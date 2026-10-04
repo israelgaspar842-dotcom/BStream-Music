@@ -1,0 +1,37 @@
+name: Build Flutter APK
+on:
+  workflow_dispatch: # Habilita un botón para ejecutar el proceso manualmente
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar el repositorio
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive # Fundamental para descargar los forks de third_party/
+      
+      - name: Configurar Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      
+      - name: Configurar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          # flutter-version: '3.19.0' # Descomenta y ajusta si hay conflictos de versión
+      
+      - name: Obtener dependencias de Flutter
+        run: flutter pub get
+      
+      - name: Compilar APK
+        run: flutter build apk --release
+      
+      - name: Subir APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: BStream-Music-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
