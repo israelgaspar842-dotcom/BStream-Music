@@ -27,11 +27,11 @@ jobs:
       - name: Obtener dependencias de Flutter
         run: flutter pub get
       
-      - name: Compilar APK
-        run: flutter build apk --release
+     - name: Compilar APK (Solo 64 bits)
+        run: flutter build apk --release --split-per-abi
       
-      - name: Subir APK como artefacto
+      - name: Subir APK de 64 bits como artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: BStream-Music-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: BStream-Music-APK-64bit
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
