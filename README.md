@@ -403,7 +403,7 @@ configuration, so the normal command is enough:
 
 ```powershell
 flutter clean
-flutter pub get --enforce-lockfile
+flutter pub get 
 flutter build windows --release
 ```
 
