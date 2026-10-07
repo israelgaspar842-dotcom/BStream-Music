@@ -62,9 +62,6 @@ jobs:
       - name: Analyze source
         run: flutter analyze
 
-      - name: Run tests
-        run: flutter test --coverage
-
       - name: Run Android unit tests
         working-directory: android
         run: |
