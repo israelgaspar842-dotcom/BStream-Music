@@ -177,7 +177,7 @@ class LibraryCsvDocument {
           ),
       ],
       detectedFormat: LibraryCsvDetectedFormat.bstream,
-      defaultPlaylistName: 'BStream Music',
+      defaultPlaylistName: 'IVG Music',
       hasPlaylistColumn: true,
     );
   }

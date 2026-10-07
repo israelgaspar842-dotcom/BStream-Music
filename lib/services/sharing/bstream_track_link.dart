@@ -35,7 +35,7 @@ class BStreamTrackLinkCodec {
   BStreamTrackLink decode(Uri uri) {
     final decoded = tryDecode(uri);
     if (decoded == null) {
-      throw FormatException('Invalid BStream Music track link.', uri);
+      throw FormatException('Invalid IVG Music track link.', uri);
     }
     return decoded;
   }

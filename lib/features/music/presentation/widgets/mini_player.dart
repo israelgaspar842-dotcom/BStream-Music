@@ -244,7 +244,7 @@ class MiniPlayer extends ConsumerWidget {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  compactErrorText ?? presentation.artist ?? 'BStream Music',
+                  compactErrorText ?? presentation.artist ?? 'IVG Music',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(

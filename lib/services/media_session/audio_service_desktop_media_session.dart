@@ -148,8 +148,8 @@ class AudioServiceDesktopMediaSession implements DesktopMediaSession {
         },
         config: const AudioServiceConfig(
           androidNotificationChannelId: 'com.bstream.bstream_music.audio',
-          androidNotificationChannelName: 'BStream Music',
-          androidNotificationChannelDescription: 'BStream Music playback',
+          androidNotificationChannelName: 'IVG Music',
+          androidNotificationChannelDescription: 'IVG Music playback',
           notificationColor: AppColors.brandGreen,
           androidNotificationIcon: 'drawable/ic_stat_bstream_music',
           androidShowNotificationBadge: true,
@@ -249,11 +249,11 @@ class AudioServiceDesktopMediaSession implements DesktopMediaSession {
             id: snapshot.trackId ?? snapshot.sourceUrl ?? trackKey,
             title: snapshot.title?.trim().isNotEmpty == true
                 ? snapshot.title!.trim()
-                : 'BStream Music',
+                : 'IVG Music',
             artist: snapshot.artist?.trim(),
             album: snapshot.album?.trim().isNotEmpty == true
                 ? snapshot.album!.trim()
-                : 'BStream Music',
+                : 'IVG Music',
             duration: snapshot.duration,
             artUri: _artUri(snapshot.thumbnailUrl),
           ),
@@ -271,7 +271,7 @@ class AudioServiceDesktopMediaSession implements DesktopMediaSession {
                   artist: item.artist,
                   album: item.album?.trim().isNotEmpty == true
                       ? item.album!.trim()
-                      : 'BStream Music',
+                      : 'IVG Music',
                   artUri: _artUri(item.thumbnailUrl),
                 ),
               )

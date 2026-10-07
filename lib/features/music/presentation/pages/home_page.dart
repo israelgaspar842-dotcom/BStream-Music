@@ -3044,7 +3044,7 @@ class _HomeView extends ConsumerWidget {
           Expanded(
             child: Text(
               key: const ValueKey('home-tab-title'),
-              'BStream Music',
+              'IVG Music',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: appTabTitleStyle(context),

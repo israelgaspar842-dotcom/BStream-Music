@@ -1,7 +1,7 @@
 class AppConstants {
   const AppConstants._();
 
-  static const appName = 'BStream Music';
+  static const appName = 'IVG Music';
   static const appVersion = '1.2.8';
   static const databaseName = 'bstream_music.db';
   static const databaseVersion = 8;

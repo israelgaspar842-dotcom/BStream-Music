@@ -143,7 +143,7 @@ class WindowsSmtcMediaSession implements DesktopMediaSession {
             artist: snapshot.artist?.trim(),
             album: snapshot.album?.trim().isNotEmpty == true
                 ? snapshot.album!.trim()
-                : 'BStream Music',
+                : 'IVG Music',
             albumArtist: snapshot.artist?.trim(),
             thumbnail: _thumbnailUri(snapshot.thumbnailUrl),
           ),

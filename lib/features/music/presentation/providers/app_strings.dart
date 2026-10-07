@@ -770,7 +770,7 @@ class AppStrings {
   );
   String get chooseCsvProfile =>
       choose('Formato del archivo CSV', 'CSV file format');
-  String get csvProfileBStream => 'BStream Music';
+  String get csvProfileBStream => 'IVG Music';
   String get csvProfileMetroList => 'MetroList';
   String get csvProfileHarmony => 'Harmony / RiMusic';
   String get csvProfileSoundiiz => 'Soundiiz';
@@ -819,7 +819,7 @@ class AppStrings {
       choose('Transparente', 'Transparent');
   String get surfaceBackgroundLiquidGlass => 'Liquid Glass Style';
   String get playerStyle => choose('Estilo', 'Style');
-  String get playerStyleBStreamMusic => 'BStream Music';
+  String get playerStyleBStreamMusic => 'IVG Music';
   String get playerStyleAppleMusic => 'Apple Music Style';
   String get playerStyleClassicVinyl =>
       choose('Vinilo Clásico', 'Classic Vinyl');
@@ -1216,8 +1216,8 @@ class AppStrings {
     required String latestVersion,
     required String currentVersion,
   }) => choose(
-    'La versión $latestVersion de BStream Music está disponible. Actualmente tienes la versión $currentVersion.',
-    'BStream Music version $latestVersion is available. You currently have version $currentVersion.',
+    'La versión $latestVersion de IVG Music está disponible. Actualmente tienes la versión $currentVersion.',
+    'IVG Music version $latestVersion is available. You currently have version $currentVersion.',
   );
   String get appIsUpToDate => choose(
     'Ya tienes la versión más reciente.',
@@ -1235,8 +1235,8 @@ class AppStrings {
   String get supportDevelopmentTitle =>
       choose('Apoyar el desarrollo', 'Support development');
   String get supportDevelopmentBody => choose(
-    'Ayuda a mantener BStream Music y a seguir agregando funciones.',
-    'Help maintain BStream Music and keep adding features.',
+    'Ayuda a mantener IVG Music y a seguir agregando funciones.',
+    'Help maintain IVG Music and keep adding features.',
   );
   String get supportDevelopmentOpenFailed => choose(
     'No se pudo abrir la página de apoyo.',
