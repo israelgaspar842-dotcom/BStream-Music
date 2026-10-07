@@ -27,6 +27,9 @@ jobs:
       - name: Obtener dependencias de Flutter
         run: flutter pub get
 
+      - name: Generar iconos automaticamente
+        run: flutter pub run flutter_launcher_icons
+
       - name: Compilar APK (Solo 64 bits)
         run: flutter build apk --debug --split-per-abi
 

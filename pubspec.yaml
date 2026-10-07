@@ -99,6 +99,7 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -119,6 +120,11 @@ flutter:
     - assets/youtube/po_token.html
     - assets/youtube/ejs/0.8.0/yt.solver.lib.min.js.b64
     - assets/youtube/ejs/0.8.0/yt.solver.core.min.js.b64
+
+  flutter_icons:
+    android: true
+    ios: false
+    image_path: "assets/icons/robot_logo.png"
 
   shaders:
     - shaders/liquid_glass_refraction.frag
