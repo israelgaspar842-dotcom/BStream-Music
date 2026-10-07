@@ -116,9 +116,8 @@ class PlayerController extends AsyncNotifier<PlayerSnapshot> {
         }
       },
     );
-    final historyShutdownRegistration = ref
-        .read(localDatabaseShutdownCoordinatorProvider)
-        .register(historyTracker.dispose);
+    final historyShutdownRegistration = Future.microtask(() =>
+        ref.read(localDatabaseShutdownCoordinatorProvider).register(historyTracker.dispose));
     final previousHistoryTracker = _playbackHistoryTracker;
     final previousHistoryShutdownRegistration =
         _playbackHistoryShutdownRegistration;
