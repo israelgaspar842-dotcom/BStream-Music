@@ -116,13 +116,14 @@ class PlayerController extends AsyncNotifier<PlayerSnapshot> {
         }
       },
     );
-    final historyShutdownRegistration = Future.microtask(() =>
-        ref.read(localDatabaseShutdownCoordinatorProvider).register(historyTracker.dispose));
+    Future.microtask(() {
+      _playbackHistoryShutdownRegistration =
+          ref.read(localDatabaseShutdownCoordinatorProvider).register(historyTracker.dispose);
+    });
     final previousHistoryTracker = _playbackHistoryTracker;
     final previousHistoryShutdownRegistration =
         _playbackHistoryShutdownRegistration;
     _playbackHistoryTracker = historyTracker;
-    _playbackHistoryShutdownRegistration = historyShutdownRegistration;
     if (previousHistoryTracker != null) {
       unawaited(
         previousHistoryShutdownRegistration?.dispose() ??
@@ -270,7 +271,7 @@ class PlayerController extends AsyncNotifier<PlayerSnapshot> {
       _crossfadePreparation.invalidate();
       _recommendationExtension.invalidate();
       _changingLocalTrackRequestId = null;
-      unawaited(historyShutdownRegistration.dispose());
+      unawaited(_playbackHistoryShutdownRegistration?.dispose());
       unawaited(subscription.cancel());
     });
     return initialSnapshot;
