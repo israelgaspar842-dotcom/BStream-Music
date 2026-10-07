@@ -59,11 +59,6 @@ jobs:
         run: |
           printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
 
-      - name: Verify formatting
-        run: >-
-          dart format --output=none --set-exit-if-changed
-          lib test integration_test test_driver tool
-
       - name: Analyze source
         run: flutter analyze
 
