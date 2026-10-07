@@ -245,28 +245,6 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Configure Android release signing
-        shell: bash
-        run: |
-          set -euo pipefail
-          required=(
-            BSTREAM_ANDROID_KEYSTORE_BASE64
-            BSTREAM_ANDROID_STORE_PASSWORD
-            BSTREAM_ANDROID_KEY_ALIAS
-            BSTREAM_ANDROID_KEY_PASSWORD
-          )
-          for variable in "${required[@]}"; do
-            if [[ -z "${!variable:-}" ]]; then
-              echo "Required GitHub secret is missing: $variable" >&2
-              exit 1
-            fi
-          done
-
-          keystore="$RUNNER_TEMP/bstream-upload-keystore.jks"
-          printf '%s' "$BSTREAM_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
-          chmod 600 "$keystore"
-          echo "BSTREAM_ANDROID_STORE_FILE=$keystore" >> "$GITHUB_ENV"
-
       - name: Resolve dependencies
         run: |
           flutter clean
@@ -275,7 +253,7 @@ jobs:
       - name: Build ARMv7, ARMv8, and x86_64 APKs
         run: >-
           flutter build apk
-          --release
+          --debug
           --split-per-abi
           --target-platform android-arm,android-arm64,android-x64
 
@@ -284,9 +262,9 @@ jobs:
         run: |
           set -euo pipefail
           output="$PWD/build/app/outputs/flutter-apk"
-          arm32="$output/app-armeabi-v7a-release.apk"
-          arm64="$output/app-arm64-v8a-release.apk"
-          x64="$output/app-x86_64-release.apk"
+          arm32="$output/app-armeabi-v7a-debug.apk"
+          arm64="$output/app-arm64-v8a-debug.apk"
+          x64="$output/app-x86_64-debug.apk"
           test -f "$arm32"
           test -f "$arm64"
           test -f "$x64"
