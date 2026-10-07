@@ -92,14 +92,13 @@ dev_dependencies:
     sdk: flutter
   integration_test:
     sdk: flutter
-
+  flutter_launcher_icons: ^0.13.1
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
-  flutter_launcher_icons: ^0.13.1
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -120,11 +119,6 @@ flutter:
     - assets/youtube/po_token.html
     - assets/youtube/ejs/0.8.0/yt.solver.lib.min.js.b64
     - assets/youtube/ejs/0.8.0/yt.solver.core.min.js.b64
-
-  flutter_icons:
-    android: true
-    ios: false
-    image_path: "assets/icons/robot_logo.png"
 
   shaders:
     - shaders/liquid_glass_refraction.frag
@@ -166,3 +160,7 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+flutter_icons:
+  android: true
+  ios: false
+  image_path: "assets/icons/robot_logo.png"
