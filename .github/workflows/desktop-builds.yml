@@ -52,7 +52,7 @@ jobs:
           cache: true
 
       - name: Resolve dependencies
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
 
       - name: Configure Android Gradle properties
         shell: bash
@@ -132,7 +132,7 @@ jobs:
           cache: true
 
       - name: Resolve locked dependencies
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
 
       - name: Analyze source on macOS
         run: flutter analyze
@@ -297,7 +297,7 @@ jobs:
       - name: Resolve dependencies
         run: |
           flutter clean
-          flutter pub get --enforce-lockfile
+          flutter pub get
 
       - name: Build ARMv7, ARMv8, and x86_64 APKs
         run: >-
@@ -446,7 +446,7 @@ jobs:
       - name: Resolve dependencies
         run: |
           flutter clean
-          flutter pub get --enforce-lockfile
+          flutter pub get
 
       - name: Build Windows release
         run: flutter build windows --release
@@ -631,7 +631,7 @@ jobs:
           cache: true
 
       - name: Resolve dependencies
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
 
       - name: Build Linux release
         run: flutter build linux --release
@@ -767,7 +767,7 @@ jobs:
           cache: true
 
       - name: Resolve dependencies
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
 
       - name: Build macOS release
         run: flutter build macos --release

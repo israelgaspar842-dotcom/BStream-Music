@@ -44,7 +44,7 @@ jobs:
       - name: Resolve locked dependencies
         run: |
           flutter clean
-          flutter pub get --enforce-lockfile
+          flutter pub get
 
       - name: Run native crossfade smoke
         run: >-
@@ -83,7 +83,7 @@ jobs:
           cache: true
 
       - name: Resolve locked dependencies
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
 
       - name: Enable KVM access
         run: |
