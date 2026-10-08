@@ -32,7 +32,7 @@ jobs:
         run: flutter pub run flutter_launcher_icons
 
       - name: Compilar APK (Solo 64 bits)
-        run: flutter build apk --debug --split-per-abi
+        run: flutter build apk --release --split-per-abi
 
       - name: Subir APK de 64 bits como artefacto
         uses: actions/upload-artifact@v4

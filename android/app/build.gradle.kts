@@ -69,14 +69,7 @@ android {
 
     buildTypes {
         release {
-            if (hasReleaseSigning) {
-                signingConfig = signingConfigs.getByName("release")
-            } else {
-                logger.warn(
-                    "Release signing is not configured. Create android/key.properties " +
-                        "or set BSTREAM_ANDROID_* environment variables before publishing.",
-                )
-            }
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
