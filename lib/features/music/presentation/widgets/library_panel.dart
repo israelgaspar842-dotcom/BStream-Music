@@ -2354,7 +2354,7 @@ class _PlaylistHeaderActions extends ConsumerWidget {
       children: [
         _NeutralLibraryIconButton(
           tooltip: strings.sharePlaylist,
-          icon: Icons.share_rounded,
+          icon: Icons.share,
           iconSize: 24,
           buttonSize: 48,
           onPressed: () {
