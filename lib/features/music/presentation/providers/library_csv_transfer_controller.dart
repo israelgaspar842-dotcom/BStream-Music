@@ -329,7 +329,7 @@ LibraryCsvTrack _trackFromLocal(
   );
 }
 
-String _youtubeVideoId(String? input) {
+String? _youtubeVideoId(String? input) {
   if (input == null || input.isEmpty) return null;
   final uri = Uri.tryParse(input);
   if (uri != null) {

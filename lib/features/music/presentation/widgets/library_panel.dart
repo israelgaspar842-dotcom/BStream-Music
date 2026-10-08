@@ -2360,8 +2360,8 @@ class _PlaylistHeaderActions extends ConsumerWidget {
           buttonSize: 48,
           onPressed: isBusy
               ? null
-              : () async {
-                  await controller.shareSinglePlaylist(
+              : () {
+                  controller.shareSinglePlaylist(
                     playlist.id,
                     playlist.name,
                   );
