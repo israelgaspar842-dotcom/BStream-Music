@@ -1,5 +1,10 @@
 part of 'music_providers.dart';
 
+import 'dart:io';
+
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+
 final libraryCsvServiceProvider = Provider<LibraryCsvService>((ref) {
   return const LibraryCsvService();
 });
@@ -210,11 +215,139 @@ class LibraryCsvTransferController extends Notifier<LibraryCsvTransferState> {
     state = const LibraryCsvTransferState();
   }
 
+  Future<void> shareSinglePlaylist(String playlistId, String playlistName) async {
+    _ensureIdle();
+    _cancelRequested = false;
+    state = const LibraryCsvTransferState(
+      phase: LibraryCsvTransferPhase.exporting,
+    );
+    try {
+      final document = await ref
+          .read(libraryOperationCoordinatorProvider)
+          .runExclusive(LibraryMaintenancePhase.exportingCsv, () async {
+            final repository = ref.read(libraryRepositoryProvider);
+            final allTracks = await repository.getLocalTracks();
+            final allPlaylists = await repository.getPlaylists();
+
+            final playlist = allPlaylists.firstWhere(
+              (p) => p.id == playlistId,
+              orElse: () => throw StateError('Playlist not found: $playlistId'),
+            );
+
+            final trackIdsSet = playlist.trackIds.toSet();
+            final playlistTracks = allTracks
+                .where((track) => trackIdsSet.contains(track.id))
+                .toList(growable: false);
+
+            final memberships = <String, List<LibraryCsvMembership>>{};
+            for (var index = 0; index < playlist.trackIds.length; index++) {
+              memberships
+                  .putIfAbsent(playlist.trackIds[index], () => [])
+                  .add(
+                    LibraryCsvMembership(
+                      name: playlist.name,
+                      position: index + 1,
+                      id: playlist.id,
+                    ),
+                  );
+            }
+
+            return LibraryCsvDocument(
+              tracks: [
+                for (var index = 0; index < playlistTracks.length; index++)
+                  _trackFromLocal(
+                    playlistTracks[index],
+                    index + 2,
+                    memberships[playlistTracks[index].id] ?? const [],
+                  ),
+              ],
+              detectedFormat: LibraryCsvDetectedFormat.bstream,
+              defaultPlaylistName: playlistName,
+              hasPlaylistColumn: true,
+            );
+          });
+
+      final tempDir = await getTemporaryDirectory();
+      final safeName = playlistName
+          .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_')
+          .replaceAll(RegExp(r'\s+'), '_');
+      final file = File('${tempDir.path}/$safeName.csv');
+
+      await file.writeAsBytes(
+        const LibraryCsvService().exportDocument(document, LibraryCsvProfile.bstream),
+        flush: true,
+      );
+
+      await Share.shareXFiles(
+        [XFile(file.path)],
+        text: 'Escucha mi playlist en IVG Music',
+      );
+
+      state = LibraryCsvTransferState(
+        phase: LibraryCsvTransferPhase.completed,
+        document: document,
+      );
+    } catch (error, stackTrace) {
+      state = LibraryCsvTransferState(
+        phase: LibraryCsvTransferPhase.failed,
+        error: error,
+        errorStackTrace: stackTrace,
+      );
+      rethrow;
+    }
+  }
+
   void _ensureIdle() {
     if (state.isBusy) {
       throw StateError('Ya hay una transferencia CSV en curso.');
     }
   }
+}
+
+LibraryCsvTrack _trackFromLocal(
+  LocalTrack track,
+  int rowNumber,
+  List<LibraryCsvMembership> memberships,
+) {
+  final videoId =
+      _youtubeVideoId(track.sourceId) ?? _youtubeVideoId(track.sourceUrl);
+  return LibraryCsvTrack(
+    rowNumber: rowNumber,
+    title: track.title,
+    artist: track.artist,
+    artists: track.artists,
+    album: track.album,
+    youtubeVideoId: videoId,
+    youtubeUrl: videoId == null
+        ? null
+        : 'https://www.youtube.com/watch?v=$videoId',
+    duration: track.duration,
+    thumbnailUrl: track.thumbnailUrl ?? track.catalogThumbnailUrl,
+    sourceUri: track.sourceUrl,
+    addedAt: track.addedAt,
+    memberships: List.unmodifiable(memberships),
+  );
+}
+
+String _youtubeVideoId(String? input) {
+  if (input == null || input.isEmpty) return null;
+  final uri = Uri.tryParse(input);
+  if (uri != null) {
+    if (uri.host.contains('youtube.com') || uri.host.contains('youtu.be')) {
+      if (uri.pathSegments.contains('watch')) {
+        return uri.queryParameters['v'];
+      }
+      if (uri.pathSegments.contains('shorts')) {
+        return uri.pathSegments.last;
+      }
+      return uri.pathSegments.last;
+    }
+  }
+  final regex = RegExp(r'^[a-zA-Z0-9_-]{11}$');
+  if (regex.hasMatch(input)) {
+    return input;
+  }
+  return null;
 }
 
 LibraryCsvGate _libraryCsvGate(Ref ref) {

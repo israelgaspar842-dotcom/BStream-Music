@@ -2055,7 +2055,10 @@ class _TrackListView extends ConsumerWidget {
                 onBack: onBack,
                 trailing: playlist == null || playlist!.isFavorites
                     ? null
-                    : _PlaylistMenu(playlist: playlist!, onBack: onBack),
+                    : _PlaylistHeaderActions(
+                        playlist: playlist!,
+                        onBack: onBack,
+                      ),
               ),
       ),
       pinnedFooter: _LibraryFilterSurface(
@@ -2330,6 +2333,43 @@ class _NeutralLibraryIconButton extends StatelessWidget {
           : BoxConstraints.tightFor(width: buttonSize, height: buttonSize),
       padding: buttonSize == null ? null : EdgeInsets.zero,
       onPressed: onPressed,
+    );
+  }
+}
+
+class _PlaylistHeaderActions extends ConsumerWidget {
+  const _PlaylistHeaderActions({required this.playlist, required this.onBack});
+
+  final Playlist playlist;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final strings = ref.watch(appStringsProvider);
+    final controller = ref.read(libraryCsvTransferControllerProvider.notifier);
+    final isBusy = ref.watch(libraryCsvTransferControllerProvider).isBusy;
+    final menuIconColor = AppColors.menuIconFor(context);
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _NeutralLibraryIconButton(
+          tooltip: strings.sharePlaylist,
+          icon: Icons.share_rounded,
+          iconSize: 24,
+          buttonSize: 48,
+          onPressed: isBusy
+              ? null
+              : () async {
+                  await controller.shareSinglePlaylist(
+                    playlist.id,
+                    playlist.name,
+                  );
+                },
+        ),
+        const SizedBox(width: 4),
+        _PlaylistMenu(playlist: playlist, onBack: onBack),
+      ],
     );
   }
 }
