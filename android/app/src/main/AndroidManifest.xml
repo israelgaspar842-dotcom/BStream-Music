@@ -106,6 +106,9 @@
                 <data android:mimeType="*/*" />
                 <data android:host="*" />
                 <data android:pathPattern=".*\\.csv" />
+                <data android:pathPattern=".*..*\\.csv" />
+                <data android:pathPattern=".*..*..*\\.csv" />
+                <data android:pathPattern=".*..*..*..*\\.csv" />
             </intent-filter>
         </activity>
         <activity
