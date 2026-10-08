@@ -156,6 +156,9 @@ class AudioServiceDesktopMediaSession implements DesktopMediaSession {
           androidNotificationOngoing: true,
           artDownscaleWidth: 320,
           artDownscaleHeight: 320,
+          androidAudioFocus: true,
+          androidAudioFocusGain: AudioFocusGain.gainTransientMayDuck,
+          androidAudioFocusLoss: AudioFocusLoss.lossTransientCanDuck,
         ),
       );
       return handler;
