@@ -2348,7 +2348,6 @@ class _PlaylistHeaderActions extends ConsumerWidget {
     final strings = ref.watch(appStringsProvider);
     final controller = ref.read(libraryCsvTransferControllerProvider.notifier);
     final isBusy = ref.watch(libraryCsvTransferControllerProvider).isBusy;
-    final menuIconColor = AppColors.menuIconFor(context);
 
     return Row(
       mainAxisSize: MainAxisSize.min,
