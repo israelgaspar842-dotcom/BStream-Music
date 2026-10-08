@@ -1824,8 +1824,26 @@ class _AboutApplicationSettings extends StatelessWidget {
           subtitle: strings.githubRepositoryBody,
           onTap: onGitHub,
         ),
+        const SizedBox(height: appCardGap),
+        _SettingsEntryCard(
+          key: const ValueKey('settings-about-creator-profile'),
+          icon: Icons.person_rounded,
+          title: 'Perfil del Creador',
+          subtitle: 'Israel Veliz Gaspar',
+          onTap: _openCreatorProfile,
+        ),
       ],
     );
+  }
+
+  Future<void> _openCreatorProfile() async {
+    final uri = Uri.parse('https://israelvelizgaspar.vercel.app/');
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      // El dispositivo puede no tener un navegador configurado; evita que la
+      // excepción no manejada cuelgue la interfaz de Ajustes.
+    }
   }
 
   Future<void> _showWhatsNew(BuildContext context) async {
