@@ -2,9 +2,6 @@ part of 'music_providers.dart';
 
 import 'dart:io';
 
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
-
 final libraryCsvServiceProvider = Provider<LibraryCsvService>((ref) {
   return const LibraryCsvService();
 });
@@ -278,9 +275,11 @@ class LibraryCsvTransferController extends Notifier<LibraryCsvTransferState> {
         flush: true,
       );
 
-      await Share.shareXFiles(
-        [XFile(file.path)],
-        text: 'Escucha mi playlist en IVG Music',
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path)],
+          text: 'Escucha mi playlist en IVG Music',
+        ),
       );
 
       state = LibraryCsvTransferState(

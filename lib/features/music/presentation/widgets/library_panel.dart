@@ -2358,14 +2358,13 @@ class _PlaylistHeaderActions extends ConsumerWidget {
           icon: Icons.share_rounded,
           iconSize: 24,
           buttonSize: 48,
-          onPressed: isBusy
-              ? null
-              : () {
-                  controller.shareSinglePlaylist(
-                    playlist.id,
-                    playlist.name,
-                  );
-                },
+          onPressed: () {
+            if (isBusy) return;
+            controller.shareSinglePlaylist(
+              playlist.id,
+              playlist.name,
+            );
+          },
         ),
         const SizedBox(width: 4),
         _PlaylistMenu(playlist: playlist, onBack: onBack),
