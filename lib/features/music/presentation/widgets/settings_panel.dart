@@ -463,8 +463,6 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         strings: strings,
         checkingForUpdates: _releaseCheckBusy,
         onVersion: _checkForAppUpdate,
-        onSupport: _openSupportDevelopment,
-        onGitHub: _openGitHubRepository,
       ),
       _SettingsRoute.root => const SizedBox.shrink(),
     };
@@ -824,13 +822,6 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     }
   }
 
-  Future<void> _openSupportDevelopment() async {
-    await _openExternalPage(
-      url: AppConstants.supportDevelopmentUrl,
-      failureMessage: ref.read(appStringsProvider).supportDevelopmentOpenFailed,
-    );
-  }
-
   Future<void> _checkForAppUpdate() async {
     if (_releaseCheckBusy) {
       return;
@@ -871,13 +862,6 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     await _openExternalPage(
       url: AppConstants.appDownloadUrl,
       failureMessage: ref.read(appStringsProvider).updateDownloadOpenFailed,
-    );
-  }
-
-  Future<void> _openGitHubRepository() async {
-    await _openExternalPage(
-      url: AppConstants.githubRepositoryUrl,
-      failureMessage: ref.read(appStringsProvider).githubRepositoryOpenFailed,
     );
   }
 
@@ -1765,15 +1749,11 @@ class _AboutApplicationSettings extends StatelessWidget {
     required this.strings,
     required this.checkingForUpdates,
     required this.onVersion,
-    required this.onSupport,
-    required this.onGitHub,
   });
 
   final AppStrings strings;
   final bool checkingForUpdates;
   final VoidCallback onVersion;
-  final VoidCallback onSupport;
-  final VoidCallback onGitHub;
 
   @override
   Widget build(BuildContext context) {
@@ -1807,22 +1787,6 @@ class _AboutApplicationSettings extends StatelessWidget {
             'Classic Vinyl, smoother lyrics, silence skipping, and gestures',
           ),
           onTap: () => _showWhatsNew(context),
-        ),
-        const SizedBox(height: appCardGap),
-        _SettingsEntryCard(
-          key: const ValueKey('settings-about-support'),
-          icon: Icons.favorite_outline_rounded,
-          title: strings.supportDevelopmentTitle,
-          subtitle: strings.supportDevelopmentBody,
-          onTap: onSupport,
-        ),
-        const SizedBox(height: appCardGap),
-        _SettingsEntryCard(
-          key: const ValueKey('settings-about-github'),
-          icon: Icons.code_rounded,
-          title: strings.githubRepositoryTitle,
-          subtitle: strings.githubRepositoryBody,
-          onTap: onGitHub,
         ),
         const SizedBox(height: appCardGap),
         _SettingsEntryCard(

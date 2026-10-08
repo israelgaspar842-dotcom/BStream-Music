@@ -103,12 +103,25 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="file" />
                 <data android:scheme="content" />
+                <!-- Captura principal: WhatsApp y otras apps de mensajería usan estos MIME internamente -->
+                <data android:mimeType="text/csv" />
+                <data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="application/csv" />
+                <data android:mimeType="application/x-csv" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <!-- Fallback explícito solo para gestores de archivos que mandan octet-stream pero conservan el path -->
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:scheme="content" />
                 <data android:mimeType="*/*" />
                 <data android:host="*" />
                 <data android:pathPattern=".*\\.csv" />
                 <data android:pathPattern=".*..*\\.csv" />
                 <data android:pathPattern=".*..*..*\\.csv" />
-                <data android:pathPattern=".*..*..*..*\\.csv" />
             </intent-filter>
         </activity>
         <activity
