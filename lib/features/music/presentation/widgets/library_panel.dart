@@ -1565,9 +1565,10 @@ class _CatalogTrackListView extends ConsumerWidget {
         title: title,
         subtitle: subtitle,
         onBack: onBack,
-        trailing: playlist.isFavorites
-            ? null
-            : _PlaylistMenu(playlist: playlist, onBack: onBack),
+        trailing: _PlaylistHeaderActions(
+          playlist: playlist,
+          onBack: onBack,
+        ),
       ),
       pinnedFooter: _LibraryFilterSurface(
         controller: filterController,
@@ -2053,7 +2054,7 @@ class _TrackListView extends ConsumerWidget {
                 title: title,
                 subtitle: subtitle,
                 onBack: onBack,
-                trailing: playlist == null || playlist!.isFavorites
+                trailing: playlist == null
                     ? null
                     : _PlaylistHeaderActions(
                         playlist: playlist!,

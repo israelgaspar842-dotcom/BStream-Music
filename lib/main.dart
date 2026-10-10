@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import 'core/constants/app_constants.dart';
 import 'core/platform/app_platform.dart';
@@ -14,6 +15,8 @@ import 'features/music/presentation/pages/home_page.dart';
 import 'features/music/presentation/providers/music_providers.dart';
 import 'services/player/notification_artwork_service.dart';
 import 'services/media_session/audio_service_desktop_media_session.dart';
+
+final sharedCsvMessengerKey = GlobalKey<ScaffoldMessengerState>();
 
 void main() {
   launchBStreamMusicApp();
@@ -248,9 +251,110 @@ class BStreamMusicApp extends ConsumerWidget {
       ),
       builder: (context, child) =>
           ScrollNotificationObserver(child: child ?? const SizedBox.shrink()),
-      home: HomePage(checkForUpdatesOnStartup: checkForUpdatesOnStartup),
+      scaffoldMessengerKey: sharedCsvMessengerKey,
+      home: _SharedCsvImportListener(
+        child: HomePage(checkForUpdatesOnStartup: checkForUpdatesOnStartup),
+      ),
     );
   }
+}
+
+/// Intercepts CSV files shared from other Android apps (e.g. WhatsApp).
+///
+/// Configured for both delivery paths:
+/// * cold start via [ReceiveSharingIntent.getInitialMedia], and
+/// * while-running via [ReceiveSharingIntent.getMediaStream].
+///
+/// On a valid CSV it reuses the existing [LibraryCsvTransferController]
+/// import pipeline so behavior matches the in-app importer.
+class _SharedCsvImportListener extends ConsumerStatefulWidget {
+  const _SharedCsvImportListener({required this.child});
+
+  final Widget child;
+
+  @override
+  ConsumerState<_SharedCsvImportListener> createState() =>
+      _SharedCsvImportListenerState();
+}
+
+class _SharedCsvImportListenerState
+    extends ConsumerState<_SharedCsvImportListener> {
+  StreamSubscription<List<SharedMediaFile>>? _mediaStreamSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!(AppPlatform.isAndroid || AppPlatform.isIOS)) {
+      return;
+    }
+    unawaited(
+      ReceiveSharingIntent.instance.getInitialMedia().then(_handleSharedMedia),
+    );
+    _mediaStreamSubscription = ReceiveSharingIntent.instance
+        .getMediaStream()
+        .listen(_handleSharedMedia);
+  }
+
+  @override
+  void dispose() {
+    unawaited(_mediaStreamSubscription?.cancel());
+    _mediaStreamSubscription = null;
+    super.dispose();
+  }
+
+  void _handleSharedMedia(List<SharedMediaFile>? files) {
+    if (files == null || files.isEmpty) {
+      return;
+    }
+    final csv = files.where((file) {
+      final mime = file.mimeType?.toLowerCase() ?? '';
+      return file.path.toLowerCase().endsWith('.csv') || mime.contains('csv');
+    }).toList(growable: false);
+    if (csv.isEmpty) {
+      return;
+    }
+    unawaited(ReceiveSharingIntent.instance.reset());
+    unawaited(_importCsv(csv.first.path));
+  }
+
+  Future<void> _importCsv(String path) async {
+    final strings = ref.read(appStringsProvider);
+    final notifier = ref.read(libraryCsvTransferControllerProvider.notifier);
+    if (notifier.state.isBusy) {
+      _showSnack(
+        strings.choose(
+          'Hay una importación en curso. Inténtalo de nuevo.',
+          'An import is already in progress. Try again.',
+        ),
+      );
+      return;
+    }
+    _showSnack(
+      strings.choose(
+        'Importando lista desde el archivo compartido…',
+        'Importing playlist from the shared file…',
+      ),
+    );
+    try {
+      final document = await notifier.preview(path);
+      await notifier.importDocument(document);
+      _showSnack(
+        strings.choose('Importación completada.', 'Import complete.'),
+      );
+    } catch (error) {
+      notifier.reset();
+      _showSnack('${strings.csvImportFailed} $error');
+    }
+  }
+
+  void _showSnack(String message) {
+    sharedCsvMessengerKey.currentState?.showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 ThemeData _buildDarkTheme({

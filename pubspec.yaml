@@ -79,6 +79,7 @@ dependencies:
   # flutter_inappwebview Android plugin is not yet compatible with AGP 9.
   flutter_secure_storage: 10.0.0
   share_plus: ^13.3.0
+  receive_sharing_intent: ^2.0.0
   piratetok_live:
     path: third_party/piratetok_live
 
