@@ -320,7 +320,8 @@ class _SharedCsvImportListenerState
   Future<void> _importCsv(String path) async {
     final strings = ref.read(appStringsProvider);
     final notifier = ref.read(libraryCsvTransferControllerProvider.notifier);
-    if (notifier.state.isBusy) {
+    final currentState = ref.read(libraryCsvTransferControllerProvider);
+    if (currentState.isBusy) {
       _showSnack(
         strings.choose(
           'Hay una importación en curso. Inténtalo de nuevo.',
