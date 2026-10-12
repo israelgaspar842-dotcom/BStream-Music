@@ -1,14 +1,17 @@
 package com.bstream.bstream_music
 
+import android.appwidget.AppWidgetManager
+import android.content.Context
+import android.content.SharedPreferences
 import es.antonborri.home_widget.HomeWidgetProvider
 
-/**
- * Provider for the BStream home screen music widget.
- *
- * Phase 1 only: the class exists so the manifest receiver can resolve it.
- * The [HomeWidgetProvider] base class reads the widget data from the
- * SharedPreferences that [HomeWidgetPlugin] writes, exposed through
- * `onUpdate(context, appWidgetManager, appWidgetIds, widgetData)` for the
- * future RemoteViews binding (title, artist, play control).
- */
-class MusicWidgetProvider : HomeWidgetProvider()
+class MusicWidgetProvider : HomeWidgetProvider() {
+    override fun onUpdate(
+        context: Context,
+        appWidgetManager: AppWidgetManager,
+        appWidgetIds: IntArray,
+        widgetData: SharedPreferences
+    ) {
+        // La lógica de sincronización con Flutter se inyectará aquí en la siguiente fase
+    }
+}

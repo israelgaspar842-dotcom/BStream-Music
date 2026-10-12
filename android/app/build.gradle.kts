@@ -35,7 +35,7 @@ plugins {
 
 android {
     namespace = "com.bstream.bstream_music"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
