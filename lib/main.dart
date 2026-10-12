@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:ui' show pragma;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:home_widget/home_widget.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import 'core/constants/app_constants.dart';
@@ -20,6 +23,36 @@ final sharedCsvMessengerKey = GlobalKey<ScaffoldMessengerState>();
 
 void main() {
   launchBStreamMusicApp();
+}
+
+/// Receives the widget taps that home_widget forwards to Dart.
+///
+/// The URI action is produced natively by `MusicWidgetProvider` and dispatched
+/// through home_widget's background pipeline (see the `HomeWidgetBackgroundReceiver`
+/// declared in the Android manifest).
+///
+/// Playback itself is *not* toggled here. home_widget 0.10.0 dispatches this
+/// callback in an isolated `FlutterEngine` built without a plugin registrant,
+/// so no platform plugin is reachable from it: audio_service, just_audio and
+/// the app's Riverpod container are all out of reach. The tap is therefore
+/// relayed natively by `MusicWidgetProvider.onReceive` into the audio_service
+/// media session, which is what the lock screen buttons and Bluetooth headsets
+/// already use. This hook remains the entry point for the widget work that
+/// must still be decided on the Dart side.
+@pragma('vm:entry-point')
+Future<void> widgetBackgroundCallback(Uri? uri) async {
+  if (uri == null) {
+    return;
+  }
+  if (uri.host == 'playpause') {
+    // Already relayed natively by MusicWidgetProvider.onReceive. This isolate
+    // has no plugins registered, so audio_service, just_audio and the app's
+    // Riverpod container are all out of reach from here; the native relay
+    // against the media session is the authoritative control.
+    debugPrint('Widget play/pause relayed natively for $uri');
+    return;
+  }
+  debugPrint('Widget background callback: $uri');
 }
 
 typedef AppStartupScheduler = void Function(VoidCallback callback);
@@ -63,6 +96,22 @@ AppStartupCoordinator launchBStreamMusicApp({
   AppStartupScheduler? scheduleStartup,
 }) {
   WidgetsFlutterBinding.ensureInitialized();
+  // Widget taps that home_widget decides to forward to Dart. Android only:
+  // the receiver and the SharedPreferences handles are Android specific, and
+  // the guard also keeps the widget tests, which run on the host, from
+  // touching a plugin channel.
+  if (AppPlatform.isAndroid) {
+    unawaited(() async {
+      try {
+        // registerBackgroundCallback is the deprecated alias of this method in
+        // home_widget 0.10.0; use the current entry point.
+        await HomeWidget.registerInteractivityCallback(widgetBackgroundCallback);
+      } catch (error, stackTrace) {
+        debugPrint('Widget background callback registration failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
+    }());
+  }
   // Keep artwork memory bounded across long sessions with many searches and
   // queue transitions. The default Flutter image cache allows 100 MiB and
   // 1,000 entries, which is excessive for music thumbnails.
@@ -201,6 +250,9 @@ class BStreamMusicApp extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     ref.watch(desktopMediaSessionProvider);
+    // Keep the Android home screen widget in sync with the track that is
+    // playing. The bridge is alive for as long as the app shell watches it.
+    ref.watch(musicWidgetBridgeProvider);
     // Keep the per-track lyrics offset synchronized even while its route is
     // closed, without rebuilding the app when the offset itself changes.
     ref.watch(lyricsOffsetControllerProvider.select((_) => null));

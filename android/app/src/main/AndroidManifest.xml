@@ -167,6 +167,19 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/music_widget_info" />
         </receiver>
+        <!--
+             Required by home_widget: ticks sent through
+             HomeWidgetBackgroundIntent are enqueued here and handed to the
+             background Dart callback. Without it the widget can render but the
+             Dart side would never hear a click.
+        -->
+        <receiver
+            android:name="es.antonborri.home_widget.HomeWidgetBackgroundReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="es.antonborri.home_widget.action.BACKGROUND" />
+            </intent-filter>
+        </receiver>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

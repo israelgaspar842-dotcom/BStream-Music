@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:crypto/crypto.dart';
+import 'package:home_widget/home_widget.dart';
 import 'package:image/image.dart' as image;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -518,6 +519,61 @@ final desktopMediaSessionProvider = Provider<DesktopMediaSession?>((ref) {
     }());
   });
   return session;
+});
+
+/// Bridges the playing track to the Android home screen widget.
+///
+/// Telemetry is strictly one directional (Dart -> widget): the player snapshots
+/// published by [playerControllerProvider] are persisted through
+/// [HomeWidget.saveWidgetData] so the native `MusicWidgetProvider` paints them
+/// on its next `onUpdate`.
+///
+/// Same lifetime strategy as [desktopMediaSessionProvider]: the provider body
+/// is kept alive by the app shell watching it (see `BStreamMusicApp`), while
+/// the bridge itself owns no UI state.
+final musicWidgetBridgeProvider = Provider<void>((ref) {
+  if (!AppPlatform.isAndroid) {
+    // Only the Android XML widget exists. HomeWidget has no receiver on other
+    // platforms and would just throw a MissingPluginException.
+    return;
+  }
+
+  var lastPushedTitle = '';
+  var lastPushedArtist = '';
+
+  Future<void> publish(PlayerSnapshot snapshot) async {
+    // Empty metadata must fall back to the same placeholders used by
+    // music_widget.xml and the MusicWidgetProvider defaults, so the widget
+    // never blanks out while the player has no resolved track.
+    final rawTitle = snapshot.title?.trim() ?? '';
+    final rawArtist = snapshot.artist?.trim() ?? '';
+    final title = rawTitle.isEmpty ? 'Sin reproducción' : rawTitle;
+    final artist = rawArtist.isEmpty ? 'IVG Music' : rawArtist;
+    // Player snapshots are emitted on every position tick. Writing the
+    // SharedPreferences and redrawing the widget for each one would be pure
+    // overhead, so only an actual track change reaches the host.
+    if (title == lastPushedTitle && artist == lastPushedArtist) {
+      return;
+    }
+    lastPushedTitle = title;
+    lastPushedArtist = artist;
+    try {
+      await HomeWidget.saveWidgetData<String>('title', title);
+      await HomeWidget.saveWidgetData<String>('artist', artist);
+      await HomeWidget.updateWidget(name: 'MusicWidgetProvider');
+    } catch (error, stackTrace) {
+      debugPrint('Music widget sync failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+  }
+
+  ref.listen<AsyncValue<PlayerSnapshot>>(playerControllerProvider, (_, next) {
+    final snapshot = next.value;
+    if (snapshot == null) {
+      return;
+    }
+    unawaited(publish(snapshot));
+  }, fireImmediately: true);
 });
 
 final databaseServiceFactoryProvider =
