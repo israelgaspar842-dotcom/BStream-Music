@@ -193,22 +193,37 @@ class LibraryCsvService {
   static const maxWarnings = 50;
 
   Future<LibraryCsvDocument> importFile(String path) async {
-    final file = File(path);
-    if (!await file.exists()) {
-      throw const FormatException('El archivo CSV no existe.');
-    }
-    final length = await file.length();
-    if (length <= 0 || length > maxFileBytes) {
-      throw const FormatException(
-        'El archivo CSV está vacío o excede el límite de 16 MiB.',
+    Uint8List bytes;
+    try {
+      final file = File(path);
+      if (!await file.exists()) {
+        throw const FormatException('El archivo CSV no existe.');
+      }
+      final length = await file.length();
+      if (length <= 0 || length > maxFileBytes) {
+        throw const FormatException(
+          'El archivo CSV está vacío o excede el límite de 16 MiB.',
+        );
+      }
+      bytes = await file.readAsBytes();
+    } on FormatException {
+      rethrow;
+    } catch (error) {
+      throw FormatException(
+        'El archivo compartido no se pudo leer: $error',
       );
     }
-    return importBytes(
-      LibraryCsvInput(
-        bytes: await file.readAsBytes(),
-        fileName: p.basename(path),
-      ),
-    );
+    final fileName = p.basename(path);
+    try {
+      return importBytes(LibraryCsvInput(bytes: bytes, fileName: fileName));
+    } catch (error) {
+      // WhatsApp-exported files can carry a UTF-8 BOM or Windows-1252 bytes.
+      // The decoders below guarantee the parse always receives text.
+      if (error is FormatException) {
+        rethrow;
+      }
+      throw FormatException('El CSV no se pudo procesar: $error');
+    }
   }
 
   LibraryCsvDocument importBytes(LibraryCsvInput input) {

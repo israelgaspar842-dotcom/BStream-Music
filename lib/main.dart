@@ -342,9 +342,19 @@ class _SharedCsvImportListenerState
       _showSnack(
         strings.choose('Importación completada.', 'Import complete.'),
       );
-    } catch (error) {
+    } catch (e, stack) {
+      // Absolute visibility: any failure while reading the shared cache or
+      // parsing the CSV surfaces the raw exception instead of aborting in
+      // silence. The stack trace is logged for diagnostics.
+      debugPrint('Shared CSV import failed: $e');
+      debugPrintStack(stackTrace: stack);
       notifier.reset();
-      _showSnack('${strings.csvImportFailed} $error');
+      sharedCsvMessengerKey.currentState?.showSnackBar(
+        SnackBar(
+          content: Text('Error crítico: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
     }
   }
 
