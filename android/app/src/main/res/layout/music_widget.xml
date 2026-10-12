@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Music widget layout (RemoteViews compatible only).
+  The dark background keeps the widget readable over any launcher wallpaper,
+  and the whole row is a LinearLayout so title/artist share the left block and
+  the play control stays pinned to the right.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#121212"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tv_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Sin reproducción"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tv_artist"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="IVG Music"
+            android:textColor="#B3FFFFFF"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <ImageButton
+        android:id="@+id/btn_play"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="?android:attr/selectableItemBackground"
+        android:contentDescription="Reproducir o pausar"
+        android:src="@android:drawable/ic_media_play" />
+</LinearLayout>
