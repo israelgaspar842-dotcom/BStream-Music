@@ -27,32 +27,37 @@ void main() {
 
 /// Receives the widget taps that home_widget forwards to Dart.
 ///
-/// The URI action is produced natively by `MusicWidgetProvider` and dispatched
-/// through home_widget's background pipeline (see the `HomeWidgetBackgroundReceiver`
-/// declared in the Android manifest).
+/// The URI actions are the ones `MusicWidgetProvider` binds to its transport
+/// buttons, and they are mirrored into home_widget's background pipeline by
+/// `onReceive` (see the `HomeWidgetBackgroundReceiver` declared in the Android
+/// manifest).
 ///
-/// Playback itself is *not* toggled here. home_widget 0.10.0 dispatches this
-/// callback in an isolated `FlutterEngine` built without a plugin registrant,
-/// so no platform plugin is reachable from it: audio_service, just_audio and
-/// the app's Riverpod container are all out of reach. The tap is therefore
-/// relayed natively by `MusicWidgetProvider.onReceive` into the audio_service
-/// media session, which is what the lock screen buttons and Bluetooth headsets
-/// already use. This hook remains the entry point for the widget work that
-/// must still be decided on the Dart side.
+/// The transport commands themselves are *not* executed here. home_widget
+/// 0.10.0 dispatches this callback in an isolated `FlutterEngine` built
+/// without a plugin registrant, so no platform plugin is reachable from it:
+/// audio_service, just_audio and the app's Riverpod container are all out of
+/// reach, which makes `skipToPrevious`/`skipToNext`/play-pause uncallable from
+/// this isolate. Each tap is therefore relayed natively by
+/// `MusicWidgetProvider.onReceive` into the audio_service media session, the
+/// same route the lock screen buttons and Bluetooth headsets take. This hook
+/// stays as the entry point for the widget work that must still be decided on
+/// the Dart side.
 @pragma('vm:entry-point')
 Future<void> widgetBackgroundCallback(Uri? uri) async {
-  if (uri == null) {
+  final host = uri?.host;
+  if (host == null) {
     return;
   }
-  if (uri.host == 'playpause') {
-    // Already relayed natively by MusicWidgetProvider.onReceive. This isolate
-    // has no plugins registered, so audio_service, just_audio and the app's
-    // Riverpod container are all out of reach from here; the native relay
-    // against the media session is the authoritative control.
-    debugPrint('Widget play/pause relayed natively for $uri');
-    return;
+  switch (host) {
+    case 'playpause':
+    case 'previous':
+    case 'next':
+    case 'playqueue1':
+    case 'playqueue2':
+      debugPrint('Widget transport relayed natively: $host');
+    case _:
+      debugPrint('Widget background callback: $uri');
   }
-  debugPrint('Widget background callback: $uri');
 }
 
 typedef AppStartupScheduler = void Function(VoidCallback callback);
@@ -103,9 +108,11 @@ AppStartupCoordinator launchBStreamMusicApp({
   if (AppPlatform.isAndroid) {
     unawaited(() async {
       try {
-        // registerBackgroundCallback is the deprecated alias of this method in
-        // home_widget 0.10.0; use the current entry point.
-        await HomeWidget.registerInteractivityCallback(widgetBackgroundCallback);
+        // registerBackgroundCallback is the deprecated alias of this method
+        // in home_widget 0.10.0; use the current entry point.
+        await HomeWidget.registerInteractivityCallback(
+          widgetBackgroundCallback,
+        );
       } catch (error, stackTrace) {
         debugPrint('Widget background callback registration failed: $error');
         debugPrintStack(stackTrace: stackTrace);

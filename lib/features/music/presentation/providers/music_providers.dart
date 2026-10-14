@@ -538,28 +538,86 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     return;
   }
 
-  var lastPushedTitle = '';
-  var lastPushedArtist = '';
+  PlayerSnapshot? latestSnapshot;
+  var latestQueue = const PlaybackQueueState();
+  // Signature of the last payload actually written, so the position ticks the
+  // player emits between real changes never reach the host.
+  String? lastPublished;
+  var lastResolvedArtwork = '';
+  String? lastResolvedCoverPath;
 
-  Future<void> publish(PlayerSnapshot snapshot) async {
+  Future<void> publish() async {
+    final snapshot = latestSnapshot;
+    if (snapshot == null) {
+      return;
+    }
+    final isPlaying = snapshot.status == PlayerStatus.playing;
+
+    // Resolving the artwork is async, and the answer is stable per URL, so it
+    // is cached across publishes.
+    final artwork = snapshot.thumbnailUrl?.trim() ?? '';
+    if (artwork != lastResolvedArtwork) {
+      lastResolvedArtwork = artwork;
+      lastResolvedCoverPath = await _resolveWidgetCoverPath(artwork);
+    }
+
+    final totalMilliseconds = snapshot.duration?.inMilliseconds ?? 0;
+    final progress = totalMilliseconds <= 0
+        ? 0
+        : (snapshot.position.inMilliseconds * 100 / totalMilliseconds)
+              .clamp(0, 100)
+              .round();
+
+    // The two entries after the one currently playing.
+    final entries = latestQueue.entries;
+    final currentIndex = latestQueue.currentIndex;
+    final queue1 = currentIndex >= 0 && currentIndex + 1 < entries.length
+        ? entries[currentIndex + 1]
+        : null;
+    final queue2 = currentIndex >= 0 && currentIndex + 2 < entries.length
+        ? entries[currentIndex + 2]
+        : null;
+
     // Empty metadata must fall back to the same placeholders used by
     // music_widget.xml and the MusicWidgetProvider defaults, so the widget
     // never blanks out while the player has no resolved track.
     final rawTitle = snapshot.title?.trim() ?? '';
-    final rawArtist = snapshot.artist?.trim() ?? '';
     final title = rawTitle.isEmpty ? 'Sin reproducción' : rawTitle;
+    final rawArtist = snapshot.artist?.trim() ?? '';
     final artist = rawArtist.isEmpty ? 'IVG Music' : rawArtist;
-    // Player snapshots are emitted on every position tick. Writing the
-    // SharedPreferences and redrawing the widget for each one would be pure
-    // overhead, so only an actual track change reaches the host.
-    if (title == lastPushedTitle && artist == lastPushedArtist) {
+    final queue1Title = queue1?.title.trim() ?? '';
+    final queue1Duration = _formatWidgetDuration(queue1?.duration);
+    final queue2Title = queue2?.title.trim() ?? '';
+    final queue2Duration = _formatWidgetDuration(queue2?.duration);
+
+    final signature = [
+      title,
+      artist,
+      isPlaying ? 'playing' : 'paused',
+      '$progress',
+      lastResolvedCoverPath ?? '',
+      queue1Title,
+      queue1Duration,
+      queue2Title,
+      queue2Duration,
+    ].join('\u0000');
+    if (signature == lastPublished) {
       return;
     }
-    lastPushedTitle = title;
-    lastPushedArtist = artist;
+    lastPublished = signature;
     try {
       await HomeWidget.saveWidgetData<String>('title', title);
       await HomeWidget.saveWidgetData<String>('artist', artist);
+      await HomeWidget.saveWidgetData<bool>('isPlaying', isPlaying);
+      await HomeWidget.saveWidgetData<int>('progress', progress);
+      await HomeWidget.saveWidgetData<String>(
+        'coverPath',
+        lastResolvedCoverPath,
+      );
+      await HomeWidget.saveWidgetData<String>('queue1Title', queue1Title);
+      await HomeWidget.saveWidgetData<String>('queue1Duration', queue1Duration);
+      await HomeWidget.saveWidgetData<String>('queue2Title', queue2Title);
+      await HomeWidget.saveWidgetData<String>('queue2Duration', queue2Duration);
       await HomeWidget.updateWidget(name: 'MusicWidgetProvider');
     } catch (error, stackTrace) {
       debugPrint('Music widget sync failed: $error');
@@ -567,14 +625,54 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     }
   }
 
+  // Both sources feed the same payload, so a queue repaint and a playback
+  // change land in one write.
   ref.listen<AsyncValue<PlayerSnapshot>>(playerControllerProvider, (_, next) {
-    final snapshot = next.value;
-    if (snapshot == null) {
-      return;
-    }
-    unawaited(publish(snapshot));
+    latestSnapshot = next.value;
+    unawaited(publish());
+  }, fireImmediately: true);
+  ref.listen<PlaybackQueueState>(playbackQueueProvider, (_, next) {
+    latestQueue = next;
+    unawaited(publish());
   }, fireImmediately: true);
 });
+
+/// Resolves the artwork of the current track into a path the widget can decode.
+///
+/// Local artwork already arrives as a file path; remote artwork is looked up in
+/// the same on-disk cache the player UI uses, so the widget normally reuses an
+/// existing file instead of forcing a new transfer.
+Future<String?> _resolveWidgetCoverPath(String artwork) async {
+  if (artwork.isEmpty) {
+    return null;
+  }
+  final uri = Uri.tryParse(artwork);
+  final scheme = uri?.scheme ?? '';
+  if (scheme.isNotEmpty && scheme != 'file' && scheme != 'content') {
+    try {
+      final file = await BStreamArtworkCacheManager().getSingleFile(artwork);
+      return file.path;
+    } catch (error) {
+      debugPrint('Music widget cover resolution failed: $error');
+      return null;
+    }
+  }
+  if (scheme == 'file') {
+    return uri.toFilePath();
+  }
+  return artwork;
+}
+
+/// Formats a duration as mm:ss for the widget queue rows. Empty when the
+/// duration is unknown, which makes the widget drop the whole row.
+String _formatWidgetDuration(Duration? duration) {
+  if (duration == null) {
+    return '';
+  }
+  final seconds = duration.inSeconds.abs();
+  final minutes = seconds ~/ 60;
+  return '$minutes:${(seconds % 60).toString().padLeft(2, '0')}';
+}
 
 final databaseServiceFactoryProvider =
     Provider<LocalDatabaseService Function()>((ref) {

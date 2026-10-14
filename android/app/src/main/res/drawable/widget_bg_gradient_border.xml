@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Card shell for the widget: a gradient ring (layer 0) with the opaque card
+  body inset 2dp on every side (layer 1), which is what renders the border.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <corners android:radius="24dp" />
+            <gradient
+                android:angle="315"
+                android:centerColor="#3A86FF"
+                android:endColor="#8338EC"
+                android:startColor="#00F5D4" />
+        </shape>
+    </item>
+    <item
+        android:bottom="2dp"
+        android:left="2dp"
+        android:right="2dp"
+        android:top="2dp">
+        <shape android:shape="rectangle">
+            <corners android:radius="22dp" />
+            <solid android:color="#0D0D11" />
+        </shape>
+    </item>
+</layer-list>

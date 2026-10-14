@@ -53,15 +53,19 @@ class PlaybackQueueEntry {
     this.logicalEntryId,
     this.album,
     this.thumbnailUrl,
+    this.duration,
   });
 
   final String id;
   final String title;
   final String artist;
-  final String? album;
-  final String? thumbnailUrl;
   final bool isRemote;
   final String? logicalEntryId;
+  final String? album;
+  final String? thumbnailUrl;
+  // Unknown for queue items that never resolved a duration (remote entries
+  // loaded lazily, for instance). The widget hides its duration label then.
+  final Duration? duration;
 }
 
 class PlaybackQueueState {
@@ -130,6 +134,7 @@ class _QueueItem {
         thumbnailUrl: localTrack.thumbnailPath ?? localTrack.thumbnailUrl,
         isRemote: false,
         logicalEntryId: logicalEntryId,
+        duration: localTrack.duration,
       );
     }
 
@@ -142,6 +147,7 @@ class _QueueItem {
       thumbnailUrl: remoteTrack.thumbnailUrl,
       isRemote: true,
       logicalEntryId: logicalEntryId,
+      duration: remoteTrack.duration,
     );
   }
 

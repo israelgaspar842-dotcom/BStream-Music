@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Widget metadata: 4 cells wide by 1 tall (250dp x 40dp) so the row layout
-  from music_widget.xml is offered by the launcher in the "wide strip" slot.
+  Expanded card: 4 cells wide by 2 tall, large enough for the current track
+  row plus the two upcoming queue rows declared in music_widget.xml.
 -->
 <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
     android:initialLayout="@layout/music_widget"
     android:minWidth="250dp"
-    android:minHeight="40dp"
+    android:minHeight="110dp"
     android:resizeMode="horizontal|vertical"
     android:targetCellWidth="4"
-    android:targetCellHeight="1"
+    android:targetCellHeight="2"
     android:updatePeriodMillis="1800000"
     android:widgetCategory="home_screen" />
