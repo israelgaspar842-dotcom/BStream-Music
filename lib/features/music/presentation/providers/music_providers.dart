@@ -658,7 +658,7 @@ Future<String?> _resolveWidgetCoverPath(String artwork) async {
     }
   }
   if (scheme == 'file') {
-    return uri.toFilePath();
+    return uri?.toFilePath();
   }
   return artwork;
 }
