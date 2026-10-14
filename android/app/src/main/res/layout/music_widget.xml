@@ -1,12 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Expanded music card (RemoteViews compatible only).
-  Only LinearLayout, ImageView, ImageButton, TextView, ProgressBar and View
-  are used, because those are the widgets RemoteViews supports.
+  Expanded music card.
 
-  Structure: current track row (cover, texts, progress, transport controls),
-  a separator, and the two upcoming queue rows. Every tap target owns a
-  PendingIntent set from MusicWidgetProvider.onUpdate.
+  Only classes annotated @RemoteView may be inflated here: LinearLayout,
+  TextView, ImageView, ImageButton and ProgressBar. In particular there is no
+  bare <View> divider: RemoteViews rejects it at inflation time on the host,
+  which is what makes the launcher show "No se pudo cargar el widget". The
+  visual gap between sections is a layout margin instead.
+
+  Icon colors are not declared here: they are applied from Kotlin through
+  RemoteViews.setInt(..., "setColorFilter", ...), so this file stays free of
+  attributes that some hosts resolve inconsistently.
+
+  Structure: current track row (cover, texts, progress, transport controls)
+  and the two upcoming queue rows. Every tap target owns a PendingIntent set
+  from MusicWidgetProvider.onUpdate.
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/widget_root"
@@ -85,8 +93,7 @@
                 android:background="@android:color/transparent"
                 android:contentDescription="Canción anterior"
                 android:scaleType="fitCenter"
-                android:src="@android:drawable/ic_media_previous"
-                android:tint="#FFFFFF" />
+                android:src="@android:drawable/ic_media_previous" />
 
             <ImageButton
                 android:id="@+id/btn_play"
@@ -95,8 +102,7 @@
                 android:background="@android:color/transparent"
                 android:contentDescription="Reproducir o pausar"
                 android:scaleType="fitCenter"
-                android:src="@android:drawable/ic_media_play"
-                android:tint="#FFFFFF" />
+                android:src="@android:drawable/ic_media_play" />
 
             <ImageButton
                 android:id="@+id/btn_next"
@@ -105,33 +111,33 @@
                 android:background="@android:color/transparent"
                 android:contentDescription="Canción siguiente"
                 android:scaleType="fitCenter"
-                android:src="@android:drawable/ic_media_next"
-                android:tint="#FFFFFF" />
+                android:src="@android:drawable/ic_media_next" />
         </LinearLayout>
     </LinearLayout>
 
-    <View
-        android:layout_width="match_parent"
-        android:layout_height="8dp" />
-
+    <!--
+      Section gap, expressed as a margin on the following row. A dedicated
+      spacer <View> is not allowed in RemoteViews.
+    -->
     <LinearLayout
         android:id="@+id/row_queue_1"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:paddingBottom="4dp"
         android:paddingTop="4dp">
 
         <ImageView
+            android:id="@+id/iv_queue_1"
             android:layout_width="28dp"
             android:layout_height="28dp"
             android:background="@drawable/widget_circle_placeholder"
             android:contentDescription="Siguiente en la cola"
             android:padding="6dp"
             android:scaleType="fitCenter"
-            android:src="@android:drawable/ic_media_play"
-            android:tint="#3A86FF" />
+            android:src="@android:drawable/ic_media_play" />
 
         <TextView
             android:id="@+id/tv_queue_1_title"
@@ -162,14 +168,14 @@
         android:paddingTop="4dp">
 
         <ImageView
+            android:id="@+id/iv_queue_2"
             android:layout_width="28dp"
             android:layout_height="28dp"
             android:background="@drawable/widget_circle_placeholder"
             android:contentDescription="Después en la cola"
             android:padding="6dp"
             android:scaleType="fitCenter"
-            android:src="@android:drawable/ic_media_play"
-            android:tint="#3A86FF" />
+            android:src="@android:drawable/ic_media_play" />
 
         <TextView
             android:id="@+id/tv_queue_2_title"

@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapShader
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Shader
 import android.net.Uri
@@ -30,71 +31,23 @@ class MusicWidgetProvider : HomeWidgetProvider() {
         appWidgetIds: IntArray,
         widgetData: SharedPreferences,
     ) {
-        val isPlaying = widgetData.getBoolean("isPlaying", false)
-        val progress = widgetData.getInt("progress", 0).coerceIn(0, MAX_PROGRESS)
-        val title = widgetData.getString("title", null) ?: DEFAULT_TITLE
-        val artist = widgetData.getString("artist", null) ?: DEFAULT_ARTIST
-
-        val views = RemoteViews(context.packageName, R.layout.music_widget)
-        views.setTextViewText(R.id.tv_title, title)
-        views.setTextViewText(R.id.tv_artist, artist)
-        views.setProgressBar(R.id.pb_progress, MAX_PROGRESS, progress, false)
-        views.setImageViewResource(
-            R.id.btn_play,
-            if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
-        )
-
-        val cover = loadCircularCover(widgetData.getString("coverPath", null))
-        if (cover != null) {
-            views.setImageViewBitmap(R.id.iv_cover, cover)
-        } else {
-            // No artwork on disk yet: keep the placeholder icon.
-            views.setImageViewResource(R.id.iv_cover, android.R.drawable.ic_media_play)
+        // Every instance is built and published on its own. A single failure
+        // inside one id must not take the rest of the widget down, and the
+        // host always receives a RemoteViews it can render: when a step fails
+        // the layout simply keeps the default declared in music_widget.xml.
+        appWidgetIds.forEach { appWidgetId ->
+            val views = RemoteViews(context.packageName, R.layout.music_widget)
+            try {
+                applyState(context, views, widgetData)
+            } catch (error: Throwable) {
+                Log.w(TAG, "Widget $appWidgetId rendered partially", error)
+            }
+            try {
+                appWidgetManager.updateAppWidget(appWidgetId, views)
+            } catch (error: Throwable) {
+                Log.e(TAG, "Could not publish widget $appWidgetId", error)
+            }
         }
-
-        bindQueueRow(
-            views,
-            R.id.row_queue_1,
-            R.id.tv_queue_1_title,
-            R.id.tv_queue_1_duration,
-            widgetData.getString("queue1Title", null)?.trim() ?: "",
-            widgetData.getString("queue1Duration", null) ?: "",
-        )
-        bindQueueRow(
-            views,
-            R.id.row_queue_2,
-            R.id.tv_queue_2_title,
-            R.id.tv_queue_2_duration,
-            widgetData.getString("queue2Title", null)?.trim() ?: "",
-            widgetData.getString("queue2Duration", null) ?: "",
-        )
-
-        views.setOnClickPendingIntent(
-            R.id.btn_prev,
-            transportPendingIntent(context, WidgetAction.PREVIOUS),
-        )
-        views.setOnClickPendingIntent(
-            R.id.btn_play,
-            transportPendingIntent(context, WidgetAction.PLAY_PAUSE),
-        )
-        views.setOnClickPendingIntent(
-            R.id.btn_next,
-            transportPendingIntent(context, WidgetAction.NEXT),
-        )
-        views.setOnClickPendingIntent(
-            R.id.row_queue_1,
-            transportPendingIntent(context, WidgetAction.QUEUE_1),
-        )
-        views.setOnClickPendingIntent(
-            R.id.row_queue_2,
-            transportPendingIntent(context, WidgetAction.QUEUE_2),
-        )
-
-        val openApp = HomeWidgetLaunchIntent.getActivity(context, MainActivity::class.java)
-        views.setOnClickPendingIntent(R.id.widget_root, openApp)
-        views.setOnClickPendingIntent(R.id.iv_cover, openApp)
-
-        appWidgetManager.updateAppWidget(appWidgetIds, views)
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -103,14 +56,126 @@ class MusicWidgetProvider : HomeWidgetProvider() {
             super.onReceive(context, intent)
             return
         }
-        // The relay is the authoritative control: home_widget dispatches its
-        // Dart callback in an isolated engine with no plugin registrant, so no
-        // audio plugin is reachable from there on Android. A queue tap jumps
-        // that many tracks forward.
-        action.keyCodes.forEach { keyCode -> sendMediaButton(context, keyCode) }
+        try {
+            // The relay is the authoritative control: home_widget dispatches its
+            // Dart callback in an isolated engine with no plugin registrant, so no
+            // audio plugin is reachable from there on Android. A queue tap jumps
+            // that many tracks forward.
+            action.keyCodes.forEach { keyCode -> sendMediaButton(context, keyCode) }
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not relay ${action.name} to the media session", error)
+        }
         // Mirror the tap into home_widget's background pipeline so the Dart
-        // callback observes the same URI the button was bound to.
+        // callback observes the same URI the button was bound to. Never fatal.
         forwardToDart(context, action.uri)
+    }
+
+    /**
+     * Fills every piece of the widget. Each optional step is isolated, so a
+     * failure in one only degrades that step.
+     */
+    private fun applyState(
+        context: Context,
+        views: RemoteViews,
+        widgetData: SharedPreferences,
+    ) {
+        val isPlaying = widgetData.getBoolean("isPlaying", false)
+        val progress = widgetData.getInt("progress", 0).coerceIn(0, MAX_PROGRESS)
+
+        // Core state: plain set* actions, covered by the per-instance catch in
+        // onUpdate. These must always succeed for the widget to make sense.
+        views.setTextViewText(
+            R.id.tv_title,
+            widgetData.getString("title", null) ?: DEFAULT_TITLE,
+        )
+        views.setTextViewText(
+            R.id.tv_artist,
+            widgetData.getString("artist", null) ?: DEFAULT_ARTIST,
+        )
+        views.setProgressBar(R.id.pb_progress, MAX_PROGRESS, progress, false)
+        views.setImageViewResource(
+            R.id.btn_play,
+            if (isPlaying) android.R.drawable.ic_media_pause
+            else android.R.drawable.ic_media_play,
+        )
+
+        // Optional from here on.
+        guarded("transport icons") {
+            views.setInt(R.id.btn_prev, "setColorFilter", COLOR_ACTIVE)
+            views.setInt(R.id.btn_play, "setColorFilter", COLOR_ACTIVE)
+            views.setInt(R.id.btn_next, "setColorFilter", COLOR_ACTIVE)
+            views.setInt(R.id.iv_queue_1, "setColorFilter", COLOR_ACCENT)
+            views.setInt(R.id.iv_queue_2, "setColorFilter", COLOR_ACCENT)
+        }
+
+        guarded("cover") {
+            val cover = loadCircularCover(widgetData.getString("coverPath", null))
+            if (cover != null) {
+                views.setImageViewBitmap(R.id.iv_cover, cover)
+            } else {
+                // No artwork on disk yet: tint the placeholder icon instead.
+                views.setInt(R.id.iv_cover, "setColorFilter", COLOR_MUTED)
+            }
+        }
+
+        guarded("queue rows") {
+            bindQueueRow(
+                views,
+                R.id.row_queue_1,
+                R.id.tv_queue_1_title,
+                R.id.tv_queue_1_duration,
+                widgetData.getString("queue1Title", null)?.trim() ?: "",
+                widgetData.getString("queue1Duration", null) ?: "",
+            )
+            bindQueueRow(
+                views,
+                R.id.row_queue_2,
+                R.id.tv_queue_2_title,
+                R.id.tv_queue_2_duration,
+                widgetData.getString("queue2Title", null)?.trim() ?: "",
+                widgetData.getString("queue2Duration", null) ?: "",
+            )
+        }
+
+        // One guard per PendingIntent: a host that rejects one intent must not
+        // leave the other controls dead.
+        guarded("intent PREVIOUS") {
+            views.setOnClickPendingIntent(
+                R.id.btn_prev,
+                transportPendingIntent(context, WidgetAction.PREVIOUS),
+            )
+        }
+        guarded("intent PLAY_PAUSE") {
+            views.setOnClickPendingIntent(
+                R.id.btn_play,
+                transportPendingIntent(context, WidgetAction.PLAY_PAUSE),
+            )
+        }
+        guarded("intent NEXT") {
+            views.setOnClickPendingIntent(
+                R.id.btn_next,
+                transportPendingIntent(context, WidgetAction.NEXT),
+            )
+        }
+        guarded("intent QUEUE_1") {
+            views.setOnClickPendingIntent(
+                R.id.row_queue_1,
+                transportPendingIntent(context, WidgetAction.QUEUE_1),
+            )
+        }
+        guarded("intent QUEUE_2") {
+            views.setOnClickPendingIntent(
+                R.id.row_queue_2,
+                transportPendingIntent(context, WidgetAction.QUEUE_2),
+            )
+        }
+
+        guarded("open app") {
+            val openApp =
+                HomeWidgetLaunchIntent.getActivity(context, MainActivity::class.java)
+            views.setOnClickPendingIntent(R.id.widget_root, openApp)
+            views.setOnClickPendingIntent(R.id.iv_cover, openApp)
+        }
     }
 
     /**
@@ -135,7 +200,7 @@ class MusicWidgetProvider : HomeWidgetProvider() {
     private fun forwardToDart(context: Context, uri: String) {
         try {
             HomeWidgetBackgroundIntent.getBroadcast(context, Uri.parse(uri)).send()
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             Log.w(TAG, "Could not forward the widget tap to Dart", error)
         }
     }
@@ -228,12 +293,27 @@ class MusicWidgetProvider : HomeWidgetProvider() {
         return output
     }
 
+    /** Runs an optional widget step, logging instead of failing the widget. */
+    private inline fun guarded(label: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (error: Throwable) {
+            Log.w(TAG, "Widget step failed ($label)", error)
+        }
+    }
+
     companion object {
         private const val TAG = "BStreamWidget"
         private const val DEFAULT_TITLE = "Sin reproducción"
         private const val DEFAULT_ARTIST = "IVG Music"
         private const val MAX_PROGRESS = 100
         private const val COVER_SIZE = 128
+
+        // Icons are tinted from Kotlin (see `setColorFilter`, which is annotated
+        // @RemotableViewMethod) instead of through the layout.
+        private val COLOR_ACTIVE = Color.WHITE
+        private val COLOR_ACCENT = Color.parseColor("#3A86FF")
+        private val COLOR_MUTED = Color.parseColor("#9E9EA8")
 
         /** Every tap target, the URI it reports and the media buttons it sends. */
         private enum class WidgetAction(
