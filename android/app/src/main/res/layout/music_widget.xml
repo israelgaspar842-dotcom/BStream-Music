@@ -1,198 +1,352 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Expanded music card.
+  Music widget: turntable header over an expanded queue of 4 tracks.
 
-  Only classes annotated @RemoteView may be inflated here: LinearLayout,
-  TextView, ImageView, ImageButton and ProgressBar. In particular there is no
-  bare <View> divider: RemoteViews rejects it at inflation time on the host,
-  which is what makes the launcher show "No se pudo cargar el widget". The
-  visual gap between sections is a layout margin instead.
+  RemoteViews safety: only classes annotated @RemoteView may be inflated here
+  (FrameLayout, LinearLayout, TextView, ImageView, ImageButton, ProgressBar).
+  There is no <View> and no <Space>: the section divider and the vertical gaps
+  are thin LinearLayouts and margins. On a launcher, an unsupported class makes
+  inflation throw and the widget stops loading.
 
-  Icon colors are not declared here: they are applied from Kotlin through
-  RemoteViews.setInt(..., "setColorFilter", ...), so this file stays free of
-  attributes that some hosts resolve inconsistently.
-
-  Structure: current track row (cover, texts, progress, transport controls)
-  and the two upcoming queue rows. Every tap target owns a PendingIntent set
-  from MusicWidgetProvider.onUpdate.
+  The root is a FrameLayout: blurred artwork, scrim and content stacked. The
+  content column distributes its free space to the queue, so resizing the
+  widget never leaves dead space.
 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/widget_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@drawable/widget_bg_gradient_border"
-    android:orientation="vertical"
-    android:padding="14dp">
+    android:padding="2dp">
+
+    <ImageView
+        android:id="@+id/iv_bg_art"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop" />
+
+    <ImageView
+        android:id="@+id/iv_bg_scrim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:scaleType="fitXY"
+        android:src="@drawable/widget_card_scrim" />
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <ImageView
-            android:id="@+id/iv_cover"
-            android:layout_width="52dp"
-            android:layout_height="52dp"
-            android:background="@drawable/widget_circle_placeholder"
-            android:contentDescription="Carátula"
-            android:scaleType="centerCrop"
-            android:src="@android:drawable/ic_media_play" />
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="12dp">
 
         <LinearLayout
-            android:layout_width="0dp"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginEnd="12dp"
-            android:layout_marginStart="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <!-- Vinyl plus tonearm. -->
+            <FrameLayout
+                android:layout_width="96dp"
+                android:layout_height="88dp">
+
+                <ImageView
+                    android:id="@+id/iv_cover"
+                    android:layout_width="84dp"
+                    android:layout_height="84dp"
+                    android:layout_gravity="left|center_vertical"
+                    android:contentDescription="Carátula"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_widget_vinyl_base" />
+
+                <ImageView
+                    android:id="@+id/iv_tonearm"
+                    android:layout_width="32dp"
+                    android:layout_height="84dp"
+                    android:layout_gravity="right|center_vertical"
+                    android:contentDescription="@null"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_widget_tonearm" />
+            </FrameLayout>
+
+            <!-- Track info, progress and transport controls. -->
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="10dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/tv_title"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:text="Sin reproducción"
+                    android:textColor="#FFFFFF"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tv_artist"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="1dp"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:text="IVG Music"
+                    android:textColor="#D0D0DA"
+                    android:textSize="12sp" />
+
+                <ProgressBar
+                    android:id="@+id/pb_progress"
+                    style="?android:attr/progressBarStyleHorizontal"
+                    android:layout_width="match_parent"
+                    android:layout_height="4dp"
+                    android:layout_marginTop="6dp"
+                    android:max="100"
+                    android:progress="35"
+                    android:progressBackgroundTint="#4DFFFFFF"
+                    android:progressTint="#FFFFFF" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/tv_elapsed"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="0:00"
+                        android:textColor="#D0D0DA"
+                        android:textSize="10sp" />
+
+                    <TextView
+                        android:id="@+id/tv_remaining"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0:00"
+                        android:textColor="#D0D0DA"
+                        android:textSize="10sp" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center"
+                    android:layout_marginTop="2dp"
+                    android:orientation="horizontal">
+
+                    <ImageButton
+                        android:id="@+id/btn_prev"
+                        android:layout_width="36dp"
+                        android:layout_height="32dp"
+                        android:background="@android:color/transparent"
+                        android:contentDescription="Canción anterior"
+                        android:padding="4dp"
+                        android:scaleType="fitCenter"
+                        android:src="@drawable/ic_widget_prev" />
+
+                    <ImageButton
+                        android:id="@+id/btn_play"
+                        android:layout_width="44dp"
+                        android:layout_height="36dp"
+                        android:layout_marginLeft="12dp"
+                        android:layout_marginRight="12dp"
+                        android:background="@android:color/transparent"
+                        android:contentDescription="Reproducir o pausar"
+                        android:padding="4dp"
+                        android:scaleType="fitCenter"
+                        android:src="@drawable/ic_widget_play" />
+
+                    <ImageButton
+                        android:id="@+id/btn_next"
+                        android:layout_width="36dp"
+                        android:layout_height="32dp"
+                        android:background="@android:color/transparent"
+                        android:contentDescription="Canción siguiente"
+                        android:padding="4dp"
+                        android:scaleType="fitCenter"
+                        android:src="@drawable/ic_widget_next" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Safe divider: a thin LinearLayout, never a bare <View>. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginBottom="4dp"
+            android:layout_marginTop="8dp"
+            android:background="#26FFFFFF" />
+
+        <!-- Queue absorbs every remaining pixel. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
             android:layout_weight="1"
             android:orientation="vertical">
 
-            <TextView
-                android:id="@+id/tv_title"
+            <LinearLayout
+                android:id="@+id/row_queue_1"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:ellipsize="end"
-                android:maxLines="1"
-                android:text="Sin reproducción"
-                android:textColor="#FFFFFF"
-                android:textSize="15sp"
-                android:textStyle="bold" />
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="2dp"
+                android:paddingRight="2dp">
 
-            <TextView
-                android:id="@+id/tv_artist"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:ellipsize="end"
-                android:maxLines="1"
-                android:text="IVG Music"
-                android:textAllCaps="true"
-                android:textColor="#9E9EA8"
-                android:textSize="11sp" />
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:background="@drawable/widget_circle_placeholder"
+                    android:contentDescription="@null"
+                    android:padding="5dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_widget_music_note" />
 
-            <ProgressBar
-                android:id="@+id/pb_progress"
-                style="?android:attr/progressBarStyleHorizontal"
+                <TextView
+                    android:id="@+id/tv_queue_1_title"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:textColor="#F0F0F5"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/tv_queue_1_duration"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="6dp"
+                    android:textColor="#9E9EA8"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/row_queue_2"
                 android:layout_width="match_parent"
-                android:layout_height="3dp"
-                android:layout_marginTop="6dp"
-                android:max="100"
-                android:progress="35"
-                android:progressBackgroundTint="#2A2A35"
-                android:progressTint="#00E5A3" />
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="2dp"
+                android:paddingRight="2dp">
+
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:background="@drawable/widget_circle_placeholder"
+                    android:contentDescription="@null"
+                    android:padding="5dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_widget_music_note" />
+
+                <TextView
+                    android:id="@+id/tv_queue_2_title"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:textColor="#F0F0F5"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/tv_queue_2_duration"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="6dp"
+                    android:textColor="#9E9EA8"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/row_queue_3"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="2dp"
+                android:paddingRight="2dp">
+
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:background="@drawable/widget_circle_placeholder"
+                    android:contentDescription="@null"
+                    android:padding="5dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_widget_music_note" />
+
+                <TextView
+                    android:id="@+id/tv_queue_3_title"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:textColor="#F0F0F5"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/tv_queue_3_duration"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="6dp"
+                    android:textColor="#9E9EA8"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/row_queue_4"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="2dp"
+                android:paddingRight="2dp">
+
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:background="@drawable/widget_circle_placeholder"
+                    android:contentDescription="@null"
+                    android:padding="5dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_widget_music_note" />
+
+                <TextView
+                    android:id="@+id/tv_queue_4_title"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:textColor="#F0F0F5"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/tv_queue_4_duration"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="6dp"
+                    android:textColor="#9E9EA8"
+                    android:textSize="11sp" />
+            </LinearLayout>
         </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal">
-
-            <ImageButton
-                android:id="@+id/btn_prev"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
-                android:background="@android:color/transparent"
-                android:contentDescription="Canción anterior"
-                android:scaleType="fitCenter"
-                android:src="@android:drawable/ic_media_previous" />
-
-            <ImageButton
-                android:id="@+id/btn_play"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
-                android:background="@android:color/transparent"
-                android:contentDescription="Reproducir o pausar"
-                android:scaleType="fitCenter"
-                android:src="@android:drawable/ic_media_play" />
-
-            <ImageButton
-                android:id="@+id/btn_next"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
-                android:background="@android:color/transparent"
-                android:contentDescription="Canción siguiente"
-                android:scaleType="fitCenter"
-                android:src="@android:drawable/ic_media_next" />
-        </LinearLayout>
     </LinearLayout>
-
-    <!--
-      Section gap, expressed as a margin on the following row. A dedicated
-      spacer <View> is not allowed in RemoteViews.
-    -->
-    <LinearLayout
-        android:id="@+id/row_queue_1"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
-        android:paddingBottom="4dp"
-        android:paddingTop="4dp">
-
-        <ImageView
-            android:id="@+id/iv_queue_1"
-            android:layout_width="28dp"
-            android:layout_height="28dp"
-            android:background="@drawable/widget_circle_placeholder"
-            android:contentDescription="Siguiente en la cola"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
-            android:src="@android:drawable/ic_media_play" />
-
-        <TextView
-            android:id="@+id/tv_queue_1_title"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="10dp"
-            android:layout_weight="1"
-            android:ellipsize="end"
-            android:maxLines="1"
-            android:textColor="#E0E0E6"
-            android:textSize="12sp" />
-
-        <TextView
-            android:id="@+id/tv_queue_1_duration"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#9E9EA8"
-            android:textSize="11sp" />
-    </LinearLayout>
-
-    <LinearLayout
-        android:id="@+id/row_queue_2"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
-        android:paddingBottom="4dp"
-        android:paddingTop="4dp">
-
-        <ImageView
-            android:id="@+id/iv_queue_2"
-            android:layout_width="28dp"
-            android:layout_height="28dp"
-            android:background="@drawable/widget_circle_placeholder"
-            android:contentDescription="Después en la cola"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
-            android:src="@android:drawable/ic_media_play" />
-
-        <TextView
-            android:id="@+id/tv_queue_2_title"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="10dp"
-            android:layout_weight="1"
-            android:ellipsize="end"
-            android:maxLines="1"
-            android:textColor="#E0E0E6"
-            android:textSize="12sp" />
-
-        <TextView
-            android:id="@+id/tv_queue_2_duration"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#9E9EA8"
-            android:textSize="11sp" />
-    </LinearLayout>
-</LinearLayout>
+</FrameLayout>

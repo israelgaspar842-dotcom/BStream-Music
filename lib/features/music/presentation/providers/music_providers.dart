@@ -21,7 +21,6 @@ import '../../../../core/constants/app_constants.dart';
 import '../../../../core/platform/app_platform.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/bounded_byte_stream.dart';
-import '../../../../core/utils/cached_artwork_image_provider.dart';
 import '../../../../core/utils/image_source.dart';
 import '../../../../core/utils/safe_file_name.dart';
 import '../../../../services/downloader/audio_stream_resolver.dart';
@@ -568,15 +567,29 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
               .clamp(0, 100)
               .round();
 
-    // The two entries after the one currently playing.
+    // The four entries after the one currently playing.
     final entries = latestQueue.entries;
     final currentIndex = latestQueue.currentIndex;
-    final queue1 = currentIndex >= 0 && currentIndex + 1 < entries.length
-        ? entries[currentIndex + 1]
-        : null;
-    final queue2 = currentIndex >= 0 && currentIndex + 2 < entries.length
-        ? entries[currentIndex + 2]
-        : null;
+    final upcoming = <PlaybackQueueEntry>[
+      for (var offset = 1; offset <= widgetQueueSize; offset++)
+        if (currentIndex >= 0 && currentIndex + offset < entries.length)
+          entries[currentIndex + offset],
+    ];
+
+    final elapsed = _formatWidgetClock(snapshot.position);
+    final remaining = _formatWidgetClock(_remainingDuration(snapshot));
+    final queue = <String>[
+      for (var index = 0; index < widgetQueueSize; index++)
+        _formatWidgetQueueLabel(
+          index < upcoming.length ? upcoming[index] : null,
+        ),
+    ];
+    final queueDurations = <String>[
+      for (var index = 0; index < widgetQueueSize; index++)
+        _formatWidgetDuration(
+          index < upcoming.length ? upcoming[index]?.duration : null,
+        ),
+    ];
 
     // Empty metadata must fall back to the same placeholders used by
     // music_widget.xml and the MusicWidgetProvider defaults, so the widget
@@ -585,21 +598,17 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     final title = rawTitle.isEmpty ? 'Sin reproducción' : rawTitle;
     final rawArtist = snapshot.artist?.trim() ?? '';
     final artist = rawArtist.isEmpty ? 'IVG Music' : rawArtist;
-    final queue1Title = queue1?.title.trim() ?? '';
-    final queue1Duration = _formatWidgetDuration(queue1?.duration);
-    final queue2Title = queue2?.title.trim() ?? '';
-    final queue2Duration = _formatWidgetDuration(queue2?.duration);
 
     final signature = [
       title,
       artist,
       isPlaying ? 'playing' : 'paused',
       '$progress',
+      elapsed,
+      remaining,
       lastResolvedCoverPath ?? '',
-      queue1Title,
-      queue1Duration,
-      queue2Title,
-      queue2Duration,
+      ...queue,
+      ...queueDurations,
     ].join('\u0000');
     if (signature == lastPublished) {
       return;
@@ -610,14 +619,23 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
       await HomeWidget.saveWidgetData<String>('artist', artist);
       await HomeWidget.saveWidgetData<bool>('isPlaying', isPlaying);
       await HomeWidget.saveWidgetData<int>('progress', progress);
+      await HomeWidget.saveWidgetData<String>('elapsed', elapsed);
+      await HomeWidget.saveWidgetData<String>('remaining', remaining);
       await HomeWidget.saveWidgetData<String>(
         'coverPath',
         lastResolvedCoverPath,
       );
-      await HomeWidget.saveWidgetData<String>('queue1Title', queue1Title);
-      await HomeWidget.saveWidgetData<String>('queue1Duration', queue1Duration);
-      await HomeWidget.saveWidgetData<String>('queue2Title', queue2Title);
-      await HomeWidget.saveWidgetData<String>('queue2Duration', queue2Duration);
+      for (var index = 0; index < widgetQueueSize; index++) {
+        final position = index + 1;
+        await HomeWidget.saveWidgetData<String>(
+          'queue${position}Title',
+          queue[index],
+        );
+        await HomeWidget.saveWidgetData<String>(
+          'queue${position}Duration',
+          queueDurations[index],
+        );
+      }
       await HomeWidget.updateWidget(name: 'MusicWidgetProvider');
     } catch (error, stackTrace) {
       debugPrint('Music widget sync failed: $error');
@@ -637,31 +655,74 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
   }, fireImmediately: true);
 });
 
-/// Resolves the artwork of the current track into a path the widget can decode.
+/// Fixed file name of the cover the widget reads from disk.
+const _widgetCoverFileName = 'widget_cover_current.jpg';
+
+/// Resolves the artwork of the current track into a file the widget can decode.
 ///
-/// Local artwork already arrives as a file path; remote artwork is looked up in
-/// the same on-disk cache the player UI uses, so the widget normally reuses an
-/// existing file instead of forcing a new transfer.
+/// A local path is used as is, and a remote URL is materialized into
+/// [_widgetCoverFileName] inside the app cache, because the native side can
+/// only decode files. Every failure is silent: the widget then keeps its
+/// vector placeholder instead of a flat patch.
 Future<String?> _resolveWidgetCoverPath(String artwork) async {
   if (artwork.isEmpty) {
     return null;
   }
   final uri = Uri.tryParse(artwork);
-  final scheme = uri?.scheme ?? '';
-  if (scheme.isNotEmpty && scheme != 'file' && scheme != 'content') {
-    try {
-      final file = await BStreamArtworkCacheManager().getSingleFile(artwork);
-      return file.path;
-    } catch (error) {
-      debugPrint('Music widget cover resolution failed: $error');
+  if (uri == null) {
+    return null;
+  }
+  switch (uri.scheme) {
+    case 'http':
+    case 'https':
+      return _downloadWidgetCover(uri);
+    case 'file':
+      return uri.toFilePath();
+    default:
+      // A bare filesystem path, or a scheme the native decoder cannot open.
+      return artwork;
+  }
+}
+
+/// Downloads the artwork and stores it under a fixed name in the app cache.
+///
+/// The write goes through a partial file plus a rename, so the widget can only
+/// ever see a complete image.
+Future<String?> _downloadWidgetCover(Uri uri) async {
+  HttpClient? client;
+  try {
+    client = HttpClient();
+    final request = await client
+        .getUrl(uri)
+        .timeout(_widgetCoverTimeout);
+    final response = await request.close().timeout(_widgetCoverTimeout);
+    if (response.statusCode != HttpStatus.ok) {
+      await response.drain<void>();
       return null;
     }
+    final bytes = await consolidateHttpResponseBytes(
+      response,
+    ).timeout(_widgetCoverTimeout);
+    if (bytes.isEmpty) {
+      return null;
+    }
+    final target = File('${Directory.systemTemp.path}/$_widgetCoverFileName');
+    final partial = File('${target.path}.part');
+    await partial.writeAsBytes(bytes, flush: true);
+    await partial.rename(target.path);
+    return target.path;
+  } catch (error) {
+    debugPrint('Music widget cover download failed: $error');
+    return null;
+  } finally {
+    client?.close(force: true);
   }
-  if (scheme == 'file') {
-    return uri?.toFilePath();
-  }
-  return artwork;
 }
+
+const _widgetCoverTimeout = Duration(seconds: 4);
+
+/// Number of upcoming tracks the widget lists.
+const widgetQueueSize = 4;
 
 /// Formats a duration as mm:ss for the widget queue rows. Empty when the
 /// duration is unknown, which makes the widget drop the whole row.
@@ -672,6 +733,36 @@ String _formatWidgetDuration(Duration? duration) {
   final seconds = duration.inSeconds.abs();
   final minutes = seconds ~/ 60;
   return '$minutes:${(seconds % 60).toString().padLeft(2, '0')}';
+}
+
+/// Formats a position as m:ss for the elapsed and remaining labels.
+String _formatWidgetClock(Duration? value) {
+  if (value == null) {
+    return '0:00';
+  }
+  final seconds = value.inSeconds.abs();
+  final minutes = seconds ~/ 60;
+  return '$minutes:${(seconds % 60).toString().padLeft(2, '0')}';
+}
+
+/// Time left in the current track, never negative and null when unknown.
+Duration? _remainingDuration(PlayerSnapshot snapshot) {
+  final duration = snapshot.duration;
+  if (duration == null) {
+    return null;
+  }
+  final left = duration - snapshot.position;
+  return left.isNegative ? Duration.zero : left;
+}
+
+/// Queue row label: "Título • Artista", or just the title when it has none.
+String _formatWidgetQueueLabel(PlaybackQueueEntry? entry) {
+  final title = entry?.title.trim() ?? '';
+  if (title.isEmpty) {
+    return '';
+  }
+  final artist = entry?.artist.trim() ?? '';
+  return artist.isEmpty ? title : '$title • $artist';
 }
 
 final databaseServiceFactoryProvider =

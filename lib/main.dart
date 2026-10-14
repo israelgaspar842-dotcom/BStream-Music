@@ -46,13 +46,15 @@ Future<void> widgetBackgroundCallback(Uri? uri) async {
   if (host == null) {
     return;
   }
-  switch (host) {
-    case 'playpause':
-    case 'previous':
-    case 'next':
-    case 'playqueue1':
-    case 'playqueue2':
-      debugPrint('Widget transport relayed natively: $host');
+    switch (host) {
+      case 'playpause':
+      case 'previous':
+      case 'next':
+      case 'playqueue1':
+      case 'playqueue2':
+      case 'playqueue3':
+      case 'playqueue4':
+        debugPrint('Widget transport relayed natively: $host');
     case _:
       debugPrint('Widget background callback: $uri');
   }

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Elegant placeholder for the artwork slot of the widget.
+
+  Used as the `src` of iv_cover together with scaleType="fitXY", so the layer
+  fills the square view and the ovals read as a circle. The note item carries
+  its own size and gravity, which is what gives the drawable an intrinsic
+  dimension the ImageView can measure.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item>
+        <shape android:shape="oval">
+            <gradient
+                android:angle="270"
+                android:endColor="#12121A"
+                android:startColor="#1F1F2E"
+                android:type="linear" />
+        </shape>
+    </item>
+
+    <!-- Subtle inner ring. -->
+    <item
+        android:bottom="4dp"
+        android:left="4dp"
+        android:right="4dp"
+        android:top="4dp">
+        <shape android:shape="oval">
+            <stroke
+                android:color="#1FFFFFFF"
+                android:width="1dp" />
+        </shape>
+    </item>
+
+    <!-- Centered note, accent colored. -->
+    <item
+        android:gravity="center"
+        android:height="22dp"
+        android:width="22dp">
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/ic_widget_music_note"
+            android:tint="#00F5D4" />
+    </item>
+</layer-list>

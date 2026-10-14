@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Vinyl disc used when there is no artwork to show: black body, subtle outer
+  rim, two groove rings and a dark center label carrying the music note.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="88dp"
+    android:height="88dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+
+    <!-- Disc body. -->
+    <path
+        android:fillColor="#111115"
+        android:pathData="M51,1 a49,49 0 1,0 -2,0 a49,49 0 1,0 2,0 Z" />
+
+    <!-- Outer rim. -->
+    <path
+        android:pathData="M50,50 m-45,0 a45,45 0 1,0 90,0 a45,45 0 1,0 -90,0"
+        android:strokeColor="#2A2A35"
+        android:strokeWidth="2" />
+
+    <!-- Grooves. -->
+    <path
+        android:pathData="M50,50 m-42,0 a42,42 0 1,0 84,0 a42,42 0 1,0 -84,0"
+        android:strokeColor="#22FFFFFF"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M50,50 m-36,0 a36,36 0 1,0 72,0 a36,36 0 1,0 -72,0"
+        android:strokeColor="#22FFFFFF"
+        android:strokeWidth="1" />
+
+    <!-- Center label with the note. -->
+    <path
+        android:fillColor="#17171E"
+        android:pathData="M50,26 a24,24 0 1,0 -0.1,0 Z" />
+    <group
+        android:scaleX="1.6"
+        android:scaleY="1.6"
+        android:translateX="31"
+        android:translateY="31">
+        <path
+            android:fillColor="#6E6E7E"
+            android:pathData="M12,3V13.55C11.41,13.21 10.73,13 10,13C7.79,13 6,14.79 6,17C6,19.21 7.79,21 10,21C12.21,21 14,19.21 14,17V7H18V3H12Z" />
+    </group>
+</vector>
