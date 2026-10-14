@@ -21,6 +21,7 @@ import '../../../../core/constants/app_constants.dart';
 import '../../../../core/platform/app_platform.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/bounded_byte_stream.dart';
+import '../../../../core/utils/cached_artwork_image_provider.dart';
 import '../../../../core/utils/image_source.dart';
 import '../../../../core/utils/safe_file_name.dart';
 import '../../../../services/downloader/audio_stream_resolver.dart';
@@ -587,7 +588,7 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     final queueDurations = <String>[
       for (var index = 0; index < widgetQueueSize; index++)
         _formatWidgetDuration(
-          index < upcoming.length ? upcoming[index]?.duration : null,
+          index < upcoming.length ? upcoming[index].duration : null,
         ),
     ];
 
@@ -700,9 +701,14 @@ Future<String?> _downloadWidgetCover(Uri uri) async {
       await response.drain<void>();
       return null;
     }
-    final bytes = await consolidateHttpResponseBytes(
-      response,
-    ).timeout(_widgetCoverTimeout);
+    // Accumulated by hand: the stream helper that would do this lives in
+    // dart:io under a different name and is not available here.
+    final bytes = await response
+        .fold<List<int>>(
+          <int>[],
+          (previous, element) => previous..addAll(element),
+        )
+        .timeout(_widgetCoverTimeout);
     if (bytes.isEmpty) {
       return null;
     }
