@@ -210,7 +210,10 @@ class LibraryCsvTransferController extends Notifier<LibraryCsvTransferState> {
     state = const LibraryCsvTransferState();
   }
 
-  Future<void> shareSinglePlaylist(String playlistId, String playlistName) async {
+  Future<void> shareSinglePlaylist(
+    Playlist playlist, {
+    Rect? sharePositionOrigin,
+  }) async {
     _ensureIdle();
     _cancelRequested = false;
     state = const LibraryCsvTransferState(
@@ -221,62 +224,122 @@ class LibraryCsvTransferController extends Notifier<LibraryCsvTransferState> {
           .read(libraryOperationCoordinatorProvider)
           .runExclusive(LibraryMaintenancePhase.exportingCsv, () async {
             final repository = ref.read(libraryRepositoryProvider);
-            final allTracks = await repository.getLocalTracks();
-            final allPlaylists = await repository.getPlaylists();
+            final localTracks = await repository.getLocalTracks();
+            final tracksById = <String, LocalTrack>{
+              for (final track in localTracks) track.id: track,
+            };
+            // Catalog entries are the authoritative order and also carry
+            // songs that were added without downloading them. Legacy rows
+            // without entries fall back to the local `trackIds` order.
+            final catalog = await ref
+                .read(databaseServiceProvider)
+                .getCatalogPlaylist(playlist.id);
+            final sourcePlaylist = catalog?.playlist ?? playlist;
+            final entries =
+                catalog?.entries
+                    .where(
+                      (entry) =>
+                          !entry.isDeleted &&
+                          entry.playlistId == sourcePlaylist.id,
+                    )
+                    .toList(growable: false) ??
+                const <PlaylistEntry>[];
 
-            final playlist = allPlaylists.firstWhere(
-              (p) => p.id == playlistId,
-              orElse: () => throw StateError('Playlist not found: $playlistId'),
-            );
+            final rows = <LibraryCsvTrack>[];
+            final exportedLocalIds = <String>{};
+            final exportedVideoIds = <String>{};
+            var rowNumber = 2;
+            for (final entry in entries) {
+              final row = _trackFromCatalogEntry(
+                entry,
+                rowNumber++,
+                LibraryCsvMembership(
+                  name: sourcePlaylist.name,
+                  position: entry.position + 1,
+                  id: sourcePlaylist.id,
+                ),
+              );
+              rows.add(row);
+              final localId = entry.localTrackId;
+              if (localId != null && localId.isNotEmpty) {
+                exportedLocalIds.add(localId);
+              } else if (entry.track.provider == CatalogProvider.local) {
+                exportedLocalIds.add(entry.track.providerId);
+              }
+              final videoId = row.youtubeVideoId;
+              if (videoId != null && videoId.isNotEmpty) {
+                exportedVideoIds.add(videoId);
+              }
+            }
 
-            final trackIdsSet = playlist.trackIds.toSet();
-            final playlistTracks = allTracks
-                .where((track) => trackIdsSet.contains(track.id))
-                .toList(growable: false);
+            // Legacy playlists (or rows written by an older CSV import) only
+            // carry `trackIds`. Append whatever the catalog entries did not
+            // already cover so no song is silently dropped from the export.
+            var nextPosition = entries.isEmpty ? 1 : entries.last.position + 2;
+            for (final trackId in sourcePlaylist.trackIds) {
+              if (!exportedLocalIds.add(trackId)) {
+                continue;
+              }
+              final track = tracksById[trackId];
+              if (track == null) {
+                continue;
+              }
+              final videoId =
+                  _youtubeVideoId(track.sourceId) ??
+                  _youtubeVideoId(track.sourceUrl);
+              if (videoId != null && !exportedVideoIds.add(videoId)) {
+                continue;
+              }
+              rows.add(
+                _trackFromLocal(track, rowNumber++, [
+                  LibraryCsvMembership(
+                    name: sourcePlaylist.name,
+                    position: nextPosition++,
+                    id: sourcePlaylist.id,
+                  ),
+                ]),
+              );
+            }
 
-            final memberships = <String, List<LibraryCsvMembership>>{};
-            for (var index = 0; index < playlist.trackIds.length; index++) {
-              memberships
-                  .putIfAbsent(playlist.trackIds[index], () => [])
-                  .add(
-                    LibraryCsvMembership(
-                      name: playlist.name,
-                      position: index + 1,
-                      id: playlist.id,
-                    ),
-                  );
+            if (rows.isEmpty) {
+              throw const FormatException(
+                'La playlist no contiene canciones para compartir.',
+              );
             }
 
             return LibraryCsvDocument(
-              tracks: [
-                for (var index = 0; index < playlistTracks.length; index++)
-                  _trackFromLocal(
-                    playlistTracks[index],
-                    index + 2,
-                    memberships[playlistTracks[index].id] ?? const [],
-                  ),
-              ],
+              tracks: rows,
               detectedFormat: LibraryCsvDetectedFormat.bstream,
-              defaultPlaylistName: playlistName,
+              defaultPlaylistName: sourcePlaylist.name,
               hasPlaylistColumn: true,
             );
           });
 
-      final tempDir = await getTemporaryDirectory();
-      final safeName = playlistName
-          .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_')
-          .replaceAll(RegExp(r'\s+'), '_');
-      final file = File('${tempDir.path}/$safeName.csv');
-
-      await file.writeAsBytes(
-        const LibraryCsvService().exportDocument(document, LibraryCsvProfile.bstream),
-        flush: true,
+      final temporaryRoot = await getTemporaryDirectory();
+      final exportDirectory = await Directory(
+        p.join(temporaryRoot.path, 'ivg-playlist-shares'),
+      ).create(recursive: true);
+      final fileName = _shareFileName(document.defaultPlaylistName);
+      final file = await const LibraryCsvService().createExportFile(
+        document: document,
+        profile: LibraryCsvProfile.bstream,
+        outputPath: p.join(exportDirectory.path, fileName),
       );
 
       await SharePlus.instance.share(
         ShareParams(
-          files: [XFile(file.path)],
+          files: [
+            XFile(file.path, mimeType: 'text/csv', name: fileName),
+          ],
+          fileNameOverrides: [fileName],
+          title: document.defaultPlaylistName,
+          subject: document.defaultPlaylistName,
           text: 'Escucha mi playlist en IVG Music',
+          // iPad requires a non-empty popover anchor. Android and other
+          // platforms ignore it, so a safe fallback is always supplied.
+          sharePositionOrigin:
+              _safeShareOrigin(sharePositionOrigin) ??
+              const Rect.fromLTWH(0, 0, 1, 1),
         ),
       );
 
@@ -320,7 +383,11 @@ LibraryCsvTrack _trackFromLocal(
         : 'https://www.youtube.com/watch?v=$videoId',
     duration: track.duration,
     thumbnailUrl: track.thumbnailUrl ?? track.catalogThumbnailUrl,
-    sourceUri: track.sourceUrl,
+    // Local paths and stream URLs are device-specific and may contain
+    // credentials, so only the portable YouTube identity is exported.
+    sourceUri: videoId == null
+        ? null
+        : 'https://www.youtube.com/watch?v=$videoId',
     addedAt: track.addedAt,
     memberships: List.unmodifiable(memberships),
   );
@@ -345,6 +412,72 @@ String? _youtubeVideoId(String? input) {
     return input;
   }
   return null;
+}
+
+LibraryCsvTrack _trackFromCatalogEntry(
+  PlaylistEntry entry,
+  int rowNumber,
+  LibraryCsvMembership membership,
+) {
+  final track = entry.track;
+  final videoId = entry.videoId ?? track.youtubeVideoId;
+  final artists = track.artists
+      .map((artist) => artist.trim())
+      .where((artist) => artist.isNotEmpty)
+      .toList(growable: false);
+  return LibraryCsvTrack(
+    rowNumber: rowNumber,
+    title: track.title,
+    artist: artists.isEmpty ? '' : artists.first,
+    artists: artists,
+    album: track.album,
+    youtubeVideoId: videoId,
+    youtubeUrl: videoId == null
+        ? null
+        : 'https://www.youtube.com/watch?v=$videoId',
+    duration: track.duration,
+    thumbnailUrl: track.thumbnailUrl,
+    // Only the canonical video identity is portable. Local paths and source
+    // URLs may contain credentials or device-specific locations.
+    sourceUri: videoId == null
+        ? null
+        : 'https://www.youtube.com/watch?v=$videoId',
+    addedAt: entry.createdAt,
+    memberships: List.unmodifiable([membership]),
+  );
+}
+
+/// Produces a conservative file name that WhatsApp and other document
+/// pickers accept on every platform.
+String _shareFileName(String playlistName) {
+  var name = playlistName
+      .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1f\x7f]'), '_')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim()
+      .replaceAll(RegExp(r'[. ]+$'), '');
+  if (name.toLowerCase().endsWith('.csv')) {
+    name = name.substring(0, name.length - 4).trim();
+  }
+  if (name.isEmpty) {
+    name = 'IVG Music';
+  }
+  if (name.length > 120) {
+    name = name.substring(0, 120).trim();
+  }
+  return '$name.csv';
+}
+
+Rect? _safeShareOrigin(Rect? origin) {
+  if (origin == null ||
+      !origin.left.isFinite ||
+      !origin.top.isFinite ||
+      !origin.width.isFinite ||
+      !origin.height.isFinite ||
+      origin.width <= 0 ||
+      origin.height <= 0) {
+    return null;
+  }
+  return origin;
 }
 
 LibraryCsvGate _libraryCsvGate(Ref ref) {

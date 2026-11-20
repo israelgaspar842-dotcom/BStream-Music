@@ -2305,7 +2305,7 @@ class _NeutralLibraryIconButton extends StatelessWidget {
 
   final String tooltip;
   final IconData icon;
-  final VoidCallback onPressed;
+  final VoidCallback? onPressed;
   final double? iconSize;
   final double? buttonSize;
 
@@ -2347,7 +2347,6 @@ class _PlaylistHeaderActions extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final strings = ref.watch(appStringsProvider);
-    final controller = ref.read(libraryCsvTransferControllerProvider.notifier);
     final isBusy = ref.watch(libraryCsvTransferControllerProvider).isBusy;
 
     return Row(
@@ -2358,18 +2357,41 @@ class _PlaylistHeaderActions extends ConsumerWidget {
           icon: Icons.share,
           iconSize: 24,
           buttonSize: 48,
-          onPressed: () {
-            if (isBusy) return;
-            controller.shareSinglePlaylist(
-              playlist.id,
-              playlist.name,
-            );
-          },
+          onPressed: isBusy ? null : () => _shareCsv(context, ref),
         ),
-        const SizedBox(width: 4),
-        _PlaylistMenu(playlist: playlist, onBack: onBack),
+        // Favorites cannot be renamed or deleted, so their overflow menu is
+        // intentionally omitted; only the CSV share action applies.
+        if (!playlist.isFavorites) ...[
+          const SizedBox(width: 4),
+          _PlaylistMenu(playlist: playlist, onBack: onBack),
+        ],
       ],
     );
+  }
+
+  Future<void> _shareCsv(BuildContext context, WidgetRef ref) async {
+    final strings = ref.read(appStringsProvider);
+    try {
+      await ref
+          .read(libraryCsvTransferControllerProvider.notifier)
+          .shareSinglePlaylist(
+            playlist,
+            sharePositionOrigin: sharePositionOriginForContext(context),
+          );
+    } catch (error) {
+      debugPrint('Could not share playlist CSV: $error');
+      if (!context.mounted) return;
+      // An empty playlist is a user-facing condition, not a failure.
+      final message = error is FormatException
+          ? strings.choose(
+              'La playlist no contiene canciones para compartir.',
+              'This playlist has no songs to share.',
+            )
+          : strings.playlistShareFailed;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    }
   }
 }
 

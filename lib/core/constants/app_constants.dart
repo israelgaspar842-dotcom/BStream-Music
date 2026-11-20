@@ -17,4 +17,5 @@ class AppConstants {
   static const githubRepositoryUrl =
       'https://github.com/BryamContreras/BStream-Music';
   static const appDownloadUrl = 'https://bstreammusic.pages.dev/';
+  static const creatorProfileUrl = 'https://israelvelizgaspar.vercel.app/';
 }

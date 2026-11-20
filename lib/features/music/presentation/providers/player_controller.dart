@@ -116,14 +116,14 @@ class PlayerController extends AsyncNotifier<PlayerSnapshot> {
         }
       },
     );
-    Future.microtask(() {
-      _playbackHistoryShutdownRegistration =
-          ref.read(localDatabaseShutdownCoordinatorProvider).register(historyTracker.dispose);
-    });
+    final historyShutdownRegistration = ref
+        .read(localDatabaseShutdownCoordinatorProvider)
+        .register(historyTracker.dispose);
     final previousHistoryTracker = _playbackHistoryTracker;
     final previousHistoryShutdownRegistration =
         _playbackHistoryShutdownRegistration;
     _playbackHistoryTracker = historyTracker;
+    _playbackHistoryShutdownRegistration = historyShutdownRegistration;
     if (previousHistoryTracker != null) {
       unawaited(
         previousHistoryShutdownRegistration?.dispose() ??

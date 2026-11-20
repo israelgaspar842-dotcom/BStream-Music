@@ -1801,7 +1801,7 @@ class _AboutApplicationSettings extends StatelessWidget {
   }
 
   Future<void> _openCreatorProfile() async {
-    final uri = Uri.parse('https://israelvelizgaspar.vercel.app/');
+    final uri = Uri.parse(AppConstants.creatorProfileUrl);
     try {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     } catch (_) {
@@ -1813,14 +1813,14 @@ class _AboutApplicationSettings extends StatelessWidget {
   Future<void> _showWhatsNew(BuildContext context) async {
     final highlights = strings.isEnglish
         ? const <String>[
-            'IVG Music, Apple Music Style, and Classic Vinyl now use responsive landscape layouts.'
+            'Added the Classic Vinyl player with a spinning record and animated tonearm. IVG Music, Apple Music Style, and Classic Vinyl now use responsive landscape layouts.',
             'Android can now conservatively shorten confirmed prolonged silence in streaming and downloaded songs without disrupting crossfade or quiet musical passages.',
             'Swipe the mobile mini player left for the next song or right for the previous one, with subtle resisted movement and protection against accidental changes.',
             'New animated artwork styles are available: Spotify Canvas and Animated Artwork from Apple Music.',
             'TikTok LIVE connection bootstrap, fallbacks, and bounded retries are now more resilient to transient upstream changes.',
           ]
         : const <String>[
-            'Se agregó el reproductor Vinilo Clásico con disco giratorio y aguja animada. IVG Music, Apple Music y Vinilo Clásico ahora usan diseños horizontales adaptables.'
+            'Se agregó el reproductor Vinilo Clásico con disco giratorio y aguja animada. IVG Music, Apple Music y Vinilo Clásico ahora usan diseños horizontales adaptables.',
             'Android ahora puede acortar de forma conservadora los silencios prolongados confirmados en canciones en streaming y descargadas, sin afectar el crossfade ni los pasajes musicales suaves.',
             'Desliza el mini reproductor móvil hacia la izquierda para avanzar o hacia la derecha para volver, con movimiento sutil y protección contra cambios accidentales.',
             'Hay nuevos estilos de portadas animadas: Spotify Canvas y Animated Artwork de Apple Music.',

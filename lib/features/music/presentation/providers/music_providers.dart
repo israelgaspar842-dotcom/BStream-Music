@@ -540,13 +540,41 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
 
   PlayerSnapshot? latestSnapshot;
   var latestQueue = const PlaybackQueueState();
-  // Signature of the last payload actually written, so the position ticks the
-  // player emits between real changes never reach the host.
-  String? lastPublished;
+  // Signatures of the last payload actually written. Metadata/queue changes
+  // repaint immediately; pure position ticks are coalesced so the launcher
+  // does not redraw every second.
+  String? lastBaseSignature;
+  String? lastTimeSignature;
+  DateTime? lastTimePublishedAt;
   var lastResolvedArtwork = '';
   String? lastResolvedCoverPath;
+  String? lastAttemptedArtwork;
+  DateTime? lastArtworkAttemptAt;
+  var publishInFlight = false;
+  var publishQueued = false;
 
   Future<void> publish() async {
+    // A tick can arrive while the previous batch is still writing; coalesce
+    // them instead of letting platform-channel calls interleave.
+    if (publishInFlight) {
+      publishQueued = true;
+      return;
+    }
+    publishInFlight = true;
+    try {
+      do {
+        publishQueued = false;
+        await publishOnce();
+      } while (publishQueued);
+    } catch (error, stackTrace) {
+      debugPrint('Music widget publish failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    } finally {
+      publishInFlight = false;
+    }
+  }
+
+  Future<void> publishOnce() async {
     final snapshot = latestSnapshot;
     if (snapshot == null) {
       return;
@@ -554,11 +582,39 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     final isPlaying = snapshot.status == PlayerStatus.playing;
 
     // Resolving the artwork is async, and the answer is stable per URL, so it
-    // is cached across publishes.
+    // is cached across publishes. A failed download is retried after a delay
+    // instead of hammering the network on every playback tick.
     final artwork = snapshot.thumbnailUrl?.trim() ?? '';
-    if (artwork != lastResolvedArtwork) {
-      lastResolvedArtwork = artwork;
-      lastResolvedCoverPath = await _resolveWidgetCoverPath(artwork);
+    final coverMissing =
+        lastResolvedCoverPath != null &&
+        !File(lastResolvedCoverPath!).existsSync();
+    final artworkChanged = artwork != lastResolvedArtwork || coverMissing;
+    if (artwork.isEmpty) {
+      lastResolvedArtwork = '';
+      lastResolvedCoverPath = null;
+      lastAttemptedArtwork = null;
+      lastArtworkAttemptAt = null;
+    } else if (artworkChanged) {
+      if (artwork != lastResolvedArtwork) {
+        // A new track must never display the previous track's cover while the
+        // new one downloads, or if the download fails.
+        lastResolvedCoverPath = null;
+      }
+      final attemptedAt = DateTime.now();
+      final retryBlocked =
+          artwork == lastAttemptedArtwork &&
+          lastArtworkAttemptAt != null &&
+          attemptedAt.difference(lastArtworkAttemptAt!) <
+              _widgetCoverRetryDelay;
+      if (!retryBlocked) {
+        lastAttemptedArtwork = artwork;
+        lastArtworkAttemptAt = attemptedAt;
+        final resolved = await _resolveWidgetCoverPath(artwork);
+        lastResolvedCoverPath = resolved;
+        if (resolved != null) {
+          lastResolvedArtwork = artwork;
+        }
+      }
     }
 
     final totalMilliseconds = snapshot.duration?.inMilliseconds ?? 0;
@@ -600,21 +656,27 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     final rawArtist = snapshot.artist?.trim() ?? '';
     final artist = rawArtist.isEmpty ? 'IVG Music' : rawArtist;
 
-    final signature = [
+    final baseSignature = [
       title,
       artist,
       isPlaying ? 'playing' : 'paused',
-      '$progress',
-      elapsed,
-      remaining,
       lastResolvedCoverPath ?? '',
       ...queue,
       ...queueDurations,
     ].join('\u0000');
-    if (signature == lastPublished) {
+    final timeSignature = '$progress\u0000$elapsed\u0000$remaining';
+    final baseChanged = baseSignature != lastBaseSignature;
+    final timeChanged = timeSignature != lastTimeSignature;
+    final now = DateTime.now();
+    final elapsedSinceTimePublish = lastTimePublishedAt == null
+        ? null
+        : now.difference(lastTimePublishedAt!);
+    final allowTimePublish =
+        elapsedSinceTimePublish == null ||
+        elapsedSinceTimePublish >= _widgetPositionThrottle;
+    if (!baseChanged && (!timeChanged || !allowTimePublish)) {
       return;
     }
-    lastPublished = signature;
     try {
       await HomeWidget.saveWidgetData<String>('title', title);
       await HomeWidget.saveWidgetData<String>('artist', artist);
@@ -627,17 +689,21 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
         lastResolvedCoverPath,
       );
       for (var index = 0; index < widgetQueueSize; index++) {
-        final position = index + 1;
         await HomeWidget.saveWidgetData<String>(
-          'queue${position}Title',
+          'queue${index + 1}Title',
           queue[index],
         );
         await HomeWidget.saveWidgetData<String>(
-          'queue${position}Duration',
+          'queue${index + 1}Duration',
           queueDurations[index],
         );
       }
       await HomeWidget.updateWidget(name: 'MusicWidgetProvider');
+      // Only remember the payload after a successful write: a transient
+      // platform failure must not permanently mark the widget as up to date.
+      lastBaseSignature = baseSignature;
+      lastTimeSignature = timeSignature;
+      lastTimePublishedAt = now;
     } catch (error, stackTrace) {
       debugPrint('Music widget sync failed: $error');
       debugPrintStack(stackTrace: stackTrace);
@@ -678,10 +744,15 @@ Future<String?> _resolveWidgetCoverPath(String artwork) async {
     case 'https':
       return _downloadWidgetCover(uri);
     case 'file':
-      return uri.toFilePath();
+      final path = uri.toFilePath();
+      return File(path).existsSync() ? path : null;
     default:
-      // A bare filesystem path, or a scheme the native decoder cannot open.
-      return artwork;
+      // The native widget decodes plain files only, so content:// and other
+      // schemes fall back to the vinyl placeholder instead of a broken path.
+      if (uri.hasScheme) {
+        return null;
+      }
+      return File(artwork).existsSync() ? artwork : null;
   }
 }
 
@@ -726,6 +797,14 @@ Future<String?> _downloadWidgetCover(Uri uri) async {
 }
 
 const _widgetCoverTimeout = Duration(seconds: 4);
+
+/// Minimum delay between position-only widget writes. Metadata, playback
+/// state and queue changes still publish immediately.
+const _widgetPositionThrottle = Duration(seconds: 3);
+
+/// Cooldown before retrying a cover download that failed, to avoid hammering
+/// the network from every playback tick.
+const _widgetCoverRetryDelay = Duration(seconds: 45);
 
 /// Number of upcoming tracks the widget lists.
 const widgetQueueSize = 4;

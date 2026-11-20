@@ -46,16 +46,16 @@ Future<void> widgetBackgroundCallback(Uri? uri) async {
   if (host == null) {
     return;
   }
-    switch (host) {
-      case 'playpause':
-      case 'previous':
-      case 'next':
-      case 'playqueue1':
-      case 'playqueue2':
-      case 'playqueue3':
-      case 'playqueue4':
-        debugPrint('Widget transport relayed natively: $host');
-    case _:
+  switch (host) {
+    case 'playpause':
+    case 'previous':
+    case 'next':
+    case 'playqueue1':
+    case 'playqueue2':
+    case 'playqueue3':
+    case 'playqueue4':
+      debugPrint('Widget transport relayed natively: $host');
+    default:
       debugPrint('Widget background callback: $uri');
   }
 }
@@ -339,6 +339,8 @@ class _SharedCsvImportListener extends ConsumerStatefulWidget {
 class _SharedCsvImportListenerState
     extends ConsumerState<_SharedCsvImportListener> {
   StreamSubscription<List<SharedMediaFile>>? _mediaStreamSubscription;
+  String? _lastSharedPath;
+  DateTime? _lastSharedAt;
 
   @override
   void initState() {
@@ -347,11 +349,25 @@ class _SharedCsvImportListenerState
       return;
     }
     unawaited(
-      ReceiveSharingIntent.instance.getInitialMedia().then(_handleSharedMedia),
+      ReceiveSharingIntent.instance
+          .getInitialMedia()
+          .then(
+            _handleSharedMedia,
+            onError: (Object error, StackTrace stack) {
+              debugPrint('Could not read the initial shared file: $error');
+              debugPrintStack(stackTrace: stack);
+            },
+          ),
     );
     _mediaStreamSubscription = ReceiveSharingIntent.instance
         .getMediaStream()
-        .listen(_handleSharedMedia);
+        .listen(
+          _handleSharedMedia,
+          onError: (Object error, StackTrace stack) {
+            debugPrint('Shared file stream failed: $error');
+            debugPrintStack(stackTrace: stack);
+          },
+        );
   }
 
   @override
@@ -367,13 +383,31 @@ class _SharedCsvImportListenerState
     }
     final csv = files.where((file) {
       final mime = file.mimeType?.toLowerCase() ?? '';
-      return file.path.toLowerCase().endsWith('.csv') || mime.contains('csv');
+      final path = file.path.toLowerCase();
+      return path.endsWith('.csv') ||
+          path.endsWith('.tsv') ||
+          mime.contains('csv') ||
+          mime.contains('comma-separated') ||
+          mime.contains('ms-excel');
     }).toList(growable: false);
     if (csv.isEmpty) {
       return;
     }
+    final path = csv.first.path;
+    // Some Android versions deliver the same share through both the initial
+    // intent and the stream. Coalesce identical paths observed back to back.
+    final now = DateTime.now();
+    final isDuplicate =
+        path == _lastSharedPath &&
+        _lastSharedAt != null &&
+        now.difference(_lastSharedAt!) < const Duration(seconds: 3);
+    if (isDuplicate) {
+      return;
+    }
+    _lastSharedPath = path;
+    _lastSharedAt = now;
     unawaited(ReceiveSharingIntent.instance.reset());
-    unawaited(_importCsv(csv.first.path));
+    unawaited(_importCsv(path));
   }
 
   Future<void> _importCsv(String path) async {
@@ -402,18 +436,16 @@ class _SharedCsvImportListenerState
         strings.choose('Importación completada.', 'Import complete.'),
       );
     } catch (e, stack) {
-      // Absolute visibility: any failure while reading the shared cache or
-      // parsing the CSV surfaces the raw exception instead of aborting in
-      // silence. The stack trace is logged for diagnostics.
+      // The full error is logged for diagnostics while the user gets a
+      // localized message instead of a raw exception.
       debugPrint('Shared CSV import failed: $e');
       debugPrintStack(stackTrace: stack);
-      notifier.reset();
       sharedCsvMessengerKey.currentState?.showSnackBar(
-        SnackBar(
-          content: Text('Error crítico: $e'),
-          backgroundColor: Colors.red,
-        ),
+        SnackBar(content: Text(strings.csvImportFailed)),
       );
+    } finally {
+      // Leave the controller idle so the Settings importer starts clean.
+      notifier.reset();
     }
   }
 
