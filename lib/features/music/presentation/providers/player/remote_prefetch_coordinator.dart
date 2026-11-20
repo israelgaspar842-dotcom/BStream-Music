@@ -37,6 +37,7 @@ class RemotePrefetchPlan {
       entry.queueEntryId,
       PlaybackIdentity.remoteTrack(entry.track),
     ],
+    for (final track in cacheWindow) PlaybackIdentity.remoteTrack(track),
   ].join('\u0000');
 }
 
@@ -156,29 +157,92 @@ abstract final class RemotePrefetchPlanner {
 /// single authority deciding whether an asynchronous prefetch still belongs
 /// to the active logical queue window.
 class RemotePrefetchCoordinator {
+  RemotePrefetchCoordinator({
+    DateTime Function()? clock,
+    this.maxAutomaticRetries = 2,
+    this.additionalWarmupDelay = const Duration(seconds: 20),
+  }) : _clock = clock ?? DateTime.now,
+       assert(maxAutomaticRetries >= 0),
+       assert(additionalWarmupDelay >= Duration.zero);
+
+  final DateTime Function() _clock;
+  final int maxAutomaticRetries;
+
+  /// Native URLs and NEXT remain immediate. Only optional full-file transfers
+  /// for the second/third successor wait, leaving the audible stream room.
+  final Duration additionalWarmupDelay;
   String? _signature;
+  String? _failedSignature;
+  DateTime? _retryAfter;
+  int _failureCount = 0;
+  int _generation = 0;
+  bool _disposed = false;
+  Timer? _retryTimer;
+  Timer? _warmupDelayTimer;
+  Completer<bool>? _warmupDelayCompletion;
   Future<void> _serviceMutationTail = Future<void>.value();
 
   String? get signature => _signature;
 
+  /// After invalidation, let already-issued native mutations settle before a
+  /// same-track deck promotion captures the authoritative queue revision.
+  Future<void> waitForServiceMutations() => _serviceMutationTail;
+
   void invalidate() {
+    _generation++;
+    _cancelWarmupDelay();
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _signature = null;
+    _failedSignature = null;
+    _retryAfter = null;
+    _failureCount = 0;
   }
 
   bool begin(String signature) {
-    if (_signature == signature) {
+    if (_disposed || _signature == signature) {
       return false;
     }
+    if (_failedSignature == signature &&
+        _retryAfter != null &&
+        _clock().isBefore(_retryAfter!)) {
+      return false;
+    }
+    if (_failedSignature != signature) {
+      _failureCount = 0;
+      _failedSignature = null;
+      _retryAfter = null;
+    }
+    _generation++;
+    _cancelWarmupDelay();
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _signature = signature;
     return true;
   }
 
-  bool isCurrent(String signature) => _signature == signature;
+  bool isCurrent(String signature) => !_disposed && _signature == signature;
 
   void invalidateIfCurrent(String signature) {
     if (_signature == signature) {
+      _generation++;
+      _cancelWarmupDelay();
+      _retryTimer?.cancel();
+      _retryTimer = null;
       _signature = null;
+      _failedSignature = signature;
+      _failureCount++;
+      _retryAfter = _clock().add(
+        Duration(
+          seconds: (5 * (1 << (_failureCount - 1).clamp(0, 4))).clamp(5, 60),
+        ),
+      );
     }
+  }
+
+  void dispose() {
+    _disposed = true;
+    invalidate();
   }
 
   Future<void> prepare({
@@ -195,22 +259,20 @@ class RemotePrefetchCoordinator {
     resolve,
     required RemotePlaybackSource Function(TrackInfo track, int queueIndex)
     networkSource,
+    void Function(RemotePlaybackSource source)? onSourcePrepared,
     required PlayerService service,
     Future<void> Function(CrossfadePlaybackSource? source)? prepareCrossfade,
   }) async {
-    if (!cacheEnabled) {
-      invalidate();
-      return;
-    }
-    if (!isCurrent()) {
+    if (_disposed || !isCurrent()) {
       return;
     }
 
-    // Protection and cancellation happen synchronously inside the cache.
-    unawaited(retainOnlyTracks(plan.cacheWindow));
-    if (!isCurrent()) {
+    final activeSignature = plan.signature;
+    if (!begin(activeSignature)) {
       return;
     }
+
+    final generation = _generation;
     final nativeService = service is NativeRemoteQueuePlayer
         ? service as NativeRemoteQueuePlayer
         : null;
@@ -220,31 +282,126 @@ class RemotePrefetchCoordinator {
             ? (source) =>
                   (service as CrossfadeCapablePlayer).prepareCrossfade(source)
             : null);
-    final activeSignature = plan.signature;
-    if (!begin(activeSignature)) {
-      return;
-    }
-    bool current() => isCurrent() && this.isCurrent(activeSignature);
+    bool current() =>
+        generation == _generation &&
+        isCurrent() &&
+        this.isCurrent(activeSignature);
 
-    if (plan.upcoming.isEmpty) {
-      await _mutateServiceIfCurrent(current, () async {
-        if (crossfadePreparer != null) {
-          await crossfadePreparer(null);
-        }
-        if (!current()) {
+    void retryAfterFailure() {
+      if (!current()) return;
+      invalidateIfCurrent(activeSignature);
+      if (_failureCount > maxAutomaticRetries) return;
+      final retryGeneration = _generation;
+      final delay = _retryAfter!.difference(_clock());
+      _retryTimer = Timer(delay.isNegative ? Duration.zero : delay, () {
+        _retryTimer = null;
+        if (_disposed ||
+            retryGeneration != _generation ||
+            _failedSignature != activeSignature ||
+            !isCurrent()) {
           return;
         }
-        await nativeService?.updateRemoteQueue(const <RemotePlaybackSource>[]);
+        // A bounded number of delayed attempts for this logical window. No
+        // position snapshot or periodic poll is needed to refill a failed queue.
+        unawaited(
+          prepare(
+            plan: plan,
+            cacheEnabled: cacheEnabled,
+            isCurrent: isCurrent,
+            retainOnlyTracks: retainOnlyTracks,
+            cachedFile: cachedFile,
+            warmResolved: warmResolved,
+            resolve: resolve,
+            networkSource: networkSource,
+            onSourcePrepared: onSourcePrepared,
+            service: service,
+            prepareCrossfade: prepareCrossfade,
+          ),
+        );
       });
+    }
+
+    Future<void>? retention;
+    var retentionFailed = false;
+    if (cacheEnabled) {
+      // Protection and cancellation happen synchronously inside the cache.
+      // Native lookahead must not depend on persistent audio caching being on.
+      retention = Future<void>.sync(() => retainOnlyTracks(plan.cacheWindow))
+          .catchError((Object _) {
+            retentionFailed = true;
+          });
+      if (!current()) return;
+    }
+
+    if (plan.upcoming.isEmpty) {
+      try {
+        await _mutateServiceIfCurrent(current, () async {
+          if (crossfadePreparer != null) {
+            await crossfadePreparer(null);
+          }
+          if (!current()) {
+            return;
+          }
+          await nativeService?.updateRemoteQueue(
+            const <RemotePlaybackSource>[],
+          );
+        });
+        await retention;
+        if (retentionFailed) retryAfterFailure();
+      } catch (_) {
+        retryAfterFailure();
+      }
+      return;
+    }
+
+    // With caching off, prepare just the immediate successor for background
+    // continuity. Do not read/download cache files or resolve an entire batch.
+    final upcoming = cacheEnabled
+        ? plan.upcoming
+        : plan.upcoming.take(1).toList(growable: false);
+    if (!cacheEnabled && nativeService == null && crossfadePreparer == null) {
       return;
     }
 
     var completed = true;
     final preparedSources = <RemotePlaybackSource>[];
-    final warmups = <({int sourceIndex, Future<File?> future})>[];
-    for (final entry in plan.upcoming) {
+    final warmups = <({int sourceIndex, TrackInfo track})>[];
+    Future<bool>? immediateWarmup;
+    var sourcesFinalized = false;
+
+    Future<bool> warmAndPublish(
+      ({int sourceIndex, TrackInfo track}) warmup,
+    ) async {
       try {
-        final existing = await cachedFile(entry.track);
+        if (!current()) return false;
+        final cached = await warmResolved(warmup.track);
+        if (!current() || cached == null) return false;
+        if (nativeService != null) {
+          final previous = preparedSources[warmup.sourceIndex];
+          preparedSources[warmup.sourceIndex] = RemotePlaybackSource(
+            track: previous.track,
+            uri: cached.uri,
+            queueEntryId: previous.queueEntryId,
+            isOnlyLogicalQueueItem: previous.isOnlyLogicalQueueItem,
+          );
+          onSourcePrepared?.call(preparedSources[warmup.sourceIndex]);
+          await _mutateServiceIfCurrent(
+            current,
+            () => nativeService.updateRemoteQueue(
+              List<RemotePlaybackSource>.unmodifiable(preparedSources),
+              finalize: sourcesFinalized,
+            ),
+          );
+        }
+        return current();
+      } catch (_) {
+        return false;
+      }
+    }
+
+    for (final entry in upcoming) {
+      try {
+        final existing = cacheEnabled ? await cachedFile(entry.track) : null;
         if (!current()) {
           return;
         }
@@ -261,12 +418,30 @@ class RemotePrefetchCoordinator {
             return;
           }
           source = networkSource(resolved, entry.index);
-          warmups.add((
-            sourceIndex: preparedSources.length,
-            future: warmResolved(resolved),
-          ));
+          if (cacheEnabled) {
+            warmups.add((sourceIndex: preparedSources.length, track: resolved));
+          }
         }
         preparedSources.add(source);
+        onSourcePrepared?.call(source);
+        // Enqueue the successor before loading the optional standby deck. A
+        // slow crossfade preparation must not leave the native queue empty.
+        if (nativeService != null) {
+          await _mutateServiceIfCurrent(
+            current,
+            () => nativeService.updateRemoteQueue(
+              List<RemotePlaybackSource>.unmodifiable(preparedSources),
+              finalize: false,
+            ),
+          );
+          if (!current()) return;
+        }
+        if (preparedSources.length == 1 && warmups.isNotEmpty) {
+          // Start NEXT's full transfer now. A slow later resolver or optional
+          // standby deck must not hold it behind the rest of the lookahead.
+          // Publishing uses the same service gate and immutable snapshots.
+          immediateWarmup = warmAndPublish(warmups.first);
+        }
         if (preparedSources.length == 1 && crossfadePreparer != null) {
           await _mutateServiceIfCurrent(
             current,
@@ -275,15 +450,6 @@ class RemotePrefetchCoordinator {
           if (!current()) {
             return;
           }
-        }
-        if (nativeService != null) {
-          await _mutateServiceIfCurrent(
-            current,
-            () => nativeService.updateRemoteQueue(
-              preparedSources,
-              finalize: false,
-            ),
-          );
         }
         if (!current()) {
           return;
@@ -296,13 +462,15 @@ class RemotePrefetchCoordinator {
 
     if (nativeService != null &&
         completed &&
-        preparedSources.length == plan.upcoming.length &&
+        preparedSources.length == upcoming.length &&
         current()) {
       try {
-        await _mutateServiceIfCurrent(
-          current,
-          () => nativeService.updateRemoteQueue(preparedSources),
-        );
+        await _mutateServiceIfCurrent(current, () async {
+          await nativeService.updateRemoteQueue(
+            List<RemotePlaybackSource>.unmodifiable(preparedSources),
+          );
+          sourcesFinalized = true;
+        });
       } catch (_) {
         completed = false;
       }
@@ -310,39 +478,72 @@ class RemotePrefetchCoordinator {
 
     for (final warmup in warmups) {
       try {
-        final cached = await warmup.future;
-        if (!current()) {
-          return;
-        }
-        if (cached == null) {
-          completed = false;
+        if (!current()) return;
+        if (warmup.sourceIndex == 0) {
+          final warmed = await (immediateWarmup ?? warmAndPublish(warmup));
+          if (!current()) return;
+          if (!warmed) {
+            completed = false;
+            break;
+          }
           continue;
         }
-        if (nativeService != null) {
-          final previous = preparedSources[warmup.sourceIndex];
-          preparedSources[warmup.sourceIndex] = RemotePlaybackSource(
-            track: previous.track,
-            uri: cached.uri,
-            queueEntryId: previous.queueEntryId,
-            isOnlyLogicalQueueItem: previous.isOnlyLogicalQueueItem,
-          );
-          await _mutateServiceIfCurrent(
-            current,
-            () => nativeService.updateRemoteQueue(preparedSources),
-          );
-          if (!current()) {
-            return;
-          }
+        // Retry a failed NEXT/native preparation on its normal backoff, rather
+        // than waiting through optional transfers before scheduling the retry.
+        if (!completed || retentionFailed) break;
+        if (!await _waitForAdditionalWarmup(current)) return;
+        final warmed = await warmAndPublish(warmup);
+        if (!current()) return;
+        if (!warmed) {
+          completed = false;
+          break;
         }
       } catch (_) {
         completed = false;
       }
     }
+    await retention;
+    if (retentionFailed) completed = false;
     if (!completed && current()) {
       if (preparedSources.isEmpty && crossfadePreparer != null) {
-        await _mutateServiceIfCurrent(current, () => crossfadePreparer(null));
+        try {
+          await _mutateServiceIfCurrent(current, () => crossfadePreparer(null));
+        } catch (_) {
+          // A failed standby cleanup must not prevent the bounded queue retry.
+        }
       }
-      invalidateIfCurrent(activeSignature);
+      retryAfterFailure();
+    } else if (completed && current()) {
+      _failedSignature = null;
+      _retryAfter = null;
+      _failureCount = 0;
+    }
+  }
+
+  Future<bool> _waitForAdditionalWarmup(bool Function() isCurrent) {
+    if (additionalWarmupDelay == Duration.zero) {
+      return Future<bool>.value(isCurrent());
+    }
+    if (!isCurrent()) return Future<bool>.value(false);
+    _cancelWarmupDelay();
+    final completion = Completer<bool>();
+    _warmupDelayCompletion = completion;
+    _warmupDelayTimer = Timer(additionalWarmupDelay, () {
+      if (!identical(_warmupDelayCompletion, completion)) return;
+      _warmupDelayTimer = null;
+      _warmupDelayCompletion = null;
+      completion.complete(isCurrent());
+    });
+    return completion.future;
+  }
+
+  void _cancelWarmupDelay() {
+    _warmupDelayTimer?.cancel();
+    _warmupDelayTimer = null;
+    final completion = _warmupDelayCompletion;
+    _warmupDelayCompletion = null;
+    if (completion != null && !completion.isCompleted) {
+      completion.complete(false);
     }
   }
 

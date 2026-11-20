@@ -443,6 +443,7 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
   final _committingMusicQueueGenerations = <int>{};
   final _scheduledMusicItems = <String, _ScheduledLiveQueueItem>{};
   final _cancelledMusicSequences = <int>{};
+  final _publishedLiveQueueItemIds = <String>{};
   int _activeMusicResolutions = 0;
   int _nextMusicSequence = 0;
   int _nextMusicSequenceToCommit = 0;
@@ -456,8 +457,13 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
   @override
   Future<TikTokLiveState> build() async {
     final service = ref.watch(tiktokLiveCommandServiceProvider);
+    final player = ref.read(playerControllerProvider.notifier);
+    player.addLiveQueueCompletionListener(_handleLiveQueuePlaybackCompleted);
     final subscription = service.events.listen(_handleBridgeEvent);
     ref.onDispose(() {
+      player.removeLiveQueueCompletionListener(
+        _handleLiveQueuePlaybackCompleted,
+      );
       _cancelMusicQueueOperations();
       unawaited(subscription.cancel());
     });
@@ -609,8 +615,9 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
     await ref.read(tiktokLiveCommandServiceProvider).disconnect();
     final current = await future;
     final player = ref.read(playerControllerProvider.notifier);
-    if (player.isLiveQueueActive) {
-      await player.clearQueueSource(PlayerController.liveQueueSourceId);
+    final liveWasActive = player.isLiveQueueActive;
+    await player.clearQueueSource(PlayerController.liveQueueSourceId);
+    if (liveWasActive) {
       await player.stop();
     }
     state = AsyncData(
@@ -631,49 +638,116 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
     state = AsyncData(
       current.copyWith(liveQueue: const [], message: 'Cola LIVE limpia.'),
     );
-    if (liveWasActive) {
-      await player.clearQueueSource(PlayerController.liveQueueSourceId);
-      if (stopPlayback) {
-        await player.stop();
-      }
+    await player.clearQueueSource(PlayerController.liveQueueSourceId);
+    if (liveWasActive && stopPlayback) {
+      await player.stop();
     }
   }
 
   Future<void> revokeLastLiveQueueItem() async {
-    final current = await future;
-    if (current.liveQueue.isEmpty) {
+    await future;
+    if (!ref.mounted) return;
+    final current = state.value;
+    if (current == null || current.liveQueue.isEmpty) {
       _setMessage('No hay pedidos en la cola LIVE para retirar.');
       return;
     }
+    await _removeLiveQueueItem(current.liveQueue.last.id, lastRequest: true);
+  }
 
-    final removed = current.liveQueue.last;
-    final remaining = List<LiveQueueItem>.unmodifiable(
-      current.liveQueue.take(current.liveQueue.length - 1),
+  Future<void> removeLiveQueueItem(String itemId) =>
+      _removeLiveQueueItem(itemId);
+
+  Future<void> _removeLiveQueueItem(
+    String itemId, {
+    bool lastRequest = false,
+  }) async {
+    await future;
+    if (!ref.mounted) return;
+    // Re-read after awaiting initialization so rapid removals cannot restore
+    // a row from an older snapshot of the queue.
+    final current = state.value;
+    if (current == null) return;
+    final removedIndex = current.liveQueue.indexWhere(
+      (item) => item.id == itemId,
     );
+    if (removedIndex < 0) return;
+    final removed = current.liveQueue[removedIndex];
+    final remaining = List<LiveQueueItem>.unmodifiable(
+      current.liveQueue.where((item) => item.id != itemId),
+    );
+    final next = current.copyWith(liveQueue: remaining);
+    final removedReadyIndex = _readyLiveTrackIndex(current, removed);
+    // Several requests can share one deduplicated playback entry. Only retire
+    // that entry once its last request has been removed.
+    final removesPlaybackEntry =
+        removedReadyIndex >= 0 && _readyLiveTrackIndex(next, removed) < 0;
     final player = ref.read(playerControllerProvider.notifier);
     final playback = ref.read(playerControllerProvider).value;
     final removesPlayingItem =
-        removed.isReady &&
+        removesPlaybackEntry &&
         player.isLiveQueueActive &&
         _snapshotMatchesLiveQueueItem(playback, removed);
 
     if (removesPlayingItem) {
       _revokedPlayingItem = removed;
-      _revokedPlayingReadyIndex = removed.saveToLibrary
-          ? remaining.where((item) => item.localTrack != null).length
-          : remaining.where((item) => item.remoteTrack != null).length;
+      _revokedPlayingReadyIndex = removedReadyIndex;
+    } else if (removesPlaybackEntry && !player.isLiveQueueActive) {
+      // Retire this occurrence before another request can reuse the same
+      // video's id and accidentally inherit its interrupted seek position.
+      player.removeInterruptedLiveQueueItemAt(removedReadyIndex);
     }
+    if (!removesPlayingItem &&
+        removesPlaybackEntry &&
+        _revokedPlayingItem?.saveToLibrary == removed.saveToLibrary &&
+        removedReadyIndex < _revokedPlayingReadyIndex) {
+      _revokedPlayingReadyIndex--;
+    }
+    _publishedLiveQueueItemIds.remove(removed.id);
+    state = AsyncData(next);
+    // Cancellation can immediately commit the next resolved request. Publish
+    // the removal first so that commit is not overwritten by this snapshot.
     _cancelScheduledLiveQueueItem(removed.id);
-    state = AsyncData(current.copyWith(liveQueue: remaining));
 
     if (removed.isReady && player.isLiveQueueActive) {
       await _syncLiveQueuePlaybackInOrder(saveToLibrary: removed.saveToLibrary);
     }
-    _setMessage('Último pedido retirado: ${removed.query}');
+    _setMessage(
+      lastRequest
+          ? 'Último pedido retirado: ${removed.query}'
+          : 'Pedido retirado: ${removed.query}',
+    );
+  }
+
+  int _readyLiveTrackIndex(TikTokLiveState queue, LiveQueueItem item) {
+    if (!item.isReady) return -1;
+    if (item.saveToLibrary) {
+      return queue.readyTracks.indexWhere(
+        (track) => track.id == item.localTrack?.id,
+      );
+    }
+    final remote = item.remoteTrack;
+    if (remote == null) return -1;
+    String key(TrackInfo track) =>
+        track.id.trim().isEmpty ? track.url : track.id;
+    final itemKey = key(remote);
+    return queue.readyRemoteTracks.indexWhere((track) => key(track) == itemKey);
   }
 
   Future<void> playLiveQueueItem(String itemId) async {
-    final current = await future;
+    await future;
+    if (!ref.mounted) {
+      return;
+    }
+    final player = ref.read(playerControllerProvider.notifier);
+    await player.waitForLiveQueueRestoration();
+    if (!ref.mounted) {
+      return;
+    }
+    final current = state.value;
+    if (current == null) {
+      return;
+    }
     final item = current.liveQueue
         .where((entry) => entry.id == itemId && entry.isReady)
         .firstOrNull;
@@ -683,13 +757,13 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
 
     _clearRevokedPlayingItem();
     _liveQueueActivated = true;
-    final player = ref.read(playerControllerProvider.notifier);
     if (item.saveToLibrary) {
       final track = item.localTrack;
       final readyTracks = current.readyTracks;
       if (track == null || readyTracks.isEmpty) {
         return;
       }
+      _recordPublishedLiveQueueItems(current);
       await player.playLocal(
         track,
         queue: readyTracks,
@@ -705,6 +779,7 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
     if (track == null || readyTracks.isEmpty) {
       return;
     }
+    _recordPublishedLiveQueueItems(current);
     await player.playRemote(
       track,
       queue: readyTracks,
@@ -1026,6 +1101,7 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
         }
         if (!resolution.isSuccess) {
           final errorMessage = resolution.errorMessage ?? 'Error desconocido';
+          _recordFailedLiveQueueItem(item.id);
           _updateLiveQueueItem(
             item.id,
             (entry) => entry.copyWith(
@@ -1068,6 +1144,7 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
           }
         } catch (error) {
           if (_isLiveQueueOperationCurrent(item.id, generation)) {
+            _recordFailedLiveQueueItem(item.id);
             _updateLiveQueueItem(
               item.id,
               (entry) => entry.copyWith(
@@ -1100,6 +1177,13 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
   }
 
   Future<void> _syncLiveQueuePlayback({required bool saveToLibrary}) async {
+    final player = ref.read(playerControllerProvider.notifier);
+    await player.waitForLiveQueueRestoration();
+    if (!ref.mounted) {
+      return;
+    }
+    // Re-read after restoration: requests can resolve while the previous LIVE
+    // batch returns to its original queue. They belong to the next batch.
     final current = state.value;
     if (current == null) {
       return;
@@ -1112,7 +1196,6 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
 
     final readyTracks = _localPlaybackTracks(current);
     if (readyTracks.isEmpty) {
-      final player = ref.read(playerControllerProvider.notifier);
       if (player.isLiveQueueActive) {
         _liveQueueActivated = false;
         await player.clearQueueSource(PlayerController.liveQueueSourceId);
@@ -1123,22 +1206,18 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
     final playerState = ref.read(playerControllerProvider).value;
     final currentTrackId = playerState?.trackId;
     final currentIsLiveTrack =
+        player.isLiveQueueActive &&
         currentTrackId != null &&
         readyTracks.any((track) => track.id == currentTrackId);
-    final player = ref.read(playerControllerProvider.notifier);
-
     if (!_liveQueueActivated || !currentIsLiveTrack) {
       _liveQueueActivated = true;
-      await player.playLocal(
-        readyTracks.first,
-        queue: readyTracks,
-        useNativeQueue: false,
-        queueSourceId: PlayerController.liveQueueSourceId,
-      );
+      _recordPublishedLiveQueueItems(current);
+      await player.resumeLocalLiveQueue(readyTracks);
       _throwIfLivePlaybackFailed();
       return;
     }
 
+    _recordPublishedLiveQueueItems(current);
     player.replaceLocalQueue(readyTracks, currentTrackId: currentTrackId);
     final playbackFinished =
         playerState?.status == PlayerStatus.stopped ||
@@ -1163,22 +1242,22 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
     }
 
     final playerState = ref.read(playerControllerProvider).value;
-    final currentIsLiveTrack = readyTracks.any(
-      (track) => _snapshotMatchesRemoteTrack(playerState, track),
-    );
     final player = ref.read(playerControllerProvider.notifier);
+    final currentIsLiveTrack =
+        player.isLiveQueueActive &&
+        readyTracks.any(
+          (track) => _snapshotMatchesRemoteTrack(playerState, track),
+        );
 
     if (!_liveQueueActivated || !currentIsLiveTrack) {
       _liveQueueActivated = true;
-      await player.playRemote(
-        readyTracks.first,
-        queue: readyTracks,
-        queueSourceId: PlayerController.liveQueueSourceId,
-      );
+      _recordPublishedLiveQueueItems(current);
+      await player.resumeRemoteLiveQueue(readyTracks);
       _throwIfLivePlaybackFailed();
       return;
     }
 
+    _recordPublishedLiveQueueItems(current);
     await player.syncRemoteQueueSource(
       PlayerController.liveQueueSourceId,
       readyTracks,
@@ -1192,6 +1271,47 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
       await player.playNext();
     }
     _throwIfLivePlaybackFailed();
+  }
+
+  void _recordPublishedLiveQueueItems(TikTokLiveState current) {
+    _publishedLiveQueueItemIds
+      ..clear()
+      ..addAll(
+        current.liveQueue
+            .where((item) => !item.isPending)
+            .map((item) => item.id),
+      );
+  }
+
+  void _recordFailedLiveQueueItem(String itemId) {
+    if (_liveQueueActivated &&
+        ref.read(playerControllerProvider.notifier).isLiveQueueActive) {
+      // A request can fail after the last playable queue update. It still
+      // belongs to this batch and should not remain as stale LIVE history.
+      _publishedLiveQueueItemIds.add(itemId);
+    }
+  }
+
+  void _handleLiveQueuePlaybackCompleted() {
+    final completedIds = Set<String>.of(_publishedLiveQueueItemIds);
+    _publishedLiveQueueItemIds.clear();
+    _liveQueueActivated = false;
+    _clearRevokedPlayingItem();
+    final current = state.value;
+    if (current == null) {
+      return;
+    }
+    // Do not invalidate the resolution generation here. Searches/downloads
+    // accepted later must survive, as must ready items not published yet.
+    state = AsyncData(
+      current.copyWith(
+        liveQueue: [
+          for (final item in current.liveQueue)
+            if (!completedIds.contains(item.id)) item,
+        ],
+        message: 'Cola LIVE finalizada.',
+      ),
+    );
   }
 
   List<LocalTrack> _localPlaybackTracks(TikTokLiveState current) {
@@ -1289,6 +1409,7 @@ class TikTokLiveController extends AsyncNotifier<TikTokLiveState> {
 
   void _cancelMusicQueueOperations() {
     _liveQueueGeneration++;
+    _publishedLiveQueueItemIds.clear();
     _pendingMusicQueue.clear();
     _completedMusicResolutions.clear();
     _scheduledMusicItems.clear();

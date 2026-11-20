@@ -2,6 +2,29 @@ name: Nightly native smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Native platform to validate
+        type: choice
+        default: all
+        options:
+          - all
+          - android
+          - ios
+          - windows
+      ios_scenario:
+        description: iOS scenario to validate
+        type: choice
+        default: all
+        options:
+          - all
+          - equalizer
+          - silence
+          - crossfade
+      ios_debugger:
+        description: Capture a native backtrace (use ios_scenario=silence)
+        type: boolean
+        default: false
   schedule:
     - cron: "41 6 * * *"
 
@@ -13,11 +36,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FLUTTER_VERSION: "3.47.2"
+  FLUTTER_VERSION: "3.47.9"
 
 jobs:
   windows-native:
     name: Windows crossfade and InnerTube playback
+    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -52,6 +76,12 @@ jobs:
           -d windows
           --dart-define=BSTREAM_HEADLESS_AUDIO=true
 
+      - name: Run native equalizer smoke
+        run: >-
+          flutter test integration_test/equalizer_native_test.dart
+          -d windows
+          --dart-define=BSTREAM_HEADLESS_AUDIO=true
+
       - name: Run live InnerTube playback smoke
         run: >-
           flutter test integration_test/innertube_playback_live_test.dart
@@ -62,6 +92,7 @@ jobs:
 
   android-native:
     name: Android native crossfade
+    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'android'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -103,14 +134,221 @@ jobs:
           emulator-options: >-
             -no-snapshot-save -no-window -gpu swiftshader_indirect
             -noaudio -no-boot-anim -camera-back none
+          # This action executes each script line in a separate shell.
           script: |
-            flutter drive \
-              --driver=test_driver/integration_test.dart \
-              --target=integration_test/crossfade_native_test.dart \
-              -d emulator-5554 \
-              --no-dds
-            flutter drive \
-              --driver=test_driver/integration_test.dart \
+            flutter drive --driver=test_driver/integration_test.dart --target=integration_test/crossfade_native_test.dart -d emulator-5554 --no-dds
+            flutter drive --driver=test_driver/integration_test.dart --target=integration_test/skip_silence_native_test.dart -d emulator-5554 --no-dds
+            flutter drive --driver=test_driver/integration_test.dart --target=integration_test/equalizer_android_native_test.dart -d emulator-5554 --no-dds
+
+  ios-native:
+    name: iOS DSP, silence skipping, and crossfade
+    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'ios'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Compile and test native Darwin audio processing
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_dir="third_party/just_audio/darwin/just_audio/Sources/just_audio"
+          include_dir="$native_dir/include/just_audio"
+          native_build="$RUNNER_TEMP/bstream-darwin-audio-tests"
+          mkdir -p "$native_build"
+          xcrun --sdk macosx clang -std=c11 -O2 -Wall -Wextra \
+            -I "$include_dir" -c "$native_dir/BStreamAudioDSP.c" \
+            -o "$native_build/BStreamAudioDSP.o"
+          xcrun --sdk macosx clang -fobjc-arc -fblocks -std=c11 -O2 -Wall -Wextra \
+            -Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
+            -Werror=objc-method-access -I "$include_dir" \
+            test/native/darwin_audio_processing_test.m \
+            "$native_dir/BStreamSilenceAnalyzer.m" "$native_dir/BStreamAudioProcessingTap.m" \
+            "$native_build/BStreamAudioDSP.o" \
+            -framework Foundation -framework CoreFoundation -framework AVFoundation \
+            -framework MediaToolbox -framework AudioToolbox -framework CoreMedia \
+            -o "$native_build/darwin_audio_processing_test"
+          "$native_build/darwin_audio_processing_test"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Resolve locked dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Select and boot an available iOS simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtimes_file="$RUNNER_TEMP/bstream-ios-runtimes.json"
+          devices_file="$RUNNER_TEMP/bstream-ios-devices.json"
+          selection_file="$RUNNER_TEMP/bstream-ios-selection.tsv"
+          xcrun simctl list runtimes --json > "$runtimes_file"
+          xcrun simctl list devices available --json > "$devices_file"
+          python3 - "$runtimes_file" "$devices_file" <<'PY' > "$selection_file"
+          import json
+          import sys
+          import uuid
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              runtimes = json.load(source)["runtimes"]
+          with open(sys.argv[2], encoding="utf-8") as source:
+              devices = json.load(source)["devices"]
+
+          def version(runtime):
+              return tuple(int(part) for part in runtime["version"].split("."))
+
+          available = [runtime for runtime in runtimes
+                       if runtime.get("isAvailable", False)
+                       and runtime["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]
+          for runtime in sorted(available, key=version, reverse=True):
+              phones = [device for device in devices.get(runtime["identifier"], [])
+                        if device.get("isAvailable", False)
+                        and device["name"].startswith("iPhone")]
+              phones.sort(key=lambda device: (device["state"] != "Booted", device["name"]))
+              if phones:
+                  device = phones[0]
+                  print(f"{uuid.UUID(device['udid'])}\t{device['state']}")
+                  break
+          else:
+              raise SystemExit("No available iOS iPhone simulator and runtime were found")
+          PY
+          IFS=$'\t' read -r simulator_id simulator_state < "$selection_file"
+          if [[ "$simulator_state" != "Booted" ]]; then
+            xcrun simctl boot "$simulator_id"
+          fi
+          xcrun simctl bootstatus "$simulator_id" -b
+          printf 'BSTREAM_IOS_SIMULATOR_ID=%s\n' "$simulator_id" >> "$GITHUB_ENV"
+
+      - name: Run native iOS equalizer scenarios
+        if: github.event_name == 'schedule' || inputs.ios_scenario == 'all' || inputs.ios_scenario == 'equalizer'
+        shell: bash
+        run: >-
+          flutter drive --driver=test_driver/integration_test.dart
+          --target=integration_test/equalizer_ios_native_test.dart
+          -d "$BSTREAM_IOS_SIMULATOR_ID" --no-dds
+
+      - name: Run native iOS silence skipping scenarios
+        if: github.event_name == 'schedule' || inputs.ios_scenario == 'all' || inputs.ios_scenario == 'silence'
+        shell: bash
+        run: |
+          native_debugger_pid=""
+          if [[ "${{ inputs.ios_debugger }}" == "true" ]]; then
+            diagnostics="$RUNNER_TEMP/ios-native-diagnostics"
+            mkdir -p "$diagnostics"
+            sudo /usr/sbin/DevToolsSecurity -enable || true
+            (
+              set +e
+              xcrun lldb --batch \
+                -o 'settings set auto-confirm true' \
+                -o 'process attach --name Runner --waitfor' \
+                -o 'process handle -s false -n false -p true SIGPIPE SIGUSR1 SIGUSR2 SIGPROF SIGTERM' \
+                -o 'continue' \
+                -k 'thread backtrace all' \
+                -k 'register read' \
+                -k 'process kill' \
+                -o 'quit' \
+                > "$diagnostics/lldb.log" 2>&1 < /dev/null
+              printf '%s\n' "$?" > "$diagnostics/lldb-finished"
+            ) &
+            native_debugger_pid=$!
+          fi
+          trap 'if [[ -n "$native_debugger_pid" ]]; then kill "$native_debugger_pid" 2>/dev/null || true; fi' EXIT
+          if [[ -n "$native_debugger_pid" ]]; then
+            python3 - "$diagnostics" <<'PY'
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          diagnostics = Path(sys.argv[1])
+          command = ["flutter", "drive", "--driver=test_driver/integration_test.dart",
+                     "--target=integration_test/skip_silence_native_test.dart",
+                     "-d", os.environ["BSTREAM_IOS_SIMULATOR_ID"], "--no-dds"]
+          driver = subprocess.Popen(command, start_new_session=True)
+          deadline = time.monotonic() + 1200
+          failure = None
+          try:
+              while driver.poll() is None:
+                  if (diagnostics / "lldb-finished").exists():
+                      failure = "Native debugger stopped; collecting its backtrace."
+                      break
+                  if time.monotonic() >= deadline:
+                      failure = "Native diagnostic exceeded its twenty-minute limit."
+                      break
+                  time.sleep(1)
+              if failure:
+                  print(failure, flush=True)
+                  log = diagnostics / "lldb.log"
+                  if log.exists():
+                      print(log.read_text(errors="replace"), flush=True)
+                  sys.exit(124)
+              sys.exit(driver.returncode)
+          finally:
+              if driver.poll() is None:
+                  os.killpg(driver.pid, signal.SIGTERM)
+                  try:
+                      driver.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(driver.pid, signal.SIGKILL)
+                      driver.wait()
+          PY
+          else
+            flutter drive --driver=test_driver/integration_test.dart \
               --target=integration_test/skip_silence_native_test.dart \
-              -d emulator-5554 \
-              --no-dds
+              -d "$BSTREAM_IOS_SIMULATOR_ID" --no-dds
+          fi
+
+      - name: Run native iOS crossfade scenarios
+        if: github.event_name == 'schedule' || inputs.ios_scenario == 'all' || inputs.ios_scenario == 'crossfade'
+        shell: bash
+        run: >-
+          flutter drive --driver=test_driver/integration_test.dart
+          --target=integration_test/crossfade_native_test.dart
+          -d "$BSTREAM_IOS_SIMULATOR_ID" --no-dds
+
+      - name: Collect iOS failure diagnostics
+        if: always() && (failure() || cancelled())
+        shell: bash
+        run: |
+          diagnostics="$RUNNER_TEMP/ios-native-diagnostics"
+          mkdir -p "$diagnostics"
+          # ReportCrash writes asynchronously after the process terminates.
+          sleep 10
+          if [[ -n "${BSTREAM_IOS_SIMULATOR_ID:-}" ]]; then
+            xcrun simctl spawn "$BSTREAM_IOS_SIMULATOR_ID" log show \
+              --style compact --last 20m \
+              --predicate 'process == "Runner" OR process == "ReportCrash" OR eventMessage CONTAINS[c] "com.bstream.bstreamMusic"' \
+              > "$diagnostics/simulator.log" 2>&1 || true
+          fi
+          for report_dir in \
+            "$HOME/Library/Logs/DiagnosticReports" \
+            "$HOME/Library/Developer/CoreSimulator/Devices/${BSTREAM_IOS_SIMULATOR_ID:-none}/data/Library/Logs/CrashReporter"
+          do
+            if [[ -d "$report_dir" ]]; then
+              find "$report_dir" -type f \
+                \( -name 'Runner*.ips' -o -name 'Runner*.crash' -o -name 'JetsamEvent*.ips' -o -name 'darwin_audio_processing_test*.ips' \) \
+                -print -exec cp -p '{}' "$diagnostics/" \;
+            fi
+          done
+
+      - name: Upload iOS failure diagnostics
+        if: always() && (failure() || cancelled())
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-native-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-native-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Stop the iOS simulator
+        if: always() && env.BSTREAM_IOS_SIMULATOR_ID != ''
+        shell: bash
+        run: xcrun simctl shutdown "$BSTREAM_IOS_SIMULATOR_ID"

@@ -9,6 +9,9 @@ import '../../core/platform/app_platform.dart';
 import '../../features/music/domain/entities/local_track.dart';
 import '../../features/music/domain/entities/track_info.dart';
 import 'crossfade_transition.dart';
+import 'media_kit_equalizer.dart';
+import 'player_audio_output.dart';
+import 'player_equalizer.dart';
 import 'player_service.dart';
 
 typedef MediaKitOperationDeadline = Future<void> Function(Duration duration);
@@ -21,6 +24,9 @@ abstract interface class MediaKitPlayerBackend {
   Stream<bool> get bufferingStream;
   Stream<bool> get playingStream;
   Stream<bool> get completedStream;
+
+  /// Native EOF state, updated before its playing/completed stream events.
+  bool get completed;
   Stream<String> get errorStream;
   Object? get platform;
 
@@ -41,10 +47,15 @@ abstract interface class MediaKitPlayerBackend {
   Future<void> dispose();
 }
 
-class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
+class _MediaKitPlayerBackend
+    implements
+        MediaKitPlayerBackend,
+        PlayerAudioOutput,
+        EqualizerCapablePlayer {
   _MediaKitPlayerBackend() {
     _player = _createPlayer();
     _playerInitialization = _headlessInitialization(_player);
+    _playerInitialization?.ignore();
     _playerSubscriptions = _forwardEvents(_player, _epoch);
   }
 
@@ -65,6 +76,224 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
   final _playings = StreamController<bool>.broadcast();
   final _completions = StreamController<bool>.broadcast();
   final _errors = StreamController<String>.broadcast();
+  final _audioOutputs = StreamController<PlayerAudioOutputState>.broadcast();
+  List<PlayerAudioDevice> _audioDevices = const [];
+  String _audioDeviceId = systemDefaultAudioDeviceId;
+  EqualizerSettings _equalizerSettings = const EqualizerSettings();
+  EqualizerSettings? _appliedEqualizer = const EqualizerSettings();
+  double _logicalVolume = 100;
+  double _equalizerOutputGain = 1;
+  bool _equalizerUnavailable = false;
+  Future<void>? _equalizerRecovery;
+  Future<void> _equalizerTail = Future<void>.value();
+  int _equalizerRevision = 0;
+  Completer<void> _equalizerCancellation = Completer<void>();
+
+  @override
+  bool get supportsEqualizer =>
+      !_equalizerUnavailable && _player.platform is NativePlayer;
+
+  @override
+  Future<void> configureEqualizer(EqualizerSettings settings) {
+    _equalizerSettings = settings.normalized;
+    final revision = ++_equalizerRevision;
+    final player = _player;
+    final epoch = _epoch;
+    final initialization = _playerInitialization;
+    final operation = _equalizerTail.then((_) async {
+      if (_disposed || epoch != _epoch || revision != _equalizerRevision) {
+        return;
+      }
+      if (initialization != null) await initialization;
+      if (_disposed || epoch != _epoch || revision != _equalizerRevision) {
+        return;
+      }
+      final curve = _equalizerSettings;
+      if (_appliedEqualizer == curve) return;
+      if (_equalizerUnavailable && curve.enabled && !curve.isFlat) {
+        throw UnsupportedError('The native equalizer is unavailable.');
+      }
+      final platform = player.platform;
+      if (platform is! NativePlayer) {
+        throw UnsupportedError('This backend has no native equalizer.');
+      }
+      _appliedEqualizer = null;
+      final gain = curve.outputGain;
+      try {
+        // The shipped minimal libavfilter contains equalizer, but not volume.
+        // Process the bands in f64 and reserve output headroom using mpv's own
+        // gain. Linear floating-point filtering commutes with this attenuation
+        // and has no integer clipping between bands.
+        if (gain < _equalizerOutputGain) {
+          await _setEqualizerOutputGain(player, gain);
+        }
+        await MediaKitEqualizerFilter.apply(platform, curve);
+        await _setEqualizerOutputGain(player, gain);
+      } catch (_) {
+        try {
+          await MediaKitEqualizerFilter.apply(
+            platform,
+            const EqualizerSettings(),
+          );
+        } catch (_) {
+          // Preserve the original optional-filter error for the caller.
+        }
+        await _setEqualizerOutputGain(player, 1);
+        rethrow;
+      }
+      if (!_disposed && epoch == _epoch) _appliedEqualizer = curve;
+    });
+    final future = Future.any<void>([operation, _equalizerCancellation.future]);
+    _equalizerTail = future.catchError((Object _) {});
+    return future;
+  }
+
+  Future<void> _setEqualizerOutputGain(Player player, double gain) async {
+    if (_disposed || !identical(player, _player)) return;
+    if (_equalizerOutputGain == gain) return;
+    _equalizerOutputGain = gain;
+    await player.setVolume(_logicalVolume * gain);
+  }
+
+  Future<void> _restorePlayerState(Player player, String deviceId) async {
+    await _restoreAudioOutput(player, deviceId);
+    final curve = _equalizerUnavailable
+        ? const EqualizerSettings()
+        : _equalizerSettings;
+    final platform = player.platform;
+    if (platform is NativePlayer) {
+      try {
+        await MediaKitEqualizerFilter.apply(platform, curve);
+        await player.setVolume(_logicalVolume * curve.outputGain);
+        if (!_disposed && identical(player, _player)) {
+          _equalizerOutputGain = curve.outputGain;
+        }
+        if (!_disposed && identical(player, _player)) _appliedEqualizer = curve;
+      } catch (error, stackTrace) {
+        await player.setVolume(_logicalVolume);
+        if (!_disposed && identical(player, _player)) _equalizerOutputGain = 1;
+        // A filter unavailable in an older libmpv must not prevent a fresh
+        // decoder from recovering after a cancelled or blocked load.
+        developer.log(
+          'Could not restore the native equalizer',
+          name: 'BStreamPlayback',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+    }
+  }
+
+  void _onNativeEqualizerLog(Player player, int epoch, PlayerLog log) {
+    if (_disposed ||
+        epoch != _epoch ||
+        _equalizerUnavailable ||
+        _equalizerRecovery != null ||
+        log.level != 'error') {
+      return;
+    }
+    final curve = _appliedEqualizer;
+    if (curve == null || !curve.enabled || curve.isFlat) return;
+    final filterError =
+        ((log.prefix.contains('lavfi') || log.prefix == 'af') &&
+            RegExp(
+              'No such filter|initializ|filtergraph|Option.*not found',
+              caseSensitive: false,
+            ).hasMatch(log.text)) ||
+        (log.prefix == 'cplayer' &&
+            log.text.toLowerCase().contains('audio filter'));
+    if (!filterError) return;
+    // af is writable while idle, even when a required FFmpeg filter is absent.
+    // A failure can therefore arrive only when the first audio frame is decoded.
+    // Retire just this optional effect; source ownership stays with playback.
+    _equalizerUnavailable = true;
+    final recovery = _recoverNativeEqualizer(player, epoch);
+    _equalizerRecovery = recovery;
+    unawaited(
+      recovery.whenComplete(() {
+        if (identical(_equalizerRecovery, recovery)) _equalizerRecovery = null;
+      }),
+    );
+  }
+
+  Future<void> _recoverNativeEqualizer(Player player, int epoch) async {
+    bool isCurrent() => !_disposed && epoch == _epoch;
+    try {
+      developer.log(
+        'Bypassing an unavailable native equalizer; retaining the playback source',
+        name: 'BStreamPlayback',
+      );
+      final platform = player.platform;
+      if (platform is NativePlayer) {
+        await MediaKitEqualizerFilter.apply(
+          platform,
+          const EqualizerSettings(),
+        );
+      }
+      if (!isCurrent()) return;
+      _appliedEqualizer = const EqualizerSettings();
+      await _setEqualizerOutputGain(player, 1);
+    } catch (error, stackTrace) {
+      developer.log(
+        'Could not recover playback after bypassing the optional equalizer',
+        name: 'BStreamPlayback',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (isCurrent()) _errors.add(error.toString());
+    }
+  }
+
+  @override
+  PlayerAudioOutputState get audioOutputState => PlayerAudioOutputState(
+    supported: true,
+    devices: _audioDevices,
+    selectedDeviceId: _audioDeviceId,
+  );
+
+  @override
+  Stream<PlayerAudioOutputState> get audioOutputStream => _audioOutputs.stream;
+
+  void _publishAudioOutput() {
+    if (!_disposed) _audioOutputs.add(audioOutputState);
+  }
+
+  Future<void> _setPlayerAudioDevice(Player player, String id) async {
+    await player.setAudioDevice(AudioDevice(id, ''));
+    // media_kit logs some native command failures instead of throwing. Read
+    // back the preference before reporting that it was accepted.
+    final platform = player.platform;
+    if (platform is NativePlayer &&
+        await platform.getProperty('audio-device') != id) {
+      throw StateError('The player did not accept the audio output.');
+    }
+  }
+
+  @override
+  Future<void> selectAudioOutput(String deviceId) async {
+    final player = _player;
+    final epoch = _epoch;
+    await _withPlayer((player) => _setPlayerAudioDevice(player, deviceId));
+    if (_disposed || epoch != _epoch || !identical(player, _player)) {
+      throw StateError('Audio output selection was cancelled.');
+    }
+    _audioDeviceId = deviceId;
+    _publishAudioOutput();
+  }
+
+  Future<void> _restoreAudioOutput(Player player, String id) async {
+    final initialization = _headlessInitialization(player);
+    if (initialization != null) await initialization;
+    try {
+      await _setPlayerAudioDevice(player, id);
+    } catch (_) {
+      await _setPlayerAudioDevice(player, systemDefaultAudioDeviceId);
+      if (!_disposed && identical(player, _player)) {
+        _audioDeviceId = systemDefaultAudioDeviceId;
+        _publishAudioOutput();
+      }
+    }
+  }
 
   Player _createPlayer() => Player(
     configuration: const PlayerConfiguration(title: AppConstants.appName),
@@ -96,7 +325,23 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
 
   List<StreamSubscription<Object?>> _forwardEvents(Player player, int epoch) {
     bool isCurrent() => !_disposed && epoch == _epoch;
-    return <StreamSubscription<Object?>>[
+    void updateAudioDevices(List<AudioDevice> devices) {
+      if (!isCurrent()) return;
+      final seen = <String>{};
+      _audioDevices = List.unmodifiable([
+        for (final device in devices)
+          if (device.name.isNotEmpty && seen.add(device.name))
+            PlayerAudioDevice(
+              id: device.name,
+              name: device.description.isEmpty
+                  ? device.name
+                  : device.description,
+            ),
+      ]);
+      _publishAudioOutput();
+    }
+
+    final subscriptions = <StreamSubscription<Object?>>[
       player.stream.position.listen((value) {
         if (isCurrent()) _positions.add(value);
       }),
@@ -104,7 +349,9 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
         if (isCurrent()) _durations.add(value);
       }),
       player.stream.volume.listen((value) {
-        if (isCurrent()) _volumes.add(value);
+        // Crossfade envelopes and EQ attenuation belong to this physical deck.
+        // Expose the requested gain rather than the compensated native value.
+        if (isCurrent()) _volumes.add(_logicalVolume);
       }),
       player.stream.buffering.listen((value) {
         if (isCurrent()) _bufferings.add(value);
@@ -116,9 +363,25 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
         if (isCurrent()) _completions.add(value);
       }),
       player.stream.error.listen((value) {
-        if (isCurrent()) _errors.add(value);
+        if (!isCurrent()) return;
+        _errors.add(value);
+      }),
+      player.stream.log.listen(
+        (log) => _onNativeEqualizerLog(player, epoch, log),
+      ),
+      player.stream.audioDevices.listen(updateAudioDevices),
+      player.stream.audioDevice.listen((_) {
+        if (isCurrent()) _publishAudioOutput();
       }),
     ];
+    // Read after subscribing so a device notification cannot be lost between
+    // the initial state and the stream subscription.
+    // A replacement Player initially exposes only "auto" before its native
+    // enumeration arrives. Retain the known list across that startup window.
+    if (epoch == 0 || _audioDevices.isEmpty) {
+      updateAudioDevices(player.state.audioDevices);
+    }
+    return subscriptions;
   }
 
   @override
@@ -129,8 +392,15 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
     final retiredPlayer = _player;
     final retiredSubscriptions = _playerSubscriptions;
     final epoch = ++_epoch;
+    _equalizerRecovery = null;
     _player = _createPlayer();
-    _playerInitialization = _headlessInitialization(_player);
+    _equalizerCancellation.complete();
+    _equalizerCancellation = Completer<void>();
+    _equalizerRevision++;
+    _equalizerTail = Future<void>.value();
+    _appliedEqualizer = const EqualizerSettings();
+    _playerInitialization = _restorePlayerState(_player, _audioDeviceId);
+    _playerInitialization?.ignore();
     _playerSubscriptions = _forwardEvents(_player, epoch);
     unawaited(_retire(retiredPlayer, retiredSubscriptions));
   }
@@ -166,6 +436,8 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
   @override
   Stream<bool> get completedStream => _completions.stream;
   @override
+  bool get completed => _player.state.completed;
+  @override
   Stream<String> get errorStream => _errors.stream;
   @override
   Object? get platform => _player.platform;
@@ -183,8 +455,13 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
   Future<void> seek(Duration position) =>
       _withPlayer((player) => player.seek(position));
   @override
-  Future<void> setVolume(double volume) =>
-      _withPlayer((player) => player.setVolume(volume));
+  Future<void> setVolume(double volume) {
+    _logicalVolume = volume;
+    return _withPlayer(
+      (player) => player.setVolume(_logicalVolume * _equalizerOutputGain),
+    );
+  }
+
   @override
   Future<void> dispose() async {
     if (_disposed) {
@@ -192,6 +469,7 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
     }
     _disposed = true;
     _epoch++;
+    _equalizerCancellation.complete();
     for (final subscription in _playerSubscriptions) {
       await subscription.cancel();
     }
@@ -203,12 +481,19 @@ class _MediaKitPlayerBackend implements MediaKitPlayerBackend {
       _playings.close(),
       _completions.close(),
       _errors.close(),
+      _audioOutputs.close(),
     ]);
     await _player.dispose();
   }
 }
 
-class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
+class MediaKitPlayerService
+    implements
+        PlayerService,
+        CrossfadeCapablePlayer,
+        AudioSourceUpgradePlayer,
+        PlayerAudioOutput,
+        EqualizerCapablePlayer {
   static const _crossfadeShutdownGrace = Duration(seconds: 2);
   static const _crossfadeRetirementGrace = Duration(milliseconds: 250);
 
@@ -240,6 +525,15 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   final MediaKitPlayerBackendFactory _backendFactory;
   final bool _usesDefaultBackendFactory;
   final _snapshotController = StreamController<PlayerSnapshot>.broadcast();
+  final _audioOutputController =
+      StreamController<PlayerAudioOutputState>.broadcast();
+  PlayerAudioOutputState _audioOutputState = const PlayerAudioOutputState();
+  Future<void> _audioOutputTail = Future<void>.value();
+  bool _changingAudioOutput = false;
+  EqualizerSettings _equalizerSettings = const EqualizerSettings();
+  Future<void> _equalizerTail = Future<void>.value();
+  int _equalizerRevision = 0;
+  Timer? _missingAudioDeviceTimer;
   final _subscriptions = <StreamSubscription<Object?>>[];
   final _standbySubscriptions = <StreamSubscription<Object?>>[];
   final Duration _operationTimeout;
@@ -253,6 +547,8 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   int? _backendGeneration;
   bool _disposed = false;
   bool _crossfadeEnabled = false;
+  bool _sourceUpgradeActive = false;
+  Completer<void>? _sourceUpgradeCancellation;
   Duration _crossfadeDuration = const Duration(seconds: 5);
   int _crossfadeGeneration = 0;
   CrossfadePlaybackSource? _preparedCrossfadeSource;
@@ -268,6 +564,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   int _seekRevision = 0;
   Duration _standbyPosition = Duration.zero;
   Duration? _standbyDuration;
+  Duration? _standbyDecodedDuration;
   int _standbyRetirementGeneration = 0;
 
   static bool _initialized = false;
@@ -283,6 +580,457 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
 
   @override
   bool get crossfadeEnabled => _crossfadeEnabled;
+
+  @override
+  PlayerAudioOutputState get audioOutputState => _audioOutputState;
+
+  @override
+  Stream<PlayerAudioOutputState> get audioOutputStream =>
+      _audioOutputController.stream;
+
+  @override
+  bool get supportsEqualizer =>
+      _player is EqualizerCapablePlayer &&
+      (_player as EqualizerCapablePlayer).supportsEqualizer;
+
+  @override
+  Future<void> configureEqualizer(EqualizerSettings settings) {
+    if (_disposed) return Future<void>.value();
+    _equalizerSettings = settings.normalized;
+    final revision = ++_equalizerRevision;
+    final future = _equalizerTail.then((_) async {
+      if (_disposed || revision != _equalizerRevision) return;
+      if (!supportsEqualizer) {
+        if (_equalizerSettings.enabled) {
+          throw UnsupportedError('This backend has no native equalizer.');
+        }
+        return;
+      }
+      Object? failure;
+      StackTrace? failureStack;
+      for (final backend in <MediaKitPlayerBackend>{_player, ?_standbyPlayer}) {
+        if (_disposed || revision != _equalizerRevision) return;
+        try {
+          if (backend case final EqualizerCapablePlayer equalizer) {
+            await equalizer.configureEqualizer(_equalizerSettings);
+          }
+        } catch (error, stackTrace) {
+          failure ??= error;
+          failureStack ??= stackTrace;
+        }
+      }
+      if (!_disposed && revision == _equalizerRevision && failure != null) {
+        Error.throwWithStackTrace(failure, failureStack!);
+      }
+    });
+    _equalizerTail = future.catchError((Object _) {});
+    return future;
+  }
+
+  Future<void> _synchronizeBackendEqualizer(
+    MediaKitPlayerBackend backend,
+  ) async {
+    if (backend is! EqualizerCapablePlayer) return;
+    final equalizer = backend as EqualizerCapablePlayer;
+    if (!equalizer.supportsEqualizer) return;
+    // A standby deck can be created while a slider update is already queued.
+    // Join that lane and re-check the revision before making the deck audible.
+    var revision = -1;
+    do {
+      final future = _equalizerTail.then((_) async {
+        if (_disposed) return;
+        revision = _equalizerRevision;
+        await equalizer.configureEqualizer(_equalizerSettings);
+      });
+      _equalizerTail = future.catchError((Object _) {});
+      try {
+        await future;
+      } catch (error, stackTrace) {
+        developer.log(
+          'Could not apply the optional native equalizer',
+          name: 'BStreamPlayback',
+          error: error,
+          stackTrace: stackTrace,
+        );
+        return;
+      }
+    } while (!_disposed && revision != _equalizerRevision);
+  }
+
+  Future<void> _serializeAudioOutput(Future<void> Function() operation) {
+    final future = _audioOutputTail.then((_) async {
+      if (_disposed) return;
+      await operation();
+    });
+    _audioOutputTail = future.catchError((Object _) {});
+    return future;
+  }
+
+  Future<void> _setBackendAudioOutput(
+    MediaKitPlayerBackend backend,
+    String deviceId,
+  ) async {
+    if (backend case final PlayerAudioOutput output) {
+      await output
+          .selectAudioOutput(deviceId)
+          .timeout(
+            _operationTimeout,
+            onTimeout: () {
+              // A timed-out command can still complete natively. Isolate its
+              // Player before allowing another route request to enter this lane.
+              backend.abandonPendingOperations();
+              _crossfadeGeneration++;
+              unawaited(_resetCrossfadeState(restoreActiveVolume: true));
+              if (identical(backend, _player)) {
+                _backendGeneration = null;
+                _emit(
+                  _snapshot.copyWith(
+                    status: PlayerStatus.failed,
+                    errorMessage: 'No se pudo cambiar la salida de audio.',
+                  ),
+                );
+              }
+              throw TimeoutException(
+                'media_kit audio output selection exceeded $_operationTimeout',
+                _operationTimeout,
+              );
+            },
+          );
+    }
+  }
+
+  void _publishAudioOutputState(PlayerAudioOutputState state) {
+    if (_disposed) return;
+    _audioOutputState = state;
+    _audioOutputController.add(state);
+  }
+
+  void _onAudioOutputState(PlayerAudioOutputState state) {
+    if (_disposed) return;
+    final selectedId = _changingAudioOutput
+        ? _audioOutputState.selectedDeviceId
+        : state.selectedDeviceId;
+    _publishAudioOutputState(
+      PlayerAudioOutputState(
+        supported: state.supported,
+        devices: state.devices,
+        selectedDeviceId: selectedId,
+      ),
+    );
+    _missingAudioDeviceTimer?.cancel();
+    if (selectedId == systemDefaultAudioDeviceId ||
+        state.devices.any((device) => device.id == selectedId)) {
+      return;
+    }
+    // Hotplug notifications can briefly expose an empty/automatic-only list,
+    // especially while a native backend initializes. Confirm disappearance
+    // after that burst before falling back, even while the picker is closed.
+    _missingAudioDeviceTimer = Timer(const Duration(milliseconds: 600), () {
+      if (_disposed ||
+          _changingAudioOutput ||
+          _audioOutputState.selectedDeviceId != selectedId ||
+          _audioOutputState.devices.any((device) => device.id == selectedId)) {
+        return;
+      }
+      unawaited(
+        selectAudioOutput(systemDefaultAudioDeviceId).catchError((
+          Object error,
+          StackTrace stackTrace,
+        ) {
+          developer.log(
+            'Could not restore the automatic audio output',
+            name: 'BStreamPlayback',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }),
+      );
+    });
+  }
+
+  @override
+  Future<void> selectAudioOutput(String deviceId) => _serializeAudioOutput(
+    () async {
+      if (!_audioOutputState.supported ||
+          (deviceId != systemDefaultAudioDeviceId &&
+              !_audioOutputState.devices.any(
+                (device) => device.id == deviceId,
+              ))) {
+        throw ArgumentError.value(deviceId, 'deviceId', 'Unavailable output.');
+      }
+      final previousId = _audioOutputState.selectedDeviceId;
+      final outputs = <MediaKitPlayerBackend>[
+        if (_player is PlayerAudioOutput) _player,
+        if (_standbyPlayer case final PlayerAudioOutput _) _standbyPlayer!,
+      ];
+      _changingAudioOutput = true;
+      try {
+        for (final output in outputs) {
+          await _setBackendAudioOutput(output, deviceId);
+        }
+        if (_disposed) return;
+        _publishAudioOutputState(
+          PlayerAudioOutputState(
+            supported: true,
+            devices: _audioOutputState.devices,
+            selectedDeviceId: deviceId,
+          ),
+        );
+      } catch (_) {
+        // Keep both decks on the previous route if either native write fails.
+        for (final output in outputs) {
+          try {
+            await _setBackendAudioOutput(output, previousId);
+          } catch (_) {
+            // A disconnected device may also reject rollback. Reflect the
+            // active backend below rather than claiming a failed selection.
+          }
+        }
+        rethrow;
+      } finally {
+        _changingAudioOutput = false;
+        if (_player case final PlayerAudioOutput output) {
+          _onAudioOutputState(output.audioOutputState);
+        }
+      }
+    },
+  );
+
+  @override
+  Future<bool> upgradeRemoteSource(
+    RemotePlaybackSource source, {
+    bool Function()? shouldContinue,
+  }) async {
+    final before = _snapshot;
+    final duration = before.duration;
+    if (_disposed ||
+        _sourceUpgradeActive ||
+        !before.isRemote ||
+        before.status != PlayerStatus.playing ||
+        before.sourceUrl != source.track.url ||
+        before.trackId !=
+            (source.track.id.isEmpty ? source.track.url : source.track.id) ||
+        (before.queueEntryId != null &&
+            before.queueEntryId != source.queueEntryId) ||
+        duration == null ||
+        duration - before.position <=
+            _crossfadeDuration + const Duration(seconds: 3) ||
+        _crossfadeRamp != null ||
+        _crossfadePreparation != null ||
+        _preparedCrossfadeSource != null ||
+        _crossfadePromotionInProgress ||
+        !(shouldContinue?.call() ?? true)) {
+      return false;
+    }
+    final playbackGeneration = _requestedGeneration;
+    final seekRevision = _seekRevision;
+    final generation = ++_crossfadeGeneration;
+    final outgoing = _player;
+    final prepared = RemoteCrossfadePlaybackSource(source);
+    final cancellation = Completer<void>();
+    var committed = false;
+    _sourceUpgradeActive = true;
+    bool isCurrent() =>
+        !_disposed &&
+        _sourceUpgradeActive &&
+        generation == _crossfadeGeneration &&
+        playbackGeneration == _requestedGeneration &&
+        seekRevision == _seekRevision &&
+        _snapshot.status == PlayerStatus.playing &&
+        _snapshot.sourceUrl == before.sourceUrl &&
+        _snapshot.queueEntryId == before.queueEntryId &&
+        (shouldContinue?.call() ?? true);
+    try {
+      await _resetCrossfadeState(
+        restoreActiveVolume: true,
+        preserveStandby: true,
+        preserveSourceUpgrade: true,
+      );
+      if (!isCurrent()) return false;
+      _sourceUpgradeCancellation = cancellation;
+      final preparation = _prepareCrossfadeSource(prepared, generation);
+      _crossfadePreparation = preparation;
+      await preparation;
+      if (identical(_crossfadePreparation, preparation)) {
+        _crossfadePreparation = null;
+      }
+      final incoming = _standbyPlayer;
+      if (!isCurrent() ||
+          incoming == null ||
+          _preparedCrossfadeSource != prepared) {
+        return false;
+      }
+      // media_kit.open completes after dispatching playlist-pos, before mpv
+      // finishes loading the file. Seeking at that point can be silently
+      // ignored. Wait for decoder metadata, rather than catalog duration.
+      await _waitForSourceUpgradeValue<Duration>(
+        incoming.durationStream,
+        (value) => value > Duration.zero,
+        current: _standbyDecodedDuration,
+        cancellation: cancellation,
+      );
+      if (!isCurrent()) return false;
+      if (_standbyDuration != null &&
+          (_standbyDuration! - duration).abs() > const Duration(seconds: 2)) {
+        return false;
+      }
+      // Loading never pauses the active decoder. Only seek the muted prepared
+      // source, using the clock after preparation rather than its old position.
+      var position = await _sourceUpgradePosition(outgoing, _snapshot.position);
+      if (!isCurrent()) return false;
+      await _seekSourceUpgrade(incoming, position, cancellation);
+      if (!isCurrent()) return false;
+      await incoming.play().timeout(_operationTimeout);
+      if (!isCurrent()) return false;
+      // A native seek may have waited for buffering while the old decoder kept
+      // advancing. Correct that drift once while the new decoder is muted.
+      // Native time-pos avoids using the UI's throttled position snapshot.
+      final livePosition = await _sourceUpgradePosition(
+        outgoing,
+        _snapshot.position,
+      );
+      if (!isCurrent()) return false;
+      if ((livePosition - position).abs() > const Duration(milliseconds: 30)) {
+        position = livePosition;
+        await _seekSourceUpgrade(incoming, position, cancellation);
+        if (!isCurrent()) return false;
+      }
+      late final CrossfadeRamp ramp;
+      ramp = CrossfadeRamp(
+        duration: const Duration(milliseconds: 100),
+        tickInterval: const Duration(milliseconds: 20),
+        applyGains: (gains) async {
+          if (!isCurrent() || !identical(_crossfadeRamp, ramp)) {
+            ramp.cancel();
+            return;
+          }
+          // Both decks carry the same recording. Linear amplitude gains avoid
+          // the level increase an equal-power overlap would add here.
+          await _writeCrossfadeVolumes(
+            outgoing: outgoing,
+            incoming: incoming,
+            outgoingVolume: gains.outgoing * gains.outgoing * _masterVolume,
+            incomingVolume: gains.incoming * gains.incoming * _masterVolume,
+          );
+        },
+      );
+      _crossfadeRamp = ramp;
+      if (!await ramp.start() || !isCurrent()) return false;
+      await _promoteCrossfadePlayer(
+        generation: generation,
+        outgoing: outgoing,
+        incoming: incoming,
+        source: prepared,
+      );
+      committed = identical(_player, incoming);
+      return committed;
+    } catch (error, stackTrace) {
+      if (!_disposed) {
+        developer.log(
+          'media_kit source upgrade kept the original source',
+          name: 'BStreamPlayback',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+      return false;
+    } finally {
+      if (!cancellation.isCompleted) cancellation.complete();
+      if (identical(_sourceUpgradeCancellation, cancellation)) {
+        _sourceUpgradeCancellation = null;
+      }
+      if (generation == _crossfadeGeneration) {
+        _sourceUpgradeActive = false;
+        if (!committed) {
+          _crossfadeGeneration++;
+          await _resetCrossfadeState(restoreActiveVolume: true);
+        }
+      }
+    }
+  }
+
+  Future<void> _seekSourceUpgrade(
+    MediaKitPlayerBackend incoming,
+    Duration position,
+    Completer<void> cancellation,
+  ) async {
+    // Subscribe before seeking: an acknowledged command is not proof that
+    // the decoder accepted the target. Keep it muted until its real clock
+    // reaches that target, and keep the original if it cannot seek there.
+    final aligned = _waitForSourceUpgradeValue<Duration>(
+      incoming.positionStream,
+      (value) => (value - position).abs() <= const Duration(milliseconds: 150),
+      current: _standbyPosition,
+      cancellation: cancellation,
+    );
+    await Future.wait<void>([
+      aligned,
+      incoming.seek(position).timeout(_operationTimeout),
+    ], eagerError: true);
+  }
+
+  Future<void> _waitForSourceUpgradeValue<T>(
+    Stream<T> stream,
+    bool Function(T value) accepts, {
+    required T? current,
+    required Completer<void> cancellation,
+  }) async {
+    if (current != null && accepts(current)) return;
+    final completion = Completer<void>();
+    final subscription = stream.listen(
+      (value) {
+        if (!completion.isCompleted && accepts(value)) completion.complete();
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!completion.isCompleted) completion.completeError(error, stack);
+      },
+      onDone: () {
+        if (!completion.isCompleted) {
+          completion.completeError(StateError('Prepared decoder was closed.'));
+        }
+      },
+    );
+    try {
+      await Future.any<void>([
+        completion.future,
+        cancellation.future.then<void>((_) {
+          throw StateError('Source alignment was cancelled.');
+        }),
+      ]).timeout(_operationTimeout);
+    } finally {
+      await subscription.cancel();
+    }
+  }
+
+  Future<Duration> _sourceUpgradePosition(
+    MediaKitPlayerBackend backend,
+    Duration fallback,
+  ) async {
+    final platform = backend.platform;
+    if (platform is NativePlayer) {
+      try {
+        final seconds = double.tryParse(
+          await platform
+              .getProperty('time-pos')
+              .timeout(const Duration(milliseconds: 250)),
+        );
+        if (seconds != null && seconds.isFinite && seconds >= 0) {
+          return Duration(microseconds: (seconds * 1000000).round());
+        }
+      } catch (_) {
+        // Alternate/older native backends may not expose a usable live clock.
+        // The last source position is still a safe bounded fallback.
+      }
+    }
+    return fallback;
+  }
+
+  Future<void> _cancelSourceUpgradeForAction() async {
+    if (!_sourceUpgradeActive) return;
+    _sourceUpgradeActive = false;
+    _crossfadeGeneration++;
+    await _resetCrossfadeState(restoreActiveVolume: true);
+  }
 
   @override
   Future<void> configureCrossfade({
@@ -314,7 +1062,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
 
   @override
   Future<void> prepareCrossfade(CrossfadePlaybackSource? source) async {
-    if (_disposed) {
+    if (_disposed || _sourceUpgradeActive) {
       return;
     }
     if (!_crossfadeEnabled || source == null) {
@@ -369,10 +1117,28 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
     _crossfadePreparationCancellation = cancellation;
     _standbyPosition = Duration.zero;
     _standbyDuration = _crossfadeSourceDuration(source);
+    _standbyDecodedDuration = null;
     _attachStandbyPlayer(standby, generation);
     try {
       await _runCrossfadePreparationWithDeadline(() async {
         await standby.setVolume(0);
+        if (!_isCrossfadeCurrent(generation) ||
+            !identical(standby, _standbyPlayer)) {
+          return;
+        }
+        if (standby is PlayerAudioOutput) {
+          await _serializeAudioOutput(
+            () => _setBackendAudioOutput(
+              standby,
+              _audioOutputState.selectedDeviceId,
+            ),
+          );
+          if (!_isCrossfadeCurrent(generation) ||
+              !identical(standby, _standbyPlayer)) {
+            return;
+          }
+        }
+        await _synchronizeBackendEqualizer(standby);
         if (!_isCrossfadeCurrent(generation) ||
             !identical(standby, _standbyPlayer)) {
           return;
@@ -469,9 +1235,11 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         }),
         player.durationStream.listen((duration) {
           if (_isCrossfadeCurrent(generation) &&
-              identical(player, _standbyPlayer) &&
-              duration > Duration.zero) {
-            _standbyDuration = duration;
+              identical(player, _standbyPlayer)) {
+            _standbyDecodedDuration = duration > Duration.zero
+                ? duration
+                : null;
+            if (duration > Duration.zero) _standbyDuration = duration;
           }
         }),
         player.errorStream.listen((message) {
@@ -556,6 +1324,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   }
 
   void _maybeStartCrossfade() {
+    if (_sourceUpgradeActive) return;
     final effectiveDuration = crossfadeStartDuration(
       enabled: _crossfadeEnabled,
       disposed: _disposed,
@@ -655,7 +1424,9 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
     _crossfadePromotionCompletion = promotionCompletion;
     try {
       final requestedGeneration = _requestedGeneration;
-      var nextSnapshot = _crossfadeSnapshot(source);
+      var nextSnapshot = _sourceUpgradeActive
+          ? _snapshot.copyWith(position: _standbyPosition)
+          : _crossfadeSnapshot(source);
       bool isCurrent() =>
           _isCrossfadeCurrent(generation) &&
           requestedGeneration == _requestedGeneration;
@@ -707,6 +1478,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
       _backendGeneration = _requestedGeneration;
       _standbyPosition = Duration.zero;
       _standbyDuration = null;
+      _standbyDecodedDuration = null;
       _attachActivePlayer(incoming);
       if (_crossfadePaused || _snapshot.status == PlayerStatus.paused) {
         nextSnapshot = nextSnapshot.copyWith(status: PlayerStatus.paused);
@@ -766,12 +1538,23 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   }
 
   bool _isCrossfadeCurrent(int generation) =>
-      !_disposed && _crossfadeEnabled && generation == _crossfadeGeneration;
+      !_disposed &&
+      (_crossfadeEnabled || _sourceUpgradeActive) &&
+      generation == _crossfadeGeneration;
 
   Future<void> _resetCrossfadeState({
     required bool restoreActiveVolume,
     bool preserveStandby = false,
+    bool preserveSourceUpgrade = false,
   }) async {
+    if (!preserveSourceUpgrade) {
+      _sourceUpgradeActive = false;
+      final sourceCancellation = _sourceUpgradeCancellation;
+      _sourceUpgradeCancellation = null;
+      if (sourceCancellation != null && !sourceCancellation.isCompleted) {
+        sourceCancellation.complete();
+      }
+    }
     _crossfadeRamp?.cancel();
     _crossfadeRamp = null;
     if (_disableCrossfadeAfterHandoff) {
@@ -886,9 +1669,20 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
     }
     _standbyPosition = Duration.zero;
     _standbyDuration = null;
+    _standbyDecodedDuration = null;
   }
 
   void _attachActivePlayer(MediaKitPlayerBackend player) {
+    if (player case final PlayerAudioOutput output) {
+      _subscriptions.add(
+        output.audioOutputStream.listen((_) {
+          if (!_disposed && identical(player, _player)) {
+            _onAudioOutputState(output.audioOutputState);
+          }
+        }),
+      );
+      _onAudioOutputState(output.audioOutputState);
+    }
     _subscriptions.addAll([
       player.positionStream.listen((position) {
         if (!identical(player, _player) || !_acceptBackendEvent) {
@@ -935,7 +1729,14 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         }
         if (!playing &&
             (_snapshot.status == PlayerStatus.stopped ||
+                _snapshot.status == PlayerStatus.completed ||
+                player.completed ||
                 _crossfadeRamp != null)) {
+          // Native EOF sets completed before broadcasting playing=false. It
+          // is not a user pause: publishing paused here cancels the queue's
+          // autoplay intent, or invalidates an already scheduled completion
+          // when the two streams arrive in the opposite order. Let the EOF
+          // stream publish the terminal event; genuine pauses still pass.
           return;
         }
         _emit(
@@ -980,7 +1781,10 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   }
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     final source = track.streamUrl;
     if (source == null || source.isEmpty) {
       throw const PlayerException(
@@ -1005,6 +1809,9 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         sourceUrl: track.url,
         thumbnailUrl: track.thumbnailUrl,
         duration: track.duration,
+        position: initialPosition < Duration.zero
+            ? Duration.zero
+            : initialPosition,
         volume: _masterVolume,
         isRemote: true,
       ),
@@ -1015,7 +1822,12 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
       'headerKeys=${_diagnosticHeaderKeys(track.httpHeaders)}',
       name: 'BStreamPlayback',
     );
-    await _openForGeneration(_remoteMedia(track), generation, play: true);
+    await _openForGeneration(
+      _remoteMedia(track),
+      generation,
+      play: true,
+      initialPosition: initialPosition,
+    );
   }
 
   Media _remoteMedia(TrackInfo track) {
@@ -1125,7 +1937,10 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
   }
 
   @override
-  Future<void> playLocal(LocalTrack track) async {
+  Future<void> playLocal(
+    LocalTrack track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     final generation = ++_requestedGeneration;
     _cancelActiveOpen();
     await _invalidateCrossfadeForExplicitAction();
@@ -1142,21 +1957,33 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         sourceUrl: track.sourceUrl,
         thumbnailUrl: track.thumbnailPath ?? track.thumbnailUrl,
         duration: track.duration,
+        position: initialPosition < Duration.zero
+            ? Duration.zero
+            : initialPosition,
         volume: _masterVolume,
         isRemote: false,
         isExternal: track.isExternal,
       ),
     );
-    await _openForGeneration(Media(track.filePath), generation, play: true);
+    await _openForGeneration(
+      Media(track.filePath),
+      generation,
+      play: true,
+      initialPosition: initialPosition,
+    );
   }
 
   @override
-  Future<void> playLocalQueue(List<LocalTrack> tracks, int initialIndex) {
+  Future<void> playLocalQueue(
+    List<LocalTrack> tracks,
+    int initialIndex, {
+    Duration initialPosition = Duration.zero,
+  }) {
     if (tracks.isEmpty) {
       return Future.value();
     }
     final safeIndex = initialIndex.clamp(0, tracks.length - 1);
-    return playLocal(tracks[safeIndex]);
+    return playLocal(tracks[safeIndex], initialPosition: initialPosition);
   }
 
   @override
@@ -1207,6 +2034,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
 
   @override
   Future<void> pause() async {
+    final upgradeCancellation = _cancelSourceUpgradeForAction();
     final generation = _requestedGeneration;
     _crossfadePaused = true;
     _crossfadeRamp?.pause();
@@ -1216,6 +2044,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
       }
       final standby = _standbyPlayer;
       await Future.wait<void>([
+        upgradeCancellation,
         _player.pause(),
         if (_crossfadeRamp != null && standby != null) standby.pause(),
       ]);
@@ -1269,16 +2098,18 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
 
   @override
   Future<void> seek(Duration position) {
+    final upgradeCancellation = _cancelSourceUpgradeForAction();
     final requestedGeneration = _requestedGeneration;
     final revision = ++_seekRevision;
     final target = position < Duration.zero ? Duration.zero : position;
-    final operation = _seekTail.then(
-      (_) => _performSeek(
+    final operation = _seekTail.then((_) async {
+      await upgradeCancellation;
+      return _performSeek(
         target,
         requestedGeneration: requestedGeneration,
         revision: revision,
-      ),
-    );
+      );
+    });
     _seekTail = operation.then<void>(
       (_) {},
       onError: (Object _, StackTrace _) {},
@@ -1316,9 +2147,11 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
 
   @override
   Future<void> setVolume(double volume) async {
+    final upgradeCancellation = _cancelSourceUpgradeForAction();
     final normalized = volume.clamp(0, 1).toDouble();
     _masterVolume = normalized;
     _emit(_snapshot.copyWith(volume: normalized));
+    await upgradeCancellation;
     final ramp = _crossfadeRamp;
     final standby = _standbyPlayer;
     if (ramp != null && standby != null) {
@@ -1356,6 +2189,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
       return;
     }
     _disposed = true;
+    _missingAudioDeviceTimer?.cancel();
     _requestedGeneration++;
     _crossfadeGeneration++;
     _standbyRetirementGeneration++;
@@ -1407,6 +2241,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
       // resources must still be released and application shutdown must finish.
     } finally {
       await _snapshotController.close();
+      await _audioOutputController.close();
     }
   }
 
@@ -1440,13 +2275,21 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
     Media media,
     int generation, {
     required bool play,
+    Duration initialPosition = Duration.zero,
   }) {
+    final startPosition = initialPosition < Duration.zero
+        ? Duration.zero
+        : initialPosition;
     return _enqueueOperation(
       () async {
         if (!_isCurrentGeneration(generation)) {
           return;
         }
         await _configureLinuxAudioClientName();
+        if (!_isCurrentGeneration(generation)) {
+          return;
+        }
+        await _synchronizeBackendEqualizer(_player);
         if (!_isCurrentGeneration(generation)) {
           return;
         }
@@ -1460,7 +2303,12 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         // is being interrupted. Publish only the explicit loading snapshot.
         _backendGeneration = null;
         try {
-          await _player.open(media, play: play);
+          // A restored position is a one-time seek, not Media.start (which
+          // would also change the start of subsequent native repeats).
+          await _player.open(
+            media,
+            play: play && startPosition == Duration.zero,
+          );
         } catch (error, stackTrace) {
           final detail = _sanitizePlaybackError(error.toString());
           developer.log(
@@ -1477,6 +2325,14 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         if (!_isCurrentGeneration(generation)) {
           return;
         }
+        if (startPosition > Duration.zero) {
+          await _player.seek(startPosition);
+          if (!_isCurrentGeneration(generation)) return;
+          if (play) {
+            await _player.play();
+            if (!_isCurrentGeneration(generation)) return;
+          }
+        }
         if (_snapshot.status == PlayerStatus.failed) {
           throw PlayerException(
             _snapshot.errorMessage ?? 'MediaKit no pudo abrir el audio.',
@@ -1487,6 +2343,7 @@ class MediaKitPlayerService implements PlayerService, CrossfadeCapablePlayer {
         _emit(
           _snapshot.copyWith(
             status: play ? PlayerStatus.playing : PlayerStatus.paused,
+            position: startPosition,
           ),
         );
       },

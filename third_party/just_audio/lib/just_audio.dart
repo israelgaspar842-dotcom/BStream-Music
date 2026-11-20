@@ -15,6 +15,10 @@ import 'package:rxdart/rxdart.dart';
 import 'package:synchronized/synchronized.dart';
 import 'package:uuid/uuid.dart';
 
+import 'bstream_equalizer_tuning.dart';
+
+part 'bstream_equalizer.dart';
+
 const _uuid = Uuid();
 
 JustAudioPlatform? _pluginPlatformCache;
@@ -179,6 +183,7 @@ class AudioPlayer {
   double _preferredPeakBitRate = 0;
   bool _allowsExternalPlayback = false;
   bool _playInterrupted = false;
+  _DarwinPlaybackStart? _darwinPlaybackStart;
   bool _platformLoading = false;
   AndroidAudioAttributes? _androidAudioAttributes;
   WebCrossOrigin? _webCrossOrigin;
@@ -671,7 +676,9 @@ class AudioPlayer {
   Duration get position => _getPositionFor(playbackEvent);
 
   Duration _getPositionFor(PlaybackEvent playbackEvent) {
-    if (playing && processingState == ProcessingState.ready) {
+    if (playing &&
+        processingState == ProcessingState.ready &&
+        !(_darwinPlaybackStart?.awaitingNativeClock ?? false)) {
       final result = playbackEvent.updatePosition +
           (DateTime.now().difference(playbackEvent.updateTime)) * speed;
       return playbackEvent.duration == null || result <= playbackEvent.duration!
@@ -1083,19 +1090,50 @@ class AudioPlayer {
     if (_disposed) return;
     if (playing) return;
     _playInterrupted = false;
+    final startPosition = position;
+    // BStream's Darwin processor may still be installing, and activating the
+    // audio session can also take time. Intent alone cannot start its clock.
+    final darwinStart = (_isDarwin() || _isUnitTest()) &&
+            _audioPipeline.darwinAudioEffects.any((e) => e is BStreamEqualizer)
+        ? (_darwinPlaybackStart = _DarwinPlaybackStart())
+        : null;
     // Broadcast to clients immediately, but revert to false if we fail to
     // activate the audio session. This allows setAudioSource to be aware of a
     // prior play request.
     _playerEventSubject.add(PlayerEvent(
       playing: true,
       playbackEvent: playbackEvent.copyWith(
-        updatePosition: position,
+        updatePosition: startPosition,
         updateTime: DateTime.now(),
       ),
     ));
     final playCompleter = Completer<dynamic>();
-    final audioSession = await AudioSession.instance;
-    if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {
+    late bool activated;
+    Future<bool> activateSession() async {
+      final audioSession = await AudioSession.instance;
+      return !_handleAudioSessionActivation ||
+          await audioSession.setActive(true);
+    }
+
+    try {
+      activated = darwinStart == null
+          ? await activateSession()
+          : await Future.any<bool>([
+              activateSession(),
+              darwinStart.cancelled.future.then((_) => false),
+            ]);
+    } catch (_) {
+      if (darwinStart != null && identical(darwinStart, _darwinPlaybackStart)) {
+        _cancelDarwinPlaybackStart();
+        _playerEventSubject.add(playerEvent.copyWith(playing: false));
+      }
+      rethrow;
+    }
+    if (darwinStart != null) {
+      if (!identical(darwinStart, _darwinPlaybackStart)) return;
+      darwinStart.sessionReady.complete(activated);
+    }
+    if (activated) {
       if (!playing) return;
       // TODO: rewrite this to more cleanly handle simultaneous load/play
       // requests which each may result in platform play requests.
@@ -1106,7 +1144,8 @@ class AudioPlayer {
           // NOTE: If a load() request happens simultaneously, this may result
           // in two play requests being sent. The platform implementation should
           // ignore the second play request since it is already playing.
-          _sendPlayRequest(await _platform, playCompleter);
+          _sendPlayRequest(await _platform, playCompleter,
+              expectedDarwinStart: darwinStart);
         } else {
           // If the native platform wasn't already active, activating it will
           // implicitly restore the playing state and send a play request.
@@ -1116,9 +1155,23 @@ class AudioPlayer {
       }
     } else {
       // Revert if we fail to activate the audio session.
+      if (darwinStart != null) _cancelDarwinPlaybackStart();
       _playerEventSubject.add(playerEvent.copyWith(playing: false));
+      if (darwinStart != null) return;
     }
-    await playCompleter.future;
+    if (darwinStart == null) {
+      await playCompleter.future;
+    } else {
+      await Future.any([playCompleter.future, darwinStart.cancelled.future]);
+    }
+  }
+
+  void _cancelDarwinPlaybackStart() {
+    final start = _darwinPlaybackStart;
+    _darwinPlaybackStart = null;
+    if (start == null) return;
+    if (!start.sessionReady.isCompleted) start.sessionReady.complete(false);
+    start.cancelled.complete();
   }
 
   /// Pauses the currently playing media. This method does nothing if
@@ -1129,11 +1182,13 @@ class AudioPlayer {
     final stopwatch = Stopwatch();
     stopwatch.start();
     _playInterrupted = false;
+    final pausedPosition = position;
+    _cancelDarwinPlaybackStart();
     // Update local state immediately so that queries aren't surprised.
     _playerEventSubject.add(PlayerEvent(
       playing: false,
       playbackEvent: playbackEvent.copyWith(
-        updatePosition: position,
+        updatePosition: pausedPosition,
         updateTime: DateTime.now(),
       ),
     ));
@@ -1145,8 +1200,27 @@ class AudioPlayer {
   }
 
   Future<void> _sendPlayRequest(
-      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {
+      AudioPlayerPlatform platform, Completer<void>? playCompleter,
+      {_DarwinPlaybackStart? expectedDarwinStart}) async {
     try {
+      final start = expectedDarwinStart ?? _darwinPlaybackStart;
+      if (start != null) {
+        if (!await start.sessionReady.future ||
+            !identical(start, _darwinPlaybackStart) ||
+            !playing) {
+          return;
+        }
+        if (start.requestedPlatform == null) {
+          start.requestedPlatform = platform;
+          start.requestedAtMs = DateTime.now().millisecondsSinceEpoch;
+          _playerEventSubject.add(playerEvent.copyWith(
+            playbackEvent: playbackEvent.copyWith(
+              updatePosition: position,
+              updateTime: DateTime.now(),
+            ),
+          ));
+        }
+      }
       if (!playing) return; // defensive
       await platform.play(PlayRequest());
       playCompleter?.complete();
@@ -1169,6 +1243,7 @@ class AudioPlayer {
         _setPlatformActive(false)?.catchError((dynamic e) async => null);
 
     _playInterrupted = false;
+    _cancelDarwinPlaybackStart();
     // Update local state immediately so that queries aren't surprised.
     _playerEventSubject.add(playerEvent.copyWith(playing: false));
     await future;
@@ -1181,8 +1256,8 @@ class AudioPlayer {
     await (await _platform).setVolume(SetVolumeRequest(volume: volume));
   }
 
-  /// Sets whether silence should be skipped in audio playback. (Currently
-  /// Android only).
+  /// Sets whether silence should be skipped in audio playback on Android and
+  /// iOS. Native engines retain the target if the current asset is unsupported.
   Future<void> setSkipSilenceEnabled(bool enabled) async {
     if (_disposed) return;
     final previouslyEnabled = skipSilenceEnabled;
@@ -1406,6 +1481,17 @@ class AudioPlayer {
   /// Releases all resources associated with this player. You must invoke this
   /// after you are done with the player.
   Future<void> dispose() {
+    if (_darwinPlaybackStart != null) {
+      final stoppedPosition = position;
+      _cancelDarwinPlaybackStart();
+      _playerEventSubject.add(playerEvent.copyWith(
+        playing: false,
+        playbackEvent: playbackEvent.copyWith(
+          updatePosition: stoppedPosition,
+          updateTime: DateTime.now(),
+        ),
+      ));
+    }
     return _lock.synchronized(() async {
       if (_disposed) return;
       await stop();
@@ -1433,6 +1519,9 @@ class AudioPlayer {
       await _currentIndexSubscription?.cancel();
       await _errorsSubscription?.cancel();
       await _errorsResetSubscription?.cancel();
+      for (final effect in _audioPipeline._audioEffects) {
+        await effect._dispose();
+      }
 
       await _playerEventSubject.close();
 
@@ -1552,6 +1641,12 @@ class AudioPlayer {
       });
       _playbackEventSubscription =
           platform.playbackEventMessageStream.listen((message) {
+        final start = _darwinPlaybackStart;
+        if (start != null &&
+            identical(start.requestedPlatform, platform) &&
+            message.updateTime.millisecondsSinceEpoch >= start.requestedAtMs!) {
+          start.awaitingNativeClock = false;
+        }
         var duration = message.duration;
         var index = message.currentIndex ?? currentIndex;
         if (index != null && index < sequence.length) {
@@ -1677,6 +1772,7 @@ class AudioPlayer {
         final automaticallyWaitsToMinimizeStalling =
             this.automaticallyWaitsToMinimizeStalling;
         final playing = this.playing;
+        final darwinStart = _darwinPlaybackStart;
         // To avoid a glitch in ExoPlayer, ensure that any requested audio
         // attributes are set before loading the audio source.
         if (_isAndroid() || _isUnitTest()) {
@@ -1743,7 +1839,8 @@ class AudioPlayer {
           if (checkInterruption()) return inactiveResult(platform);
         }
         if (playing) {
-          _sendPlayRequest(platform, playCompleter);
+          _sendPlayRequest(platform, playCompleter,
+              expectedDarwinStart: darwinStart);
         }
       }
 
@@ -1815,6 +1912,14 @@ class AudioPlayer {
       return PlayerException(code, e.message, index);
     }
   }
+}
+
+class _DarwinPlaybackStart {
+  final sessionReady = Completer<bool>();
+  final cancelled = Completer<void>();
+  bool awaitingNativeClock = true;
+  AudioPlayerPlatform? requestedPlatform;
+  int? requestedAtMs;
 }
 
 /// Captures the details of any error accessing, loading or playing an audio
@@ -4359,6 +4464,8 @@ abstract class AudioEffect {
 
   /// Called when [_player] is connected to the platform.
   Future<void> _activate(AudioPlayerPlatform platform) async {}
+
+  Future<void> _dispose() async {}
 
   /// Whether the effect is enabled. When `true`, and if the effect is part
   /// of an [AudioPipeline] attached to an [AudioPlayer], the effect will modify

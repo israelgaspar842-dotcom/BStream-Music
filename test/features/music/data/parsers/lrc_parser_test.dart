@@ -107,4 +107,66 @@ void main() {
       const LyricLine(timestamp: Duration(seconds: 4), text: 'Valid'),
     ]);
   });
+
+  test(
+    'enhanced LRC keeps word times, punctuation and repeated line offsets',
+    () {
+      final lines = parser.parse('''
+[offset:+250]
+[00:01.00][00:05.00]<00:01.00>Hel<00:01.50>lo, <00:02.00>world!<00:03.00>
+''');
+      expect(lines.map((line) => line.text), [
+        'Hello, world!',
+        'Hello, world!',
+      ]);
+      expect(lines.every((line) => line.hasWordTiming), isTrue);
+      expect(lines.first.words.map((word) => word.start.inMilliseconds), [
+        1250,
+        1750,
+        2250,
+      ]);
+      expect(lines.last.words.map((word) => word.start.inMilliseconds), [
+        5250,
+        5750,
+        6250,
+      ]);
+      expect(lines.first.words.last.end, const Duration(milliseconds: 3250));
+      expect(
+        lines.first.words.map((word) => (word.startOffset, word.endOffset)),
+        [(0, 3), (3, 6), (7, 13)],
+      );
+    },
+  );
+
+  test('enhanced LRC with missing final bound keeps clean line lyrics', () {
+    final line = parser
+        .parse('[00:01.00]<00:01.00>Hello <00:02.00>world')
+        .single;
+    expect(line.text, 'Hello world');
+    expect(line.timestamp, const Duration(seconds: 1));
+    expect(line.words, isEmpty);
+  });
+
+  test('enhanced LRC uses the next line as a final word boundary', () {
+    final lines = parser.parse(
+      '[00:01.00]<00:01.00>Hello <00:02.00>world\n[00:04.00]Next line',
+    );
+    expect(lines.first.hasWordTiming, isTrue);
+    expect(lines.first.words.last.end, const Duration(seconds: 4));
+    expect(lines.last.hasWordTiming, isFalse);
+  });
+
+  test(
+    'enhanced LRC with backward tokens or clamped empty duration falls back',
+    () {
+      for (final source in [
+        '[00:01.00]<00:02.00>Hello <00:01.00>world<00:03.00>',
+        '[offset:-1500]\n[00:01.00]<00:01.00>Hello <00:01.20>world<00:03.00>',
+      ]) {
+        final line = parser.parse(source).single;
+        expect(line.text, 'Hello world');
+        expect(line.hasWordTiming, isFalse);
+      }
+    },
+  );
 }

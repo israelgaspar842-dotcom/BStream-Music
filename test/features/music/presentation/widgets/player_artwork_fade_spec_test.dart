@@ -15,7 +15,7 @@ void main() {
       );
       _expectFadeGradient(
         expandedArtworkHeroFocusFadeGradient,
-        lastOpaqueStop: 0.68,
+        lastOpaqueStop: 0.60,
       );
       _expectFadeGradient(
         expandedArtworkBoundedEdgeFadeGradient,

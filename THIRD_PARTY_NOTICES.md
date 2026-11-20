@@ -1,5 +1,43 @@
 # Third-party notices
 
+## Online lyrics services
+
+BStream Music can query the separately operated Better Lyrics, LyricsPlus,
+and LRCLIB services, in that priority order. LyricsPlus is the backend used by
+the separate YouLy+ browser extension. Provider attribution accompanies the displayed
+lyrics. Responses are retained only in a small in-memory cache; lyrics and the
+providers' server code are not bundled with the application.
+
+- Better Lyrics: <https://better-lyrics.boidu.dev> and <https://docs.betterlyrics.org/>
+- LyricsPlus: <https://github.com/ibratabian17/LyricsPlus>
+- LRCLIB: <https://lrclib.net/docs>
+
+Better Lyrics' public TTML API availability depends on its cached catalog.
+When TTML is unavailable, BStream can try Better Lyrics' documented public
+Kugou endpoint within the same bounded lookup. BStream does not embed private
+API keys or bypass the service's authentication.
+
+## Google Cast sender SDKs
+
+BStream Music integrates the official Google Cast sender SDKs for Android
+(`com.google.android.gms:play-services-cast-framework` 22.3.1) and iOS
+(`google-cast-sdk-no-bluetooth` 4.8.0), using the default media receiver.
+These proprietary SDKs are distributed under Google's applicable SDK terms,
+not the license of this application's original casting code.
+
+Documentation: <https://developers.google.com/cast/docs/overview>
+
+Terms: <https://developers.google.com/cast/docs/terms>
+
+AndroidX MediaRouter is licensed under Apache-2.0:
+<https://android.googlesource.com/platform/frameworks/support/+/androidx-main/LICENSE.txt>
+
+## xml 6.6.1
+
+BStream Music uses the Dart `xml` package (MIT license) for bounded UPnP device
+descriptions and SOAP messages. Source and license:
+<https://github.com/renggli/dart-xml/blob/v6.6.1/LICENSE>
+
 ## Kyant AndroidLiquidGlass 2.0.0
 
 BStream Music's rounded-rectangle refraction shader adapts the optical model

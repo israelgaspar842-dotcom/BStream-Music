@@ -2,6 +2,54 @@ import 'package:bstream_music/features/music/domain/entities/lyrics.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'line value identity includes word timings and validates UTF-16 ranges',
+    () {
+      const word = LyricWord(
+        text: 'Hola',
+        start: Duration(seconds: 1),
+        end: Duration(seconds: 2),
+        startOffset: 3,
+        endOffset: 7,
+      );
+      const first = LyricLine(
+        timestamp: Duration(seconds: 1),
+        text: '🎵 Hola',
+        words: [word],
+      );
+      const same = LyricLine(
+        timestamp: Duration(seconds: 1),
+        text: '🎵 Hola',
+        words: [word],
+      );
+      const lineOnly = LyricLine(
+        timestamp: Duration(seconds: 1),
+        text: '🎵 Hola',
+      );
+      expect(first, same);
+      expect(first.hashCode, same.hashCode);
+      expect(first, isNot(lineOnly));
+      expect(first.hasWordTiming, isTrue);
+      expect(lineOnly.hasWordTiming, isFalse);
+      expect(
+        const LyricLine(
+          timestamp: Duration(seconds: 1),
+          text: '🎵 Hola missing',
+          words: [word],
+        ).hasWordTiming,
+        isFalse,
+      );
+      expect(
+        const LyricLine(
+          timestamp: Duration(seconds: 1),
+          text: 'Hola',
+          words: [word],
+        ).hasWordTiming,
+        isFalse,
+      );
+    },
+  );
+
   test('LyricsLookup uses every lookup field for value equality', () {
     const first = LyricsLookup(
       title: 'Song',

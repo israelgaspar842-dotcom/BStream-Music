@@ -361,22 +361,36 @@ class SqlitePlaylistSyncStore implements PlaylistSyncStore {
             .whereType<String>()
             .toSet()
             .toList(growable: false);
-        final localTrackRows = referencedLocalTrackIds.isEmpty
-            ? const <Map<String, Object?>>[]
-            : await transaction.query(
-                'local_tracks',
-                columns: const <String>['id', 'source_id'],
-                where:
-                    'id IN (${List.filled(referencedLocalTrackIds.length, '?').join(', ')})',
-                whereArgs: referencedLocalTrackIds,
-              );
-        for (final row in localTrackRows) {
-          final localTrackId = _text(row['id']);
-          final videoId = _text(row['source_id']);
-          if (localTrackId == null || videoId == null) {
-            continue;
+        // Older supported Android SQLite builds allow only 999 parameters per
+        // statement. Keep large downloaded Favorites within that bound while
+        // resolving all sources in the same transaction.
+        const lookupChunkSize = 900;
+        for (
+          var start = 0;
+          start < referencedLocalTrackIds.length;
+          start += lookupChunkSize
+        ) {
+          final end = start + lookupChunkSize;
+          final chunk = referencedLocalTrackIds.sublist(
+            start,
+            end < referencedLocalTrackIds.length
+                ? end
+                : referencedLocalTrackIds.length,
+          );
+          final localTrackRows = await transaction.query(
+            'local_tracks',
+            columns: const <String>['id', 'source_id'],
+            where: 'id IN (${List.filled(chunk.length, '?').join(', ')})',
+            whereArgs: chunk,
+          );
+          for (final row in localTrackRows) {
+            final localTrackId = _text(row['id']);
+            final videoId = _text(row['source_id']);
+            if (localTrackId == null || videoId == null) {
+              continue;
+            }
+            localVideoIdByTrackId[localTrackId] = videoId;
           }
-          localVideoIdByTrackId[localTrackId] = videoId;
         }
         for (final localTrackId in referencedLocalTrackIds) {
           final videoId = localVideoIdByTrackId[localTrackId];

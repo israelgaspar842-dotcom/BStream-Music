@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:bstream_music/core/errors/app_exception.dart';
 import 'package:bstream_music/features/music/domain/entities/download_options.dart';
 import 'package:bstream_music/features/music/domain/entities/download_result.dart';
 import 'package:bstream_music/features/music/domain/entities/local_track.dart';
@@ -9,7 +10,9 @@ import 'package:bstream_music/features/music/domain/entities/track_info.dart';
 import 'package:bstream_music/features/music/domain/repositories/library_repository.dart';
 import 'package:bstream_music/features/music/domain/repositories/music_repository.dart';
 import 'package:bstream_music/features/music/presentation/providers/music_providers.dart';
+import 'package:bstream_music/services/audio_sources/audio_format_details.dart';
 import 'package:bstream_music/services/downloader/downloader_service.dart';
+import 'package:bstream_music/services/downloader/download_audio_metadata_service.dart';
 import 'package:bstream_music/services/storage/library_operation_coordinator.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -21,6 +24,14 @@ final List<int> _validArtworkBytes = image.encodePng(
   image.Image(width: 2, height: 2),
 );
 
+const _downloadFormat = AudioFormatDetails(
+  codec: 'aac',
+  mimeType: 'audio/mp4',
+  bitrate: 325929,
+  sampleRate: 44100,
+  channels: 2,
+);
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -29,6 +40,320 @@ void main() {
   });
 
   group('LocalTrackDownloadHelper deduplication', () {
+    test(
+      'embeds resolved metadata and saved artwork before publishing the track',
+      () async {
+        const track = TrackInfo(
+          id: 'embedded-catalog-song',
+          title: 'Canci\u00f3n del cat\u00e1logo',
+          artist: 'Artista uno, Artista dos',
+          artists: ['Artista uno', 'Artista dos'],
+          album: '\u00c1lbum del cat\u00e1logo',
+          url: 'https://catalog.example/tracks/embedded-song',
+          thumbnailUrl: 'https://images.example/embedded-song.png',
+          duration: Duration(minutes: 3),
+          metadataSource: TrackMetadataSource.youtubeMusic,
+        );
+        late _DownloadFixture fixture;
+        late File cachedArtwork;
+        var publishedDuringEmbedding = true;
+        var savedArtworkExisted = false;
+        final metadataService = _RecordingAudioMetadataService(
+          onEmbed: (call) async {
+            publishedDuringEmbedding =
+                fixture.libraryRepository.localTracks.isNotEmpty;
+            savedArtworkExisted =
+                call.artworkPath != null &&
+                await File(call.artworkPath!).exists();
+            await File(
+              call.filePath,
+            ).writeAsBytes([8, 9], mode: FileMode.append, flush: true);
+            return AudioMetadataWriteResult.written;
+          },
+        );
+        fixture = await _DownloadFixture.create(
+          metadataService: metadataService,
+          artworkCacheFileLookup: (_) async => cachedArtwork,
+        );
+        addTearDown(fixture.dispose);
+        cachedArtwork = await File(
+          p.join(fixture.tempDirectory.path, 'source-cover.png'),
+        ).writeAsBytes(_validArtworkBytes);
+
+        final result = await fixture.helper.resolveForLibrary(track);
+
+        expect(publishedDuringEmbedding, isFalse);
+        expect(savedArtworkExisted, isTrue);
+        expect(metadataService.calls, hasLength(1));
+        final call = metadataService.calls.single;
+        expect(call.filePath, result.track.filePath);
+        expect(call.title, track.title);
+        expect(call.artist, track.artist);
+        expect(call.album, track.album);
+        expect(call.artworkPath, result.track.thumbnailPath);
+        expect(call.artworkPath, isNot(cachedArtwork.path));
+        expect(result.downloadResult!.bytes, 6);
+        expect(result.downloadResult!.audioFormat, _downloadFormat);
+        expect(result.track.audioFormat, _downloadFormat);
+        expect(await File(result.track.filePath).length(), 6);
+        expect(
+          fixture.libraryRepository.localTracks.single.id,
+          result.track.id,
+        );
+        expect(
+          fixture.libraryRepository.localTracks.single.audioFormat,
+          _downloadFormat,
+        );
+        expect(fixture.musicRepository.infoCalls, 0);
+        expect(fixture.musicRepository.downloadCalls, 1);
+      },
+    );
+
+    test(
+      'coalesces embedding until one newly downloaded track is published',
+      () async {
+        final embeddingStarted = Completer<void>();
+        final releaseEmbedding = Completer<void>();
+        final metadataService = _RecordingAudioMetadataService(
+          onEmbed: (_) async {
+            embeddingStarted.complete();
+            await releaseEmbedding.future;
+            return AudioMetadataWriteResult.unchanged;
+          },
+        );
+        final fixture = await _DownloadFixture.create(
+          metadataService: metadataService,
+        );
+        addTearDown(fixture.dispose);
+        final track = _remoteTrack(
+          url: 'https://catalog.example/tracks/coalesced-embedding',
+        );
+        final first = fixture.helper.resolveForLibrary(track);
+        await embeddingStarted.future;
+        final second = fixture.helper.resolveForLibrary(track);
+        await Future<void>.delayed(Duration.zero);
+        expect(fixture.libraryRepository.localTracks, isEmpty);
+        expect(metadataService.calls, hasLength(1));
+        releaseEmbedding.complete();
+        final results = await Future.wait([first, second]);
+        expect(fixture.musicRepository.downloadCalls, 1);
+        expect(metadataService.calls, hasLength(1));
+        expect(results.map((result) => result.track.id).toSet(), hasLength(1));
+        expect(results.where((result) => result.reusedExisting), hasLength(1));
+        expect(fixture.libraryRepository.localTracks, hasLength(1));
+      },
+    );
+
+    for (final throwsFailure in [false, true]) {
+      test(
+        'keeps the usable download when embedding ${throwsFailure ? 'throws' : 'fails'}',
+        () async {
+          final metadataService = _RecordingAudioMetadataService(
+            onEmbed: (_) async {
+              if (throwsFailure) {
+                throw const FileSystemException('Simulated tagging failure');
+              }
+              return AudioMetadataWriteResult.failed;
+            },
+          );
+          final fixture = await _DownloadFixture.create(
+            metadataService: metadataService,
+          );
+          addTearDown(fixture.dispose);
+          final result = await fixture.helper.resolveForLibrary(
+            _remoteTrack(url: 'https://catalog.example/tracks/tagging-failure'),
+          );
+          expect(await File(result.track.filePath).readAsBytes(), [1, 2, 3, 1]);
+          expect(result.downloadResult!.bytes, 4);
+          expect(
+            fixture.libraryRepository.localTracks.single.id,
+            result.track.id,
+          );
+          expect(metadataService.calls, hasLength(1));
+        },
+      );
+    }
+
+    test(
+      'cancellation during embedding rolls back audio and the saved cover',
+      () async {
+        final embeddingStarted = Completer<void>();
+        final releaseEmbedding = Completer<void>();
+        final metadataService = _RecordingAudioMetadataService(
+          onEmbed: (_) async {
+            embeddingStarted.complete();
+            await releaseEmbedding.future;
+            return AudioMetadataWriteResult.written;
+          },
+        );
+        late File cachedArtwork;
+        final fixture = await _DownloadFixture.create(
+          metadataService: metadataService,
+          artworkCacheFileLookup: (_) async => cachedArtwork,
+        );
+        addTearDown(fixture.dispose);
+        cachedArtwork = await File(
+          p.join(fixture.tempDirectory.path, 'cached-cover.png'),
+        ).writeAsBytes(_validArtworkBytes);
+        var cancelled = false;
+        const taskId = 'cancel-during-metadata';
+        fixture.helper.registerCancellationProbe(taskId, () => cancelled);
+        final operation = fixture.helper.resolveForLibrary(
+          _remoteTrack(
+            url: 'https://catalog.example/tracks/cancel-embedding',
+            thumbnailUrl: 'https://images.example/cancel-cover.png',
+          ),
+          taskId: taskId,
+        );
+        final failure = expectLater(
+          operation,
+          throwsA(
+            isA<DownloaderException>().having(
+              (error) => error.code,
+              'code',
+              'download_cancelled',
+            ),
+          ),
+        );
+        await embeddingStarted.future;
+        cancelled = true;
+        releaseEmbedding.complete();
+        await failure;
+        expect(fixture.libraryRepository.localTracks, isEmpty);
+        final call = metadataService.calls.single;
+        expect(await File(call.filePath).exists(), isFalse);
+        expect(call.artworkPath, isNotNull);
+        expect(await File(call.artworkPath!).exists(), isFalse);
+        expect(await cachedArtwork.exists(), isTrue);
+      },
+    );
+
+    test(
+      'shares legacy cleanup across concurrent and later downloads',
+      () async {
+        final releaseCleanup = Completer<bool>();
+        final cleanupStarted = Completer<void>();
+        var cleanupCalls = 0;
+        final fixture = await _DownloadFixture.create(
+          legacyArtworkCleanup: (_) {
+            cleanupCalls++;
+            if (!cleanupStarted.isCompleted) cleanupStarted.complete();
+            return releaseCleanup.future;
+          },
+        );
+        addTearDown(fixture.dispose);
+
+        Future<LocalTrackDownloadResult> download(int index) =>
+            fixture.helper.resolveForLibrary(
+              _remoteTrack(
+                id: 'cleanup-$index',
+                url: 'https://catalog.example/tracks/cleanup-$index',
+              ),
+              allowConcurrentDownload: true,
+            );
+        final first = download(1);
+        final second = download(2);
+        await cleanupStarted.future;
+        await Future<void>.delayed(Duration.zero);
+        expect(cleanupCalls, 1);
+        releaseCleanup.complete(true);
+        await Future.wait([first, second]);
+        await download(3);
+
+        expect(cleanupCalls, 1);
+        expect(fixture.musicRepository.downloadCalls, 3);
+      },
+    );
+
+    test(
+      'retries incomplete legacy cleanup and resets it after restore',
+      () async {
+        var cleanupCalls = 0;
+        final fixture = await _DownloadFixture.create(
+          legacyArtworkCleanup: (_) async => ++cleanupCalls > 1,
+        );
+        addTearDown(fixture.dispose);
+
+        Future<LocalTrackDownloadResult> download(int index) =>
+            fixture.helper.resolveForLibrary(
+              _remoteTrack(
+                id: 'cleanup-retry-$index',
+                url: 'https://catalog.example/tracks/cleanup-retry-$index',
+              ),
+            );
+        await download(1);
+        await download(2);
+        await download(3);
+        expect(cleanupCalls, 2);
+
+        final coordinator = fixture.container.read(
+          libraryOperationCoordinatorProvider,
+        );
+        await coordinator.runExclusive(
+          LibraryMaintenancePhase.committingRestore,
+          () async {},
+        );
+        await download(4);
+        expect(cleanupCalls, 3);
+      },
+    );
+
+    test('retries legacy cleanup after a directory read failure', () async {
+      var cleanupCalls = 0;
+      final fixture = await _DownloadFixture.create(
+        legacyArtworkCleanup: (_) async {
+          if (++cleanupCalls == 1) {
+            throw const FileSystemException('Directory cannot be read');
+          }
+          return true;
+        },
+      );
+      addTearDown(fixture.dispose);
+      final track = _remoteTrack(
+        url: 'https://catalog.example/tracks/cleanup-read-retry',
+      );
+
+      await expectLater(
+        fixture.helper.resolveForLibrary(track),
+        throwsA(isA<FileSystemException>()),
+      );
+      expect(fixture.musicRepository.downloadCalls, 0);
+      await fixture.helper.resolveForLibrary(track);
+      expect(cleanupCalls, 2);
+      expect(fixture.musicRepository.downloadCalls, 1);
+    });
+
+    test(
+      'cleans only legacy images and checks directories created later',
+      () async {
+        final fixture = await _DownloadFixture.create();
+        addTearDown(fixture.dispose);
+
+        Future<LocalTrackDownloadResult> download(int index) =>
+            fixture.helper.resolveForLibrary(
+              _remoteTrack(
+                id: 'cleanup-files-$index',
+                url: 'https://catalog.example/tracks/cleanup-files-$index',
+              ),
+            );
+        final first = await download(1);
+        final directory = File(first.track.filePath).parent;
+        final legacy = File(p.join(directory.path, 'old-cover.jpg'));
+        final unrelated = File(p.join(directory.path, 'keep.txt'));
+        await legacy.writeAsBytes([1]);
+        await unrelated.writeAsString('preserved');
+
+        await download(2);
+        expect(await legacy.exists(), isFalse);
+        expect(await unrelated.exists(), isTrue);
+        expect(await File(first.track.filePath).exists(), isTrue);
+        expect(
+          await directory.list().where((entry) => entry is File).length,
+          3,
+        );
+      },
+    );
+
     test('always reuses an existing valid library file', () async {
       final fixture = await _DownloadFixture.create();
       addTearDown(fixture.dispose);
@@ -48,6 +373,7 @@ void main() {
       expect(fixture.musicRepository.downloadCalls, 0);
       expect(fixture.libraryRepository.localTracks, hasLength(1));
       expect(downloadStarted, isFalse);
+      expect(fixture.metadataService.calls, isEmpty);
     });
 
     test(
@@ -617,6 +943,95 @@ void main() {
     );
 
     test(
+      'reuses full-frame validation only for an unchanged stored cover',
+      () async {
+        var validations = 0;
+        final fixture = await _DownloadFixture.create(
+          thumbnailValidator: (bytes) async {
+            validations++;
+            return image.decodeImage(bytes) == null ? null : '.png';
+          },
+        );
+        addTearDown(fixture.dispose);
+        final artwork = File(
+          p.join(fixture.tempDirectory.path, 'unchanged.png'),
+        );
+        await artwork.writeAsBytes(_validArtworkBytes);
+        final local = LocalTrack(
+          id: 'unchanged-art-track',
+          title: 'Unchanged artwork',
+          artist: 'Artist',
+          filePath: p.join(fixture.tempDirectory.path, 'audio.m4a'),
+          addedAt: DateTime(2026),
+          sourceUrl: 'https://catalog.example/tracks/unchanged',
+          thumbnailUrl: 'https://images.example/art.png',
+          thumbnailPath: artwork.path,
+        );
+
+        expect(await fixture.helper.repairStoredArtwork([local]), 0);
+        expect(await fixture.helper.repairStoredArtwork([local]), 0);
+        expect(validations, 1);
+
+        await artwork.setLastModified(DateTime.utc(2030));
+        expect(await fixture.helper.repairStoredArtwork([local]), 0);
+        expect(validations, 2);
+        expect(fixture.musicRepository.downloadCalls, 0);
+      },
+    );
+
+    for (final mutation in ['corrupt', 'delete']) {
+      test(
+        'repairs a previously validated cover after $mutation without touching audio',
+        () async {
+          late File cached;
+          final fixture = await _DownloadFixture.create(
+            artworkCacheFileLookup: (_) async => cached,
+          );
+          addTearDown(fixture.dispose);
+          final artwork = File(
+            p.join(fixture.tempDirectory.path, 'changed.png'),
+          );
+          cached = File(p.join(fixture.tempDirectory.path, 'cached.png'));
+          final audio = File(p.join(fixture.tempDirectory.path, 'audio.m4a'));
+          await artwork.writeAsBytes(_validArtworkBytes);
+          await cached.writeAsBytes(_validArtworkBytes);
+          await audio.writeAsBytes([4, 3, 2, 1]);
+          final local = LocalTrack(
+            id: 'changed-art-track',
+            title: 'Changed artwork',
+            artist: 'Artist',
+            filePath: audio.path,
+            addedAt: DateTime(2026),
+            sourceUrl: 'https://catalog.example/tracks/changed',
+            thumbnailUrl: 'https://images.example/art.png',
+            thumbnailPath: artwork.path,
+          );
+          fixture.libraryRepository.localTracks.add(local);
+          expect(await fixture.helper.repairStoredArtwork([local]), 0);
+          if (mutation == 'delete') {
+            await artwork.delete();
+          } else {
+            // Same length and file path, but an invalid PNG frame. A successful
+            // validation from the previous pass must not mask this replacement.
+            final damaged = List<int>.of(_validArtworkBytes);
+            damaged.fillRange(8, damaged.length, 0);
+            await artwork.writeAsBytes(damaged, flush: true);
+            await artwork.setLastModified(DateTime.utc(2030));
+          }
+
+          expect(await fixture.helper.repairStoredArtwork([local]), 1);
+          final repaired = fixture.libraryRepository.localTracks.single;
+          expect(
+            await File(repaired.thumbnailPath!).readAsBytes(),
+            _validArtworkBytes,
+          );
+          expect(await audio.readAsBytes(), [4, 3, 2, 1]);
+          expect(fixture.musicRepository.downloadCalls, 0);
+        },
+      );
+    }
+
+    test(
       'rolls back newly downloaded audio and artwork when persistence fails',
       () async {
         final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -708,6 +1123,7 @@ void main() {
         addTearDown(fixture.dispose);
         final existing = await fixture.addExisting(
           sourceUrl: 'https://catalog.example/tracks/42',
+          audioFormat: _downloadFormat,
         );
         const canonical = TrackInfo(
           id: 'catalog-track-42',
@@ -720,6 +1136,8 @@ void main() {
           catalogThumbnailUrl: 'file:///missing-catalog-artwork.jpg',
           duration: Duration(minutes: 3),
           metadataSource: TrackMetadataSource.youtubeMusic,
+          streamBitrate: 96000,
+          streamCodec: 'opus',
         );
 
         final result = await fixture.helper.resolveForLibrary(canonical);
@@ -733,6 +1151,7 @@ void main() {
         expect(result.track.artists, canonical.artists);
         expect(result.track.metadataSource, TrackMetadataSource.youtubeMusic);
         expect(result.track.sourceId, canonical.id);
+        expect(result.track.audioFormat, _downloadFormat);
         expect(fixture.musicRepository.downloadCalls, 0);
         expect(
           fixture.libraryRepository.localTracks.single,
@@ -1027,6 +1446,7 @@ class _DownloadFixture {
     required this.musicRepository,
     required this.progressService,
     required this.container,
+    required this.metadataService,
   });
 
   final Directory tempDirectory;
@@ -1034,6 +1454,7 @@ class _DownloadFixture {
   final _RecordingMusicRepository musicRepository;
   final _ProgressOnlyDownloaderService progressService;
   final ProviderContainer container;
+  final _RecordingAudioMetadataService metadataService;
 
   LocalTrackDownloadHelper get helper =>
       container.read(localTrackDownloadHelperProvider);
@@ -1044,6 +1465,9 @@ class _DownloadFixture {
     TrackInfo? resolvedInfo,
     bool failSavingLocalTrack = false,
     ArtworkCacheFileLookup? artworkCacheFileLookup,
+    LocalTrackThumbnailValidator? thumbnailValidator,
+    LocalTrackLegacyArtworkCleanup? legacyArtworkCleanup,
+    _RecordingAudioMetadataService? metadataService,
   }) async {
     final tempDirectory = await Directory.systemTemp.createTemp(
       'bstream-download-dedupe-',
@@ -1057,16 +1481,29 @@ class _DownloadFixture {
       resolvedInfo: resolvedInfo,
     );
     final progressService = _ProgressOnlyDownloaderService();
+    final effectiveMetadataService =
+        metadataService ?? _RecordingAudioMetadataService();
     final settingsController = _FixedSettingsController(tempDirectory.path);
     final container = ProviderContainer(
       overrides: [
         libraryRepositoryProvider.overrideWithValue(libraryRepository),
         musicRepositoryProvider.overrideWithValue(musicRepository),
+        downloadAudioMetadataServiceProvider.overrideWithValue(
+          effectiveMetadataService,
+        ),
         downloaderServiceProvider.overrideWithValue(progressService),
         settingsControllerProvider.overrideWith(() => settingsController),
         artworkCacheFileLookupProvider.overrideWithValue(
           artworkCacheFileLookup ?? (_) async => null,
         ),
+        if (thumbnailValidator != null || legacyArtworkCleanup != null)
+          localTrackDownloadHelperProvider.overrideWith(
+            (ref) => LocalTrackDownloadHelper(
+              ref,
+              thumbnailValidator: thumbnailValidator,
+              legacyArtworkCleanup: legacyArtworkCleanup,
+            ),
+          ),
       ],
     );
     return _DownloadFixture._(
@@ -1075,6 +1512,7 @@ class _DownloadFixture {
       musicRepository: musicRepository,
       progressService: progressService,
       container: container,
+      metadataService: effectiveMetadataService,
     );
   }
 
@@ -1082,6 +1520,7 @@ class _DownloadFixture {
     required String sourceUrl,
     bool createFile = true,
     List<int> contents = const [1, 2, 3],
+    AudioFormatDetails? audioFormat,
   }) async {
     final file = File(
       p.join(
@@ -1100,6 +1539,7 @@ class _DownloadFixture {
       addedAt: DateTime(2025),
       sourceUrl: sourceUrl,
       duration: const Duration(minutes: 3),
+      audioFormat: audioFormat,
     );
     libraryRepository.localTracks.add(track);
     return track;
@@ -1111,6 +1551,41 @@ class _DownloadFixture {
     if (await tempDirectory.exists()) {
       await tempDirectory.delete(recursive: true);
     }
+  }
+}
+
+typedef _AudioMetadataCall = ({
+  String filePath,
+  String title,
+  String artist,
+  String? album,
+  String? artworkPath,
+});
+
+class _RecordingAudioMetadataService implements DownloadAudioMetadataService {
+  _RecordingAudioMetadataService({this.onEmbed});
+
+  final Future<AudioMetadataWriteResult> Function(_AudioMetadataCall call)?
+  onEmbed;
+  final calls = <_AudioMetadataCall>[];
+
+  @override
+  Future<AudioMetadataWriteResult> embed({
+    required String filePath,
+    required String title,
+    required String artist,
+    String? album,
+    String? artworkPath,
+  }) async {
+    final call = (
+      filePath: filePath,
+      title: title,
+      artist: artist,
+      album: album,
+      artworkPath: artworkPath,
+    );
+    calls.add(call);
+    return await onEmbed?.call(call) ?? AudioMetadataWriteResult.unsupported;
   }
 }
 
@@ -1168,6 +1643,8 @@ class _RecordingMusicRepository implements MusicRepository {
       fileName: fileName,
       mediaType: DownloadMediaType.audio,
       completedAt: DateTime(2026),
+      bytes: await file.length(),
+      audioFormat: _downloadFormat,
     );
   }
 

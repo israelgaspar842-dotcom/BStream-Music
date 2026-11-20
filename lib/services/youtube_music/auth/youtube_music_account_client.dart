@@ -29,6 +29,14 @@ abstract interface class YouTubeMusicAccountClient {
   );
 }
 
+/// Optional capability for metadata refreshes that must bypass the short-lived
+/// profile cached during a login's channel discovery.
+abstract interface class YouTubeMusicAccountProfileRefresher {
+  Future<YouTubeMusicAccountProfile> refreshAccount(
+    YouTubeMusicWebAuthData authData,
+  );
+}
+
 /// Safe default until the authenticated InnerTube gateway is connected.
 class UnconfiguredYouTubeMusicAccountClient
     implements YouTubeMusicAccountClient {

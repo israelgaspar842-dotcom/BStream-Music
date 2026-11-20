@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:developer' as developer;
 
+import '../../../core/utils/background_work.dart';
 import 'youtube_music_account_models.dart';
 import 'youtube_music_account_parser.dart';
 import 'youtube_music_account_transport.dart';
@@ -78,7 +79,7 @@ class YouTubeMusicAccountGateway
     YouTubeMusicAccountRetryDelay retryDelay =
         defaultYouTubeMusicAccountRetryDelay,
     Duration requestTimeout = const Duration(seconds: 12),
-    int maxReadPages = 40,
+    int maxReadPages = 256,
   }) {
     if (clientContext.isEmpty) {
       throw ArgumentError.value(
@@ -134,7 +135,7 @@ class YouTubeMusicAccountGateway
       YouTubeMusicAccountEndpoints.accountMenu,
       _body(),
     );
-    return _parser.parseProfile(response.body);
+    return _parseAccountResponse(response, _parser.parseProfile);
   }
 
   Future<RemoteAccountDirectory> getAccounts() async {
@@ -145,7 +146,7 @@ class YouTubeMusicAccountGateway
         'callCircumstance': 'SWITCHING_USERS_FULL',
       }),
     );
-    return _parser.parseAccountDirectory(response.body);
+    return _parseAccountResponse(response, _parser.parseAccountDirectory);
   }
 
   @override
@@ -174,13 +175,22 @@ class YouTubeMusicAccountGateway
 
     while (true) {
       pagesFetched += 1;
-      for (final playlist in _parser.parsePlaylistSummaries(response.body)) {
+      final page = await _parseAccountResponse(
+        response,
+        _AccountCollectionPageParser(_parser).playlists,
+      );
+      if (!page.isRecognized || (pagesFetched > 1 && page.items.isEmpty)) {
+        return RemotePlaylistCollection(
+          playlists: playlists.values.toList(growable: false),
+          termination: RemotePaginationTermination.invalidResponse,
+          pagesFetched: pagesFetched,
+        );
+      }
+      for (final playlist in page.items) {
         playlists.putIfAbsent(playlist.playlistId, () => playlist);
       }
 
-      final continuationTokens = _parser.parseSavedPlaylistContinuationTokens(
-        response.body,
-      );
+      final continuationTokens = page.continuations;
       final continuation = _nextContinuation(
         continuationTokens,
         requestedContinuations,
@@ -229,12 +239,22 @@ class YouTubeMusicAccountGateway
 
     while (true) {
       pagesFetched += 1;
-      for (final artist in _parser.parseSubscribedArtists(response.body)) {
+      final page = await _parseAccountResponse(
+        response,
+        _AccountCollectionPageParser(_parser).artists,
+      );
+      if (!page.isRecognized || (pagesFetched > 1 && page.items.isEmpty)) {
+        return RemoteSubscribedArtistCollection(
+          artists: artists.values.toList(growable: false),
+          termination: RemotePaginationTermination.invalidResponse,
+          pagesFetched: pagesFetched,
+        );
+      }
+      for (final artist in page.items) {
         artists.putIfAbsent(artist.identity, () => artist);
       }
 
-      final continuationTokens = _parser
-          .parseSubscribedArtistContinuationTokens(response.body);
+      final continuationTokens = page.continuations;
       final continuation = _nextContinuation(
         continuationTokens,
         requestedContinuations,
@@ -267,6 +287,7 @@ class YouTubeMusicAccountGateway
   Future<RemotePlaylistSnapshot> getPlaylist(String playlistId) async {
     final normalizedPlaylistId = _requiredPlaylistId(playlistId);
     final entries = <RemotePlaylistEntry>[];
+    final observedSetVideoIds = <String>{};
     final requestedContinuations = <String>{};
     RemotePlaylistSummary? summary;
     var pagesFetched = 0;
@@ -277,31 +298,72 @@ class YouTubeMusicAccountGateway
 
     while (true) {
       pagesFetched += 1;
-      summary ??= _parser.parsePlaylistHeader(
-        response.body,
-        playlistId: normalizedPlaylistId,
+      final page = await _parseAccountResponse(
+        response,
+        _AccountPlaylistPageParser(
+          _parser,
+          normalizedPlaylistId,
+          entries.length,
+          includeHeader: summary == null,
+        ).parse,
       );
-      entries.addAll(
-        _parser.parsePlaylistEntries(
-          response.body,
-          startingPosition: entries.length,
-        ),
-      );
+      summary ??= page.summary;
+      var repeatedOccurrence = false;
+      if (page.isRecognized) {
+        for (final entry in page.entries) {
+          final setVideoId = entry.setVideoId?.trim();
+          if (setVideoId != null &&
+              setVideoId.isNotEmpty &&
+              !observedSetVideoIds.add(setVideoId)) {
+            repeatedOccurrence = true;
+          }
+        }
+      }
+      // An occurrence ID identifies one playlist row. Receiving it twice is
+      // a replayed/overlapping page, even if the server rotates its token.
+      // Repeated video IDs with distinct occurrence IDs remain untouched.
+      final declaredCount = summary?.itemCount;
+      final verifiedEmptyEnd =
+          page.entries.isEmpty &&
+          page.continuations.isEmpty &&
+          declaredCount != null &&
+          declaredCount == entries.length;
+      if (!page.isRecognized ||
+          repeatedOccurrence ||
+          (pagesFetched > 1 && page.entries.isEmpty && !verifiedEmptyEnd)) {
+        return RemotePlaylistSnapshot(
+          playlistId: normalizedPlaylistId,
+          summary: summary,
+          entries: entries,
+          termination: RemotePaginationTermination.invalidResponse,
+          pagesFetched: pagesFetched,
+        );
+      }
+      entries.addAll(page.entries);
 
-      final continuationTokens = _parser.parsePlaylistEntryContinuationTokens(
-        response.body,
-      );
+      final continuationTokens = page.continuations;
       final continuation = _nextContinuation(
         continuationTokens,
         requestedContinuations,
       );
       if (continuation == null) {
+        // YouTube's header includes hidden/unavailable tracks that are absent
+        // from otherwise complete pages (observed 383 advertised / 382 rows).
+        // A validated, nonempty paginated terminal is therefore authoritative.
+        // The full first 100-row page remains suspicious when a larger header
+        // count is present but no continuation was obtained at all.
+        final suspiciousFirstPage =
+            pagesFetched == 1 &&
+            entries.length >= 100 &&
+            (declaredCount ?? 0) > entries.length;
         return RemotePlaylistSnapshot(
           playlistId: normalizedPlaylistId,
           summary: summary,
           entries: entries,
           termination: continuationTokens.isNotEmpty
               ? RemotePaginationTermination.repeatedContinuation
+              : suspiciousFirstPage
+              ? RemotePaginationTermination.invalidResponse
               : RemotePaginationTermination.exhausted,
           pagesFetched: pagesFetched,
         );
@@ -331,9 +393,14 @@ class YouTubeMusicAccountGateway
       YouTubeMusicAccountEndpoints.browse,
       _body(<String, Object?>{'browseId': 'VL$normalizedPlaylistId'}),
     );
-    return _parser.parsePlaylistHeader(
-      response.body,
-      playlistId: normalizedPlaylistId,
+    return _parseAccountResponse(
+      response,
+      _AccountPlaylistPageParser(
+        _parser,
+        normalizedPlaylistId,
+        0,
+        includeHeader: true,
+      ).header,
     );
   }
 
@@ -452,11 +519,11 @@ class YouTubeMusicAccountGateway
       YouTubeMusicAccountEndpoints.browse,
       _body(<String, Object?>{'browseId': normalizedBrowseId}),
     );
-    return _parseArtistSubscriptionState(
-      response.body,
-      fallbackChannelId: normalizedBrowseId.startsWith('UC')
-          ? normalizedBrowseId
-          : null,
+    return _parseAccountResponse(
+      response,
+      _AccountArtistSubscriptionParser(
+        normalizedBrowseId.startsWith('UC') ? normalizedBrowseId : null,
+      ).parse,
     );
   }
 
@@ -801,6 +868,90 @@ String _requiredChannelId(String channelId) {
     );
   }
   return normalized;
+}
+
+Future<T> _parseAccountResponse<T>(
+  YouTubeMusicAccountResponse response,
+  T Function(Object?) parse,
+) => transformInBackground(
+  response.body,
+  parse,
+  inputSize: response.bodyByteCount,
+);
+
+class _AccountCollectionPage<T> {
+  const _AccountCollectionPage(
+    this.items,
+    this.continuations,
+    this.isRecognized,
+  );
+  final List<T> items;
+  final List<String> continuations;
+  final bool isRecognized;
+}
+
+class _AccountCollectionPageParser {
+  const _AccountCollectionPageParser(this.parser);
+  final YouTubeMusicAccountParser parser;
+
+  _AccountCollectionPage<RemotePlaylistSummary> playlists(Object? body) =>
+      _AccountCollectionPage(
+        parser.parsePlaylistSummaries(body),
+        parser.parseSavedPlaylistContinuationTokens(body),
+        parser.isSavedPlaylistPage(body),
+      );
+
+  _AccountCollectionPage<RemoteSubscribedArtist> artists(Object? body) =>
+      _AccountCollectionPage(
+        parser.parseSubscribedArtists(body),
+        parser.parseSubscribedArtistContinuationTokens(body),
+        parser.isSubscribedArtistPage(body),
+      );
+}
+
+class _AccountPlaylistPage {
+  const _AccountPlaylistPage(
+    this.summary,
+    this.entries,
+    this.continuations,
+    this.isRecognized,
+  );
+  final RemotePlaylistSummary? summary;
+  final List<RemotePlaylistEntry> entries;
+  final List<String> continuations;
+  final bool isRecognized;
+}
+
+class _AccountPlaylistPageParser {
+  const _AccountPlaylistPageParser(
+    this.parser,
+    this.playlistId,
+    this.startingPosition, {
+    required this.includeHeader,
+  });
+
+  final YouTubeMusicAccountParser parser;
+  final String playlistId;
+  final int startingPosition;
+  final bool includeHeader;
+
+  RemotePlaylistSummary? header(Object? body) =>
+      parser.parsePlaylistHeader(body, playlistId: playlistId);
+
+  _AccountPlaylistPage parse(Object? body) => _AccountPlaylistPage(
+    includeHeader ? header(body) : null,
+    parser.parsePlaylistEntries(body, startingPosition: startingPosition),
+    parser.parsePlaylistEntryContinuationTokens(body),
+    parser.isPlaylistEntryPage(body),
+  );
+}
+
+class _AccountArtistSubscriptionParser {
+  const _AccountArtistSubscriptionParser(this.fallbackChannelId);
+  final String? fallbackChannelId;
+
+  RemoteArtistSubscriptionState? parse(Object? body) =>
+      _parseArtistSubscriptionState(body, fallbackChannelId: fallbackChannelId);
 }
 
 RemoteArtistSubscriptionState? _parseArtistSubscriptionState(

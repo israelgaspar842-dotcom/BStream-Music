@@ -1,28 +1,65 @@
 import '../../../../core/utils/duration_formatter.dart';
 import '../../../../core/theme/app_theme.dart';
+import '../../../../core/platform/app_platform.dart';
 import '../../domain/entities/lyrics_romanization_language.dart';
 import 'lyrics_animation_style.dart';
+import 'lyrics_background_style.dart';
+import 'live_widget_style.dart';
 import 'mini_player_background_mode.dart';
 import 'mini_player_mode.dart';
 import 'player_artwork_style.dart';
 import 'player_style.dart';
+import 'player_font.dart';
+import 'app_strings_translation_catalog.dart';
+import '../../../../services/player/player_equalizer.dart';
 
-enum AppLanguage { spanish, english }
+enum AppLanguage {
+  spanish,
+  english,
+  portuguese,
+  french,
+  korean,
+  chinese,
+  japanese,
+}
+
+String systemFontNameForPlatform(AppPlatformType platform) =>
+    switch (platform) {
+      AppPlatformType.android || AppPlatformType.linux => 'Roboto',
+      AppPlatformType.ios || AppPlatformType.macos => 'San Francisco',
+      AppPlatformType.windows => 'Segoe UI',
+      AppPlatformType.unsupported => 'System',
+    };
 
 extension AppLanguageLabel on AppLanguage {
   String get label => switch (this) {
     AppLanguage.spanish => 'Español',
     AppLanguage.english => 'English',
+    AppLanguage.portuguese => 'Português',
+    AppLanguage.french => 'Français',
+    AppLanguage.korean => '한국어',
+    AppLanguage.chinese => '简体中文',
+    AppLanguage.japanese => '日本語',
   };
 
   String get code => switch (this) {
     AppLanguage.spanish => 'es',
     AppLanguage.english => 'en',
+    AppLanguage.portuguese => 'pt',
+    AppLanguage.french => 'fr',
+    AppLanguage.korean => 'ko',
+    AppLanguage.chinese => 'zh',
+    AppLanguage.japanese => 'ja',
   };
 
   static AppLanguage fromCode(String? code) {
     return switch (code) {
       'en' => AppLanguage.english,
+      'pt' => AppLanguage.portuguese,
+      'fr' => AppLanguage.french,
+      'ko' => AppLanguage.korean,
+      'zh' => AppLanguage.chinese,
+      'ja' => AppLanguage.japanese,
       _ => AppLanguage.spanish,
     };
   }
@@ -35,7 +72,56 @@ class AppStrings {
 
   bool get isEnglish => appLanguage == AppLanguage.english;
 
-  String choose(String es, String en) => isEnglish ? en : es;
+  String choose(String es, String en) {
+    if (appLanguage == AppLanguage.spanish) return es;
+    if (isEnglish) return en;
+    return translateAppString(en, appLanguage.code) ?? en;
+  }
+
+  String get audioOutput => choose('Salida Multimedia', 'Media output');
+  String get playerAudioOutput => choose('Salida de audio', 'Audio output');
+  String get playerAudioOutputHint => choose(
+    'Elige dónde escuchar BStream. Solo afecta al audio del reproductor.',
+    'Choose where to listen to BStream. Only the player audio is affected.',
+  );
+  String get systemDefaultAudioOutput =>
+      choose('Predeterminada del sistema', 'System default');
+  String get playerVolume => choose('Volumen del reproductor', 'Player volume');
+  String get playerAudioControlFailed => choose(
+    'No se pudo actualizar el audio del reproductor.',
+    'Could not update the player audio.',
+  );
+  String get thisPhone => choose('Este teléfono', 'This phone');
+  String get castTo => choose('Transmitir a', 'Cast to');
+  String get mediaVolume => choose('Volumen multimedia', 'Media volume');
+  String get deviceVolume => choose('Volumen del dispositivo', 'Device volume');
+  String get systemOutputPicker =>
+      choose('Más salidas del sistema', 'More system outputs');
+  String get outputUnavailable => choose(
+    'El sistema no pudo cambiar la salida de audio.',
+    'The system could not change the audio output.',
+  );
+  String get outputRequested => choose('Salida solicitada', 'Output requested');
+  String get castNetworkHint => choose(
+    'Conecta tu dispositivo y el receptor a la misma Wi-Fi.',
+    'Connect your device and receiver to the same Wi-Fi.',
+  );
+  String get castNoDevices => choose(
+    'No se encontraron dispositivos compatibles.',
+    'No compatible devices found.',
+  );
+  String get castSearching =>
+      choose('Buscando dispositivos…', 'Searching for devices…');
+  String get castRefresh => choose('Buscar dispositivos', 'Find devices');
+  String get castDisconnect => choose('Dejar de transmitir', 'Stop casting');
+  String get castFailed => choose(
+    'No se pudo transmitir. La música continúa en este dispositivo.',
+    'Could not cast. Music continues on this device.',
+  );
+  String get outputLoadFailed => choose(
+    'No se pudieron consultar las salidas de audio.',
+    'Could not read audio outputs.',
+  );
 
   String get home => choose('Inicio', 'Home');
   String homeGreeting({required int hour}) {
@@ -49,6 +135,8 @@ class AppStrings {
       choose('Refrescar recomendaciones', 'Refresh recommendations');
   String get refreshingHomeRecommendations =>
       choose('Refrescando recomendaciones', 'Refreshing recommendations');
+  String get loadingHomeRecommendations =>
+      choose('Cargando recomendaciones', 'Loading recommendations');
   String get popularArtists => choose('Artistas populares', 'Popular artists');
   String get recommendedArtists =>
       choose('Artistas recomendados', 'Recommended artists');
@@ -60,8 +148,36 @@ class AppStrings {
   );
   String get artistProfile => choose('Perfil del artista', 'Artist profile');
   String get popularSongs => choose('Canciones más populares', 'Popular songs');
+  String get showMore => choose('Mostrar más', 'Show more');
+  String get showLess => choose('Mostrar menos', 'Show less');
+  String get viewAll => choose('Ver todo', 'View all');
+  String get artistSongs => searchSongs;
+  String artistSongsLoadedCount(int loaded, int total) =>
+      choose('$loaded de $total canciones', '$loaded of $total songs');
+  String artistSongsPartialCount(int count) =>
+      choose('$count canciones cargadas', '$count songs loaded');
+  String get artistSongsLoadError => choose(
+    'No se pudieron cargar las canciones del artista.',
+    'The artist\'s songs could not be loaded.',
+  );
+  String get artistWithoutSongs => choose(
+    'No se encontraron canciones de este artista.',
+    'No songs were found for this artist.',
+  );
   String get albums => choose('Álbumes', 'Albums');
   String get singles => choose('Sencillos', 'Singles');
+  String get artistReleasesLoadError => choose(
+    'No se pudieron cargar los lanzamientos del artista.',
+    'The artist\'s releases could not be loaded.',
+  );
+  String get artistWithoutReleases => choose(
+    'No se encontraron lanzamientos de este artista.',
+    'No releases were found for this artist.',
+  );
+  String get artistReleasesPartial => choose(
+    'No se pudieron cargar todos los lanzamientos. Vuelve a intentarlo.',
+    'Some releases could not be loaded. Try again.',
+  );
   String get artistMix => 'Mix';
   String get subscribe => choose('Suscribirse', 'Subscribe');
   String get unsubscribe => choose('Cancelar suscripción', 'Unsubscribe');
@@ -216,7 +332,7 @@ class AppStrings {
   String get clearSearch => choose('Limpiar búsqueda', 'Clear search');
   String get searchTitle => choose('Búsqueda', 'Search');
   String get player => choose('Reproductor', 'Player');
-  String get localTab => 'Local';
+  String get localTab => choose('Local', 'Local');
   String get localMusic => choose('Música local', 'Local music');
   String get allLocalSongs => choose('Todas las canciones', 'All songs');
   String get localMusicFolders => choose('Carpetas', 'Folders');
@@ -304,16 +420,33 @@ class AppStrings {
     count == 1 ? '1 song' : '$count songs',
   );
   String get play => choose('Reproducir', 'Play');
+  String get playbackLoading => choose('Cargando canción', 'Loading song');
   String get pause => choose('Pausar', 'Pause');
   String get previous => choose('Anterior', 'Previous');
   String get next => choose('Siguiente', 'Next');
   String get download => choose('Descargar', 'Download');
   String get downloadAudio => choose('Descargar audio', 'Download audio');
   String get cancelDownload => choose('Cancelar descarga', 'Cancel download');
+  String get cancelDownloads =>
+      choose('Cancelar descargas', 'Cancel downloads');
+  String get downloadsCancelled => choose(
+    'Descargas pendientes canceladas.',
+    'Pending downloads cancelled.',
+  );
+  String get bulkDownloadFailed => choose(
+    'No se pudieron preparar las descargas. Inténtalo de nuevo.',
+    'Could not queue the downloads. Try again.',
+  );
+  String get bulkDownloadCancelFailed => choose(
+    'No se pudieron cancelar las descargas. Inténtalo de nuevo.',
+    'Could not cancel the downloads. Try again.',
+  );
   String get downloadCancelled =>
       choose('Descarga cancelada', 'Download cancelled');
   String get noPlayback => choose('Sin reproducción', 'Nothing playing');
   String get nowPlaying => choose('En reproducción', 'Now playing');
+  String get playbackPaused => choose('Pausado', 'Paused');
+  String get viewInList => choose('Ver en la lista', 'View in list');
   String get minimizePlayer =>
       choose('Minimizar reproductor', 'Minimize player');
   String get noTitle => choose('Sin título', 'Untitled');
@@ -361,6 +494,80 @@ class AppStrings {
     'These lyrics do not include synchronized timing.',
   );
   String get lyricsOffset => choose('Desfase', 'Offset');
+  String get lyricsSettings => choose('Opciones de letras', 'Lyrics options');
+  String get lyricsShareTitle => choose('Compartir letras', 'Share lyrics');
+  String get lyricsShareSelectHint => choose(
+    'Mantén pulsada una línea para compartir hasta 5 líneas',
+    'Hold a line to share up to 5 lines',
+  );
+  String get lyricsShareLimit =>
+      choose('Puedes seleccionar hasta 5 líneas', 'Select up to 5 lines');
+  String lyricsShareSelectedCount(int count) =>
+      choose('$count de 5 líneas', '$count of 5 lines');
+  String get lyricsShareBackground => choose('Fondo', 'Background');
+  String get lyricsShareBlur => choose('Desenfoque', 'Blur');
+  String get lyricsShareCover => choose('Portada', 'Artwork');
+  String get lyricsShareGradient => choose('Gradiente', 'Gradient');
+  String get lyricsBackground => choose('Fondo de letras', 'Lyrics background');
+  String lyricsBackgroundLabel(LyricsBackgroundStyle style) => switch (style) {
+    LyricsBackgroundStyle.blur => lyricsShareBlur,
+    LyricsBackgroundStyle.gradient => lyricsShareGradient,
+    LyricsBackgroundStyle.animatedGradient => choose('Animado', 'Animated'),
+  };
+  String get lyricsShareTextColor => choose('Color del texto', 'Text color');
+  String get lyricsShareTextAuto => choose('Automático', 'Automatic');
+  String get lyricsShareTextLight => choose('Claro', 'Light');
+  String get lyricsShareTextDark => choose('Oscuro', 'Dark');
+  String get lyricsShareGallery => choose('Galería', 'Gallery');
+  String get lyricsShareChoosePhoto => choose('Elegir foto', 'Choose photo');
+  String get lyricsShareAdjustPhoto => choose('Ajustar foto', 'Adjust photo');
+  String get lyricsShareCropTitle => lyricsShareAdjustPhoto;
+  String get lyricsShareCropHint => choose(
+    'Arrastra y amplía la foto para ajustar el recorte',
+    'Drag and zoom the photo to adjust the crop',
+  );
+  String get lyricsShareUsePhoto => choose('Usar foto', 'Use photo');
+  String get lyricsShareResetCrop => choose('Restablecer', 'Reset');
+  String get lyricsSharePhotoFailed => choose(
+    'No se pudo abrir la foto. Prueba con otra imagen.',
+    'Could not open the photo. Try another image.',
+  );
+  String get lyricsSharePalette =>
+      choose('Colores del gradiente', 'Gradient colors');
+  String lyricsShareColorLabel(int index) =>
+      choose('Color $index', 'Color $index');
+  String get lyricsShareImage => choose('Compartir imagen', 'Share image');
+  String get lyricsShareSaveImage => choose('Guardar imagen', 'Save image');
+  String get lyricsShareSaved => choose('Imagen guardada', 'Image saved');
+  String get lyricsShareFailed => choose(
+    'No se pudo preparar o compartir la imagen',
+    'Could not prepare or share the image',
+  );
+  String get lyricsSharePreparing =>
+      choose('Preparando imagen…', 'Preparing image…');
+  String get lyricsSharePreview => lyricsPreview;
+  String get lyricsOffsetUnavailable => choose(
+    'Disponible para letras sincronizadas.',
+    'Available for synchronized lyrics.',
+  );
+  String get translateLyrics => choose('Traducir letras', 'Translate lyrics');
+  String get translateLyricsSummary => choose(
+    'Al idioma de la app · Google Translate',
+    'To the app language · Google Translate',
+  );
+  String get lyricsTranslationLoading => choose('Traduciendo…', 'Translating…');
+  String get lyricsTranslationError => choose(
+    'No se pudo traducir. Se conserva la letra original.',
+    'Unable to translate. The original lyrics remain available.',
+  );
+  String get lyricsAlreadyInAppLanguage => choose(
+    'La letra ya está en el idioma de la app.',
+    'The lyrics are already in the app language.',
+  );
+  String get lyricsTranslationAttribution => choose(
+    'Traducción automática: Google Translate',
+    'Automatic translation: Google Translate',
+  );
   String get lyricsOffsetHint => choose(
     'Ajústalo si la letra aparece antes o después de la voz.',
     'Adjust it if the lyrics appear before or after the vocals.',
@@ -378,6 +585,26 @@ class AppStrings {
   String get lyricsAppearanceSummary => choose(
     'Personaliza la animación, alineación y romanización.',
     'Customize lyrics animation, alignment, and romanization.',
+  );
+  String get lyricsProviders =>
+      choose('Proveedores de letras', 'Lyrics providers');
+  String get lyricsProvidersHint => choose(
+    'Activa los proveedores que quieras consultar. Orden de búsqueda: Better Lyrics → LyricsPlus → LRCLIB.',
+    'Enable the providers you want to use. Search order: Better Lyrics → LyricsPlus → LRCLIB.',
+  );
+  String get lyricsProvidersFallbackHint => choose(
+    'Solo se consultan los proveedores activos. Si no hay letra sincronizada, se prueba el siguiente, incluso si el resultado es instrumental. La letra sin sincronizar se conserva como último recurso.',
+    'Only enabled providers are queried. If synchronized lyrics are unavailable, the next provider is tried, including instrumental results. Unsynchronized lyrics are kept as a last resort.',
+  );
+  String get noLyricsProvidersEnabled =>
+      choose('Ningún proveedor activo', 'No providers enabled');
+  String get lyricsProvidersDisabledHint => choose(
+    'No hay proveedores activos. La búsqueda automática de letras está desactivada.',
+    'No providers are enabled. Automatic lyrics lookup is disabled.',
+  );
+  String get betterLyricsAvailabilityHint => choose(
+    'TTML depende de su caché pública; si no está disponible, se prueba Kugou.',
+    'TTML depends on its public cache; if unavailable, Kugou is tried.',
   );
   String get lyricsAnimation => choose('Animación', 'Animation');
   String get lyricsAnimationSmooth => choose('Suave', 'Smooth');
@@ -417,6 +644,8 @@ class AppStrings {
   String get retry => choose('Reintentar', 'Retry');
   String get lyricsSource =>
       choose('Letras proporcionadas por LRCLIB', 'Lyrics provided by LRCLIB');
+  String lyricsSourceForProvider(String provider) =>
+      lyricsSource.replaceAll('LRCLIB', provider);
   String get tapLyricsToSeek => choose(
     'Toca una línea para ir a ese momento.',
     'Tap a line to seek to that moment.',
@@ -434,6 +663,25 @@ class AppStrings {
   String get sharedSong => choose('Canción compartida', 'Shared song');
   String get sharePlaylist => choose('Compartir playlist', 'Share playlist');
   String get sharePlaylistTitle => sharePlaylist;
+  String get sharePlaylistCsv => choose('Archivo .csv', 'CSV file');
+  String get sharePlaylistYouTubeMusicUrl =>
+      choose('URL de YouTube Music', 'YouTube Music URL');
+  String get sharePlaylistCsvDescription => choose(
+    'Comparte la lista de canciones de esta playlist, sin archivos de audio.',
+    'Share a list of the songs in this playlist, without audio files.',
+  );
+  String get sharePlaylistUrlDescription => choose(
+    'Comparte el enlace de esta playlist sincronizada con YouTube Music.',
+    'Share the link to this playlist synced with YouTube Music.',
+  );
+  String get playlistShareUrlUnavailable => choose(
+    'Sincroniza esta playlist con YouTube Music para compartir su URL.',
+    'Sync this playlist with YouTube Music first to share its URL.',
+  );
+  String get favoritesPlaylistUrlUnavailable => choose(
+    'Los favoritos de YouTube Music no tienen un enlace público. Compártelos como CSV.',
+    'YouTube Music favorites do not have a public link. Share them as CSV.',
+  );
   String sharePlaylistMessage(String name) => choose(
     'Escucha mi playlist "$name" en YouTube Music.',
     'Listen to my "$name" playlist on YouTube Music.',
@@ -463,6 +711,27 @@ class AppStrings {
     'The playlist could not be shared.',
   );
   String get addToPlaylist => choose('Añadir a playlist', 'Add to playlist');
+  String get playlistAddFailed => choose(
+    'No se pudo añadir a la playlist. Inténtalo de nuevo.',
+    'Could not add to the playlist. Try again.',
+  );
+  String get downloadAll => choose('Descargar todo', 'Download all');
+  String songsQueuedForDownload(int count) => choose(
+    count == 1
+        ? 'Canción añadida a la cola de descargas.'
+        : '$count canciones añadidas a la cola de descargas.',
+    count == 1
+        ? 'Song added to the download queue.'
+        : '$count songs added to the download queue.',
+  );
+  String get noPendingPlaylistDownloads => choose(
+    'No hay canciones pendientes de descargar.',
+    'There are no songs left to download.',
+  );
+  String get playlistDownloadFailed => choose(
+    'No se pudo preparar la descarga de la playlist. Inténtalo de nuevo.',
+    'Could not queue the playlist download. Try again.',
+  );
   String get favorites => choose('Favoritos', 'Favorites');
   String get addToFavorites => choose('Añadir a favoritos', 'Add to favorites');
   String get removeFromFavorites =>
@@ -519,6 +788,8 @@ class AppStrings {
     'Live !play requests will appear here.',
   );
   String get clearLiveQueue => choose('Limpiar cola LIVE', 'Clear LIVE queue');
+  String get removeFromQueue =>
+      choose('Quitar de la cola', 'Remove from queue');
   String get requestedBy => choose('Pedido por', 'Requested by');
   String get moderator => choose('Moderador', 'Moderator');
   String get commandPermissions =>
@@ -570,12 +841,25 @@ class AppStrings {
       choose('Pausa la canción LIVE actual.', 'Pauses the current LIVE song.');
   String get reusedDownload => choose('Ya descargada', 'Already downloaded');
   String get playlist => choose('Playlist', 'Playlist');
+  String get playlistArtworkTitle =>
+      choose('Portada de la playlist', 'Playlist artwork');
+  String get playlistArtworkRandom => choose('Aleatorio', 'Random');
+  String get playlistArtworkCustom => choose('Personalizada', 'Custom');
+  String get playlistArtworkEdit =>
+      choose('Cambiar portada de la playlist', 'Change playlist artwork');
+  String get playlistArtworkSaveFailed => choose(
+    'No se pudo actualizar la portada de la playlist.',
+    'Could not update the playlist artwork.',
+  );
   String get newPlaylist => choose('Nueva playlist', 'New playlist');
   String get createPlaylist => choose('Crear playlist', 'Create playlist');
   String get create => choose('Crear', 'Create');
   String get cancel => choose('Cancelar', 'Cancel');
   String get name => choose('Nombre', 'Name');
   String get filterSongs => choose('Filtrar canciones', 'Filter songs');
+  String get searchPlaylistSongs => choose('Buscar canción', 'Search songs');
+  String get reorderSong =>
+      choose('Mantén y arrastra para reordenar', 'Drag to reorder');
   String get noSongsToShow =>
       choose('No hay canciones para mostrar.', 'No songs to show.');
   String get noLocalPlaylists => choose(
@@ -678,6 +962,21 @@ class AppStrings {
                   : '$count songs removed from playlist.'),
       );
   String get folder => choose('Carpeta', 'Folder');
+  String get refreshDownloadedMetadata =>
+      choose('Actualizar metadatos de archivos', 'Update file metadata');
+  String downloadedMetadataProgress(int processed, int total) => choose(
+    'Actualizando metadatos: $processed de $total',
+    'Updating metadata: $processed of $total',
+  );
+  String downloadedMetadataSummary(int updated, int skipped, int failed) =>
+      choose(
+        'Actualizados: $updated · Omitidos: $skipped · Fallidos: $failed',
+        'Updated: $updated · Skipped: $skipped · Failed: $failed',
+      );
+  String get downloadedMetadataFailed => choose(
+    'No se pudieron actualizar los metadatos. Inténtalo nuevamente.',
+    'Could not update file metadata. Try again.',
+  );
   String get exportBackup => choose('Exportar', 'Export');
   String get importBackup => choose('Importar', 'Import');
   String get importData => choose('Importar', 'Import');
@@ -691,8 +990,8 @@ class AppStrings {
   String get importFromCsv =>
       choose('Importar desde archivo .csv', 'Import from a .csv file');
   String get importCsvSummary => choose(
-    'Combina listas y metadatos; tras confirmar, descargará las canciones.',
-    'Merge lists and metadata; after confirmation, songs will be downloaded.',
+    'Combina listas, favoritos y metadatos sin descargar audio.',
+    'Merge lists, favorites, and metadata without downloading audio.',
   );
   String get exportLocalBackup =>
       choose('Exportar respaldo local', 'Export local backup');
@@ -706,8 +1005,7 @@ class AppStrings {
     'Compatible con MetroList, Harmony y formatos comunes; no incluye audio.',
     'Compatible with MetroList, Harmony, and common formats; no audio included.',
   );
-  String get csvImportTitle =>
-      choose('Importar y descargar canciones', 'Import and download songs');
+  String get csvImportTitle => choose('Importar canciones', 'Import songs');
   String csvImportPreview({
     required int tracks,
     required int playlists,
@@ -717,43 +1015,42 @@ class AppStrings {
     'Se encontraron $tracks canciones y $playlists playlists. '
         'Se omitirán $invalid filas inválidas y se combinarán $duplicates '
         'filas repetidas. '
-        'Las canciones existentes se reutilizarán; las faltantes se '
-        'descargarán en paralelo con un límite seguro.',
+        'Se combinarán listas, favoritos y metadatos sin descargar audio. '
+        'Las canciones existentes se reutilizarán.',
     '$tracks songs and $playlists playlists were found. $invalid invalid '
         'rows will be skipped and $duplicates repeated rows will be merged. '
-        'Existing songs '
-        'will be reused; missing songs will be downloaded in parallel with a '
-        'safe limit.',
+        'Lists, favorites, and metadata will be merged without downloading '
+        'audio. Existing songs will be reused.',
   );
   String get csvImportDataNotice => choose(
-    'La descarga puede consumir datos y almacenamiento. Puedes detener la '
-        'importación después de las descargas activas.',
-    'Downloads may use data and storage. You can stop the import after the '
-        'active downloads finish.',
+    'La búsqueda de metadatos puede usar la conexión a Internet. Puedes '
+        'descargar las canciones más adelante.',
+    'Metadata lookup may use your Internet connection. You can download '
+        'songs later.',
   );
-  String get importAndDownload =>
-      choose('Importar y descargar', 'Import and download');
   String get csvImporting =>
       choose('Importando biblioteca', 'Importing library');
   String csvImportProgress(int processed, int total) =>
       choose('$processed de $total canciones', '$processed of $total songs');
-  String get stopAfterCurrent =>
-      choose('Detener después de las activas', 'Stop after active downloads');
+  String get stopAfterCurrent => choose(
+    'Detener después de las importaciones activas',
+    'Stop after active imports',
+  );
   String get csvStopRequested => choose(
-    'Se detendrá al terminar las descargas activas.',
-    'The import will stop after the active downloads finish.',
+    'Se detendrá al terminar las importaciones activas.',
+    'The import will stop after the active imports finish.',
   );
   String get csvImportCompleted =>
       choose('Importación terminada', 'Import complete');
   String csvImportResult({
-    required int downloaded,
+    required int imported,
     required int reused,
     required int failed,
     required int playlists,
   }) => choose(
-    '$downloaded descargadas, $reused reutilizadas, $failed con error y '
+    '$imported importadas, $reused reutilizadas, $failed con error y '
         '$playlists playlists actualizadas.',
-    '$downloaded downloaded, $reused reused, $failed failed, and $playlists '
+    '$imported imported, $reused reused, $failed failed, and $playlists '
         'playlists updated.',
   );
   String get csvImportCancelled => choose(
@@ -813,14 +1110,55 @@ class AppStrings {
   String get surfaceEffects =>
       choose('Efectos de superficie', 'Surface effects');
   String get surfaceBackground =>
-      choose('Fondo de las superficies', 'Surface background');
+      choose('Estilo de las superficies', 'Surface style');
+  String get appBackground => choose('Fondo de la App', 'App background');
+  String get appBackgroundNone => choose('Sin Fondo', 'No background');
+  String get appBackgroundCustom => choose('Personalizado', 'Custom');
+  String get appBackgroundSelectionFailed => choose(
+    'No se pudo usar esa foto. Prueba con otra imagen.',
+    'Could not use that photo. Try another image.',
+  );
   String get surfaceBackgroundAccent => choose('Acento', 'Accent');
   String get surfaceBackgroundTransparent =>
       choose('Transparente', 'Transparent');
   String get surfaceBackgroundLiquidGlass => 'Liquid Glass Style';
+  String get playerFont => choose('Fuente de la app', 'App font');
+  String get playerFontCurrent =>
+      AppPlatform.current == AppPlatformType.unsupported
+      ? choose('Sistema', 'System')
+      : systemFontNameForPlatform(AppPlatform.current);
+  String get playerFontCurrentDescription => choose(
+    'La fuente que ya usas en la app',
+    'The font already used by the app',
+  );
+  String get playerFontNunitoDescription =>
+      choose('Redondeada y cálida', 'Rounded and warm');
+  String get playerFontLoraDescription =>
+      choose('Elegante, con serifas', 'Elegant, with serifs');
+  String get playerFontSpaceMonoDescription =>
+      choose('Monoespaciada y retro', 'Monospaced and retro');
+  String get playerFontFredokaDescription =>
+      choose('Redondeada y alegre', 'Rounded and playful');
   String get playerStyle => choose('Estilo', 'Style');
+  String get playerStyles => choose('Estilos del reproductor', 'Player styles');
+  String get playerStylePreview => choose('Vista previa', 'Preview');
+  String get playerStyleGalleryHint => choose(
+    'Elige un diseño para usarlo al instante.',
+    'Choose a design to use it immediately.',
+  );
+  String get showAudioQuality =>
+      choose('Mostrar códec y calidad', 'Show codec and quality');
+  String get showAudioQualityDescription => choose(
+    'Muestra el códec, la frecuencia de muestreo, la tasa de bits y los canales cuando están disponibles.',
+    'Shows the codec, sample rate, bitrate and channels when available.',
+  );
+  String get audioQualityStereo => choose('Estéreo', 'Stereo');
+  String get audioQualityMono => 'Mono';
+  String audioQualityChannels(int channels) =>
+      choose('$channels canales', '$channels channels');
   String get playerStyleBStreamMusic => 'IVG Music';
   String get playerStyleAppleMusic => 'Apple Music Style';
+  String get playerStyleSpotifyMusic => 'Spotify Style';
   String get playerStyleClassicVinyl =>
       choose('Vinilo Clásico', 'Classic Vinyl');
   String get animatedArtwork =>
@@ -958,6 +1296,46 @@ class AppStrings {
     'Export or restore your library and settings.',
   );
   String get integrations => choose('Integraciones', 'Integrations');
+  String get audioSources => choose('Fuentes de audio', 'Audio sources');
+  String get audioSourcesSummary => choose(
+    'Elige los proveedores para reproducir y descargar.',
+    'Choose providers for playback and downloads.',
+  );
+  String get youtubeMusicSourceDescription => choose(
+    'Fuente principal, siempre activa.',
+    'Primary source, always enabled.',
+  );
+  String get jioSaavnSourceDescription => choose(
+    'Mejora el audio cuando hay una versión de mayor calidad.',
+    'Improve audio when a higher quality version is available.',
+  );
+  String get audioSourceAlwaysEnabled =>
+      choose('Siempre activada', 'Always enabled');
+  String get dataSaving => choose('Ahorro de datos', 'Data saving');
+  String get audioQuality => choose('Calidad de audio', 'Audio quality');
+  String get streamingAudio => choose('Audio en streaming', 'Streaming audio');
+  String get downloadAudioQuality =>
+      choose('Calidad de descarga', 'Download quality');
+  String get downloadHighQualitySource =>
+      choose('JioSaavn + fallback YTMusic', 'JioSaavn + YTMusic fallback');
+  String get dataSavingSummary => choose(
+    'Ajusta por separado la calidad de streaming y de descarga.',
+    'Set streaming and download quality separately.',
+  );
+  String get wifiNetwork => choose('Wi-Fi', 'Wi-Fi');
+  String get mobileNetwork => choose('Datos móviles', 'Mobile data');
+  String get highAudioQuality => choose('Alta calidad', 'High quality');
+  String get losslessAudioQuality =>
+      choose('Alta calidad - Lossless', 'High quality - Lossless');
+  String get hiResAudioQuality =>
+      choose('Alta calidad - Hi-Res', 'High quality - Hi-Res');
+  String audioQualityBits(int bits) =>
+      choose('{bits} bits', '{bits}-bit').replaceAll('{bits}', '$bits');
+  String get standardAudioQuality =>
+      choose('Calidad estándar', 'Standard quality');
+  String get lowAudioQuality => choose('Baja calidad', 'Low quality');
+  String get improvingAudioQuality =>
+      choose('Mejorando calidad…', 'Improving quality…');
   String get supportedLinks =>
       choose('Abrir enlaces compatibles', 'Open supported links');
   String get supportedLinksSummary => choose(
@@ -972,6 +1350,68 @@ class AppStrings {
       choose('Apagado automático', 'Automatic shutdown');
   String get sleepTimerOff => choose('Desactivado', 'Off');
   String get crossfade => 'Crossfade';
+  String get equalizer => choose('Ecualizador', 'Equalizer');
+  String get skipSilenceUnavailableForAudio =>
+      choose('No disponible para este audio.', 'Unavailable for this audio.');
+  String get equalizerCurve =>
+      choose('Curva de ecualización', 'Equalizer curve');
+  String get equalizerSummary => choose(
+    'Ajusta el sonido con presets o diez bandas.',
+    'Adjust the sound with presets or ten bands.',
+  );
+  String get equalizerEnabled =>
+      choose('Activar ecualizador', 'Enable equalizer');
+  String get equalizerActive => choose('Activado', 'Enabled');
+  String get equalizerInactive => choose('Desactivado', 'Disabled');
+  String get equalizerPresets => choose('Presets', 'Presets');
+  String get equalizerReset =>
+      choose('Restablecer ecualizador', 'Reset equalizer');
+  String get equalizerUnavailable => choose(
+    'El ecualizador no está disponible en este dispositivo.',
+    'The equalizer is unavailable on this device.',
+  );
+  String get equalizerCastUnavailable => choose(
+    'El ecualizador solo se aplica al audio de este dispositivo, no al transmitir.',
+    'The equalizer only affects audio on this device, not cast playback.',
+  );
+  String get equalizerError => choose(
+    'No se pudo aplicar el ecualizador. Prueba otro ajuste.',
+    'Could not apply the equalizer. Try another setting.',
+  );
+  String equalizerPresetName(EqualizerPreset preset) => switch (preset) {
+    EqualizerPreset.flat => choose('Plano', 'Flat'),
+    EqualizerPreset.acoustic => choose('Acústico', 'Acoustic'),
+    EqualizerPreset.bassBoost => choose('Refuerzo de graves', 'Bass boost'),
+    EqualizerPreset.bassCut => choose('Reducción de graves', 'Bass cut'),
+    EqualizerPreset.vocal => choose('Voz', 'Vocal'),
+    EqualizerPreset.trebleBoost => choose('Refuerzo de agudos', 'Treble boost'),
+    EqualizerPreset.trebleCut => choose('Reducción de agudos', 'Treble cut'),
+    EqualizerPreset.loudness => choose('Sonoridad', 'Loudness'),
+    EqualizerPreset.spokenWord => choose('Palabra hablada', 'Spoken word'),
+    EqualizerPreset.electronic => choose('Electrónica', 'Electronic'),
+    EqualizerPreset.rock => choose('Rock', 'Rock'),
+    EqualizerPreset.hipHop => choose('Hip-hop', 'Hip-hop'),
+    EqualizerPreset.jazz => choose('Jazz', 'Jazz'),
+    EqualizerPreset.classical => choose('Clásica', 'Classical'),
+    EqualizerPreset.smallSpeakers => choose(
+      'Altavoces pequeños',
+      'Small speakers',
+    ),
+    EqualizerPreset.lateNight => choose('Noche', 'Late night'),
+    EqualizerPreset.custom => choose('Personalizado', 'Custom'),
+  };
+  String equalizerBandName(int index) => const [
+    '31 Hz',
+    '62 Hz',
+    '125 Hz',
+    '250 Hz',
+    '500 Hz',
+    '1 kHz',
+    '2 kHz',
+    '4 kHz',
+    '8 kHz',
+    '16 kHz',
+  ][index];
   String get crossfadeSummary => choose(
     'Superpone suavemente el final de una canción con el inicio de la siguiente.',
     'Smoothly overlaps the end of one song with the start of the next.',
@@ -1030,16 +1470,36 @@ class AppStrings {
   String get connect => choose('Conectar', 'Connect');
   String get disconnect => choose('Desconectar', 'Disconnect');
   String get liveOverlay => choose('Overlay LIVE local', 'Local LIVE overlay');
+  String get liveWidget => choose('Widget Live', 'Live widget');
+  String get liveWidgetPreview => choose('Vista previa', 'Preview');
+  String get liveWidgetDescription => choose(
+    'Elige el diseño que aparece en tu transmisión. Usa el color de acento de la app.',
+    'Choose the design shown on your stream. It uses the app accent color.',
+  );
+  String liveWidgetStyleLabel(LiveWidgetStyle style) => switch (style) {
+    LiveWidgetStyle.classic => choose('Clásico', 'Classic'),
+    LiveWidgetStyle.wave => choose('Onda', 'Wave'),
+  };
+  String liveWidgetStyleDescription(LiveWidgetStyle style) => switch (style) {
+    LiveWidgetStyle.classic => choose(
+      'Tarjetas compactas con portada y progreso.',
+      'Compact cards with artwork and progress.',
+    ),
+    LiveWidgetStyle.wave => choose(
+      'Portada grande, onda animada y barra inferior.',
+      'Large artwork, animated wave, and a bottom progress bar.',
+    ),
+  };
   String get liveOverlayResolving => choose('BUSCANDO', 'SEARCHING');
   String get liveOverlayLoading => choose('CARGANDO', 'LOADING');
   String get liveOverlayConnectFirst => choose(
-    'Conecta un LIVE para comenzar a mostrar la cola.',
-    'Connect a LIVE to start showing the queue.',
+    'Activa la fuente web local cuando quieras; no necesitas conectar un LIVE.',
+    'Enable the local browser source whenever you want; no LIVE connection is required.',
   );
   String get liveOverlayInactive => choose(
-    'Activa una fuente web transparente con la canción actual y 4 más. '
+    'Activa una fuente web transparente con la cola activa. No necesitas estar conectado a un LIVE. '
         'La primera vez Windows pedirá permiso para configurar su dominio local.',
-    'Enable a transparent browser source with the current song and 4 more. '
+    'Enable a transparent browser source with the active queue. No LIVE connection is required. '
         'The first time, Windows will request permission to configure its local domain.',
   );
   String liveOverlayActive(String url) => choose(
@@ -1152,6 +1612,21 @@ class AppStrings {
     PlayerStyle.bstreamMusic => playerStyleBStreamMusic,
     PlayerStyle.appleMusic => playerStyleAppleMusic,
     PlayerStyle.classicVinyl => playerStyleClassicVinyl,
+    PlayerStyle.spotifyMusic => playerStyleSpotifyMusic,
+  };
+  String playerFontLabel(PlayerFont font) => switch (font) {
+    PlayerFont.current => playerFontCurrent,
+    PlayerFont.nunito => 'Nunito',
+    PlayerFont.lora => 'Lora',
+    PlayerFont.spaceMono => 'Space Mono',
+    PlayerFont.fredoka => 'Fredoka',
+  };
+  String playerFontDescription(PlayerFont font) => switch (font) {
+    PlayerFont.current => playerFontCurrentDescription,
+    PlayerFont.nunito => playerFontNunitoDescription,
+    PlayerFont.lora => playerFontLoraDescription,
+    PlayerFont.spaceMono => playerFontSpaceMonoDescription,
+    PlayerFont.fredoka => playerFontFredokaDescription,
   };
   String playerArtworkStyleLabel(PlayerArtworkStyle style) => switch (style) {
     PlayerArtworkStyle.classic => playerArtworkStyleClassic,
@@ -1210,14 +1685,66 @@ class AppStrings {
     'Version, support, and repository',
   );
   String get versionLabel => choose('Versión', 'Version');
+  String whatsNewTitle(String version) =>
+      choose('Novedades de $version', 'What’s new in $version');
+  String get whatsNewSummary => choose(
+    'Estilos del reproductor, filtros de música local, letras y ajustes',
+    'Player styles, local music filters, lyrics, and settings',
+  );
+  List<String> get whatsNewHighlights => [
+    choose(
+      'Ahora está disponible un ecualizador de 10 bandas.',
+      'A 10-band equalizer is now available.',
+    ),
+    choose(
+      'Compatibilidad con audio de mayor calidad, siempre que esté disponible.',
+      'Support for higher quality audio whenever available.',
+    ),
+    choose(
+      'Se mejoraron y optimizaron los diseños de los estilos del reproductor.',
+      'Improved and optimized player style layouts.',
+    ),
+    choose(
+      'Se añadió el nuevo reproductor Spotify Style.',
+      'Added the new Spotify Style player.',
+    ),
+    choose(
+      'Se añadieron opciones de filtrado en la pestaña de música local.',
+      'Added filtering options to the Local music tab.',
+    ),
+    choose(
+      'Se añadió compatibilidad con letras sincronizadas palabra por palabra cuando están disponibles los tiempos de sincronización.',
+      'Added word-by-word synchronized lyrics when timing is available.',
+    ),
+    choose(
+      'Se mejoró el diseño de la pestaña de ajustes.',
+      'Improved the Settings tab layout.',
+    ),
+    choose(
+      'Personaliza la portada de tus playlists con una imagen de tu galería.',
+      'Customize playlist artwork with an image from your gallery.',
+    ),
+  ];
   String get updateAvailableTitle =>
       choose('Nueva versión disponible', 'New version available');
   String updateAvailableMessage({
     required String latestVersion,
     required String currentVersion,
   }) => choose(
-    'La versión $latestVersion de IVG Music está disponible. Actualmente tienes la versión $currentVersion.',
-    'IVG Music version $latestVersion is available. You currently have version $currentVersion.',
+    'IVG Music $latestVersion está disponible. Versión actual: $currentVersion.',
+    'IVG Music $latestVersion is available. Current version: $currentVersion.',
+  );
+  String updateReleaseNotesTitle(String version) =>
+      choose('Novedades $version', 'What’s new in $version');
+  String get updateReleaseNotesLoading =>
+      choose('Traduciendo novedades…', 'Translating release notes…');
+  String get updateReleaseNotesEmpty => choose(
+    'Este release no incluye novedades.',
+    'This release does not include release notes.',
+  );
+  String get updateReleaseNotesTranslationFailed => choose(
+    'No se pudo traducir. Se muestran las novedades originales.',
+    'Translation unavailable. Showing the original release notes.',
   );
   String get appIsUpToDate => choose(
     'Ya tienes la versión más reciente.',
@@ -1252,6 +1779,10 @@ class AppStrings {
   );
 
   String songCount(int count) {
+    if (appLanguage != AppLanguage.spanish && !isEnglish) {
+      final english = count == 1 ? '$count song' : '$count songs';
+      return translateAppString(english, appLanguage.code) ?? english;
+    }
     if (isEnglish) {
       return '$count ${count == 1 ? 'song' : 'songs'}';
     }
@@ -1267,6 +1798,11 @@ class AppStrings {
   }
 
   String playbackQueueSummary(int count) {
+    if (appLanguage != AppLanguage.spanish && !isEnglish) {
+      final english =
+          'Playback Queue - $count ${count == 1 ? 'Song' : 'Songs'}';
+      return translateAppString(english, appLanguage.code) ?? english;
+    }
     if (isEnglish) {
       return 'Playback Queue - $count ${count == 1 ? 'Song' : 'Songs'}';
     }
@@ -1275,6 +1811,10 @@ class AppStrings {
   }
 
   String liveQueueSummary(int total, int ready, int pending) {
+    if (appLanguage != AppLanguage.spanish && !isEnglish) {
+      final english = '$total requests - $ready ready - $pending pending';
+      return translateAppString(english, appLanguage.code) ?? english;
+    }
     if (isEnglish) {
       return '$total requests - $ready ready - $pending pending';
     }
@@ -1282,6 +1822,12 @@ class AppStrings {
   }
 
   String exitPressesRemaining(int remaining) {
+    if (appLanguage != AppLanguage.spanish && !isEnglish) {
+      final english = remaining == 1
+          ? 'Press once to exit.'
+          : 'Press $remaining more times to exit.';
+      return translateAppString(english, appLanguage.code) ?? english;
+    }
     if (isEnglish) {
       return 'Press ${remaining == 1 ? 'once' : '$remaining more times'} to exit.';
     }
@@ -1289,6 +1835,12 @@ class AppStrings {
   }
 
   String downloadLabel(String label, String title, int queuedCount) {
+    if (appLanguage != AppLanguage.spanish && !isEnglish) {
+      final english = queuedCount <= 0
+          ? '$label: $title'
+          : '$label: $title - $queuedCount queued';
+      return translateAppString(english, appLanguage.code) ?? english;
+    }
     if (queuedCount <= 0) {
       return '$label: $title';
     }

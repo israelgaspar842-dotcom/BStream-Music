@@ -7,6 +7,10 @@ final localTrackDownloadHelperProvider = Provider<LocalTrackDownloadHelper>((
 });
 
 typedef ArtworkCacheFileLookup = Future<File?> Function(String source);
+typedef LocalTrackThumbnailValidator =
+    Future<String?> Function(Uint8List bytes);
+typedef LocalTrackLegacyArtworkCleanup =
+    Future<bool> Function(String directory);
 
 final artworkCacheFileLookupProvider = Provider<ArtworkCacheFileLookup>((ref) {
   final cache = BStreamArtworkCacheManager();
@@ -28,7 +32,29 @@ class LocalTrackDownloadResult {
 }
 
 class LocalTrackDownloadHelper {
-  LocalTrackDownloadHelper(Ref ref) : _ref = ref;
+  LocalTrackDownloadHelper(
+    Ref ref, {
+    @visibleForTesting LocalTrackThumbnailValidator? thumbnailValidator,
+    @visibleForTesting LocalTrackLegacyArtworkCleanup? legacyArtworkCleanup,
+  }) : _ref = ref,
+       // Keep the test injection named without exposing the stored callback.
+       // ignore: prefer_initializing_formals
+       _thumbnailValidator = thumbnailValidator,
+       // ignore: prefer_initializing_formals
+       _legacyArtworkCleanup = legacyArtworkCleanup {
+    final maintenance = ref
+        .read(libraryOperationCoordinatorProvider)
+        .phaseStream
+        .listen((phase) {
+          if (phase == LibraryMaintenancePhase.committingRestore ||
+              phase == LibraryMaintenancePhase.migratingDirectory) {
+            _legacyThumbnailCleanupGeneration++;
+            _cleanedLegacyThumbnailDirectories.clear();
+            _legacyThumbnailCleanups.clear();
+          }
+        });
+    ref.onDispose(() => unawaited(maintenance.cancel()));
+  }
 
   static const _maxThumbnailBytes = 10 * 1024 * 1024;
   static const _thumbnailIdleTimeout = Duration(seconds: 10);
@@ -36,8 +62,15 @@ class LocalTrackDownloadHelper {
   static const _thumbnailCandidateTimeout = Duration(seconds: 20);
   static const _thumbnailSaveBudget = Duration(seconds: 45);
   static const _maximumParallelDownloads = 3;
+  static const _maximumValidatedThumbnailFiles = 4096;
 
   final Ref _ref;
+  final LocalTrackThumbnailValidator? _thumbnailValidator;
+  final LocalTrackLegacyArtworkCleanup? _legacyArtworkCleanup;
+  final Set<String> _cleanedLegacyThumbnailDirectories = {};
+  final Map<String, Future<void>> _legacyThumbnailCleanups = {};
+  int _legacyThumbnailCleanupGeneration = 0;
+  final Map<String, (int, DateTime, DateTime)> _validatedThumbnailFiles = {};
   final Map<String, Future<LocalTrackDownloadResult>> _inFlight = {};
   final Map<String, Future<LocalTrackDownloadResult>> _resolvedInFlight = {};
   final Map<String, bool Function()> _cancellationProbes = {};
@@ -72,6 +105,14 @@ class LocalTrackDownloadHelper {
   }
 
   Future<int> _repairStoredArtwork(List<LocalTrack> tracks) async {
+    final retainedPaths = <String>{
+      for (final track in tracks)
+        if (track.thumbnailPath?.trim() case final path? when path.isNotEmpty)
+          p.normalize(p.absolute(path)),
+    };
+    _validatedThumbnailFiles.removeWhere(
+      (path, _) => !retainedPaths.contains(path),
+    );
     if (tracks.isEmpty) {
       return 0;
     }
@@ -86,7 +127,8 @@ class LocalTrackDownloadHelper {
       }
 
       final track = _trackInfoFromLocalTrack(localTrack);
-      final candidates = _thumbnailCandidates(track).toList(growable: false);
+      final sources = _acceptedThumbnailSources(track);
+      final candidates = _thumbnailCandidates(sources).toList(growable: false);
       if (candidates.isEmpty) {
         continue;
       }
@@ -100,7 +142,7 @@ class LocalTrackDownloadHelper {
       final storedSourceIsCurrent =
           storedSource != null &&
           storedSource.isNotEmpty &&
-          _acceptedThumbnailSources(track).contains(storedSource);
+          sources.contains(storedSource);
       if (hasStoredArtwork && storedSourceIsCurrent) {
         consecutiveFailures = 0;
         continue;
@@ -113,6 +155,7 @@ class LocalTrackDownloadHelper {
         track,
         thumbnailsDirectory,
         identityDigest,
+        artworkCandidates: candidates,
       );
       if (savedThumbnail == null) {
         consecutiveFailures++;
@@ -384,6 +427,7 @@ class LocalTrackDownloadHelper {
     final options = DownloadOptions(
       outputDirectory: audioDirectory,
       fileName: _identityFileName(metadataTrack, identityDigest),
+      track: metadataTrack,
       taskId: taskId,
     );
 
@@ -406,6 +450,7 @@ class LocalTrackDownloadHelper {
     }
     _SavedThumbnail? savedThumbnail;
     LocalTrack? persistedTrack;
+    var completedResult = result;
     try {
       savedThumbnail = await _saveThumbnail(
         metadataTrack,
@@ -413,6 +458,40 @@ class LocalTrackDownloadHelper {
         identityDigest,
         isCancelled: isCancelled,
       );
+      _throwIfDownloadCancelled(isCancelled);
+
+      // Embed only after the artwork has been saved and before publishing the
+      // library row. Playback must not open a file while tags are being written.
+      try {
+        final metadataResult = await _ref
+            .read(downloadAudioMetadataServiceProvider)
+            .embed(
+              filePath: result.filePath,
+              title: metadataTrack.title,
+              artist: metadataTrack.artist,
+              album: metadataTrack.album,
+              artworkPath: savedThumbnail?.path ?? staleMatch?.thumbnailPath,
+            );
+        if (metadataResult == AudioMetadataWriteResult.written) {
+          completedResult = DownloadResult(
+            id: result.id,
+            sourceUrl: result.sourceUrl,
+            filePath: result.filePath,
+            fileName: result.fileName,
+            mediaType: result.mediaType,
+            completedAt: result.completedAt,
+            bytes: await File(result.filePath).length(),
+            audioFormat: result.audioFormat,
+          );
+        }
+      } catch (error, stackTrace) {
+        // Tagging is optional. Its service preserves the original audio when
+        // unsupported or unsuccessful, so the usable download can still finish.
+        debugPrint(
+          'Downloaded audio metadata could not be embedded: '
+          '$error\n$stackTrace',
+        );
+      }
       _throwIfDownloadCancelled(isCancelled);
 
       final localTrack = LocalTrack(
@@ -433,6 +512,7 @@ class LocalTrackDownloadHelper {
         sourceId: metadataTrack.id.trim().isEmpty ? null : metadataTrack.id,
         lastPlayedAt: staleMatch?.lastPlayedAt,
         lastPlayedPlaylistId: staleMatch?.lastPlayedPlaylistId,
+        audioFormat: result.audioFormat,
       );
 
       await _ref.read(libraryRepositoryProvider).saveLocalTrack(localTrack);
@@ -447,7 +527,7 @@ class LocalTrackDownloadHelper {
         track: localTrack,
         remoteTrack: metadataTrack,
         reusedExisting: false,
-        downloadResult: result,
+        downloadResult: completedResult,
       );
     } catch (_) {
       // The media file is not useful unless its library row was persisted.
@@ -702,6 +782,7 @@ class LocalTrackDownloadHelper {
       lastPlayedAt: existing.lastPlayedAt,
       lastPlayedPlaylistId: existing.lastPlayedPlaylistId,
       isExternal: existing.isExternal,
+      audioFormat: existing.audioFormat,
     );
     if (_hasSameStoredMetadata(existing, next)) {
       await _commitSavedThumbnail(savedThumbnail);
@@ -814,17 +895,39 @@ class LocalTrackDownloadHelper {
   }
 
   Future<bool> _isUsableThumbnailFile(String path) async {
+    final key = p.normalize(p.absolute(path));
     try {
       final file = File(path);
-      if (!await file.exists()) {
+      final before = await file.stat();
+      if (before.type != FileSystemEntityType.file ||
+          before.size <= 0 ||
+          before.size > _maxThumbnailBytes) {
+        _validatedThumbnailFiles.remove(key);
         return false;
       }
-      final length = await file.length();
-      if (length <= 0 || length > _maxThumbnailBytes) {
+      final fingerprint = (before.size, before.modified, before.changed);
+      if (_validatedThumbnailFiles.remove(key) == fingerprint) {
+        _validatedThumbnailFiles[key] = fingerprint;
+        return true;
+      }
+      if (await _thumbnailExtension(await file.readAsBytes()) == null) {
         return false;
       }
-      return await _thumbnailExtension(await file.readAsBytes()) != null;
+      // A file can be replaced during an asynchronous decode. Only remember
+      // validation when it still describes the same complete source bytes.
+      final after = await file.stat();
+      if (after.type != FileSystemEntityType.file ||
+          (after.size, after.modified, after.changed) != fingerprint) {
+        return false;
+      }
+      _validatedThumbnailFiles[key] = fingerprint;
+      while (_validatedThumbnailFiles.length >
+          _maximumValidatedThumbnailFiles) {
+        _validatedThumbnailFiles.remove(_validatedThumbnailFiles.keys.first);
+      }
+      return true;
     } catch (_) {
+      _validatedThumbnailFiles.remove(key);
       return false;
     }
   }
@@ -1000,10 +1103,41 @@ class LocalTrackDownloadHelper {
         .trim();
   }
 
-  Future<void> _removeMisplacedThumbnailFiles(String audioDirectory) async {
+  Future<void> _removeMisplacedThumbnailFiles(String audioDirectory) {
+    final absolutePath = p.normalize(p.absolute(audioDirectory));
+    final key = AppPlatform.isWindows
+        ? absolutePath.toLowerCase()
+        : absolutePath;
+    if (_cleanedLegacyThumbnailDirectories.contains(key)) {
+      return Future.value();
+    }
+    final active = _legacyThumbnailCleanups[key];
+    if (active != null) return active;
+
+    final generation = _legacyThumbnailCleanupGeneration;
+    late final Future<void> cleanup;
+    cleanup =
+        (_legacyArtworkCleanup ?? _cleanMisplacedThumbnailFiles)(audioDirectory)
+            .then((complete) {
+              if (complete && generation == _legacyThumbnailCleanupGeneration) {
+                _cleanedLegacyThumbnailDirectories.add(key);
+              }
+            })
+            .whenComplete(() {
+              if (identical(_legacyThumbnailCleanups[key], cleanup)) {
+                _legacyThumbnailCleanups.remove(key);
+              }
+            });
+    _legacyThumbnailCleanups[key] = cleanup;
+    return cleanup;
+  }
+
+  Future<bool> _cleanMisplacedThumbnailFiles(String audioDirectory) async {
     final directory = Directory(audioDirectory);
     if (!await directory.exists()) {
-      return;
+      // The downloader creates this directory later. Inspect it on the next
+      // request instead of remembering a cleanup that never ran.
+      return false;
     }
 
     final files = await directory
@@ -1011,6 +1145,7 @@ class LocalTrackDownloadHelper {
         .where((entity) => entity is File)
         .cast<File>()
         .toList();
+    var complete = true;
     for (final file in files) {
       final extension = p.extension(file.path).toLowerCase();
       if (const {'.jpg', '.jpeg', '.png', '.webp'}.contains(extension)) {
@@ -1018,9 +1153,11 @@ class LocalTrackDownloadHelper {
           await file.delete();
         } catch (_) {
           // Best effort cleanup for files left by older Android commands.
+          complete = false;
         }
       }
     }
+    return complete;
   }
 
   Future<_SavedThumbnail?> _saveThumbnail(
@@ -1028,9 +1165,14 @@ class LocalTrackDownloadHelper {
     String directoryPath,
     String identityDigest, {
     bool Function()? isCancelled,
+    List<Uri>? artworkCandidates,
   }) async {
     _throwIfDownloadCancelled(isCancelled);
-    final candidates = _thumbnailCandidates(track).toList(growable: false);
+    final candidates =
+        artworkCandidates ??
+        _thumbnailCandidates(
+          _acceptedThumbnailSources(track),
+        ).toList(growable: false);
     if (candidates.isEmpty) {
       return null;
     }
@@ -1212,6 +1354,7 @@ class LocalTrackDownloadHelper {
   ) async {
     final baseName = _identityFileName(track, identityDigest, digestLength: 16);
     final file = File(p.join(directory.path, '$baseName$extension'));
+    _validatedThumbnailFiles.remove(p.normalize(p.absolute(file.path)));
     final createdNewFile = !await file.exists();
     final replacedBytes = createdNewFile ? null : await file.readAsBytes();
     final partial = File(_thumbnailPartialPath(file.path, 'write'));
@@ -1342,22 +1485,9 @@ class LocalTrackDownloadHelper {
     return '$destination.$operation-$sequence.part';
   }
 
-  Iterable<Uri> _thumbnailCandidates(TrackInfo track) sync* {
+  Iterable<Uri> _thumbnailCandidates(Iterable<String> sources) sync* {
     final seen = <String>{};
-    final direct = track.thumbnailUrl?.trim();
-    final catalog = track.catalogThumbnailUrl?.trim();
-    final videoArtwork = youtubeThumbnailSourceForVideoId(
-      _youtubeVideoId(track),
-    );
-    // catalogThumbnailUrl is explicitly the square music-catalog cover. Some
-    // legacy rows predate metadataSource persistence, so its presence is more
-    // authoritative than the enum when choosing artwork.
-    final candidates = <String>[
-      ...artworkDownloadSourceCandidates(catalog),
-      ...artworkDownloadSourceCandidates(direct),
-      ...artworkDownloadSourceCandidates(videoArtwork),
-    ];
-    for (final source in candidates) {
+    for (final source in sources) {
       final uri = Uri.tryParse(source);
       if (uri != null && uri.hasScheme && seen.add(uri.toString())) {
         yield uri;
@@ -1371,6 +1501,8 @@ class LocalTrackDownloadHelper {
     final videoArtwork = youtubeThumbnailSourceForVideoId(
       _youtubeVideoId(track),
     );
+    // The square catalog cover takes precedence, including on legacy rows
+    // created before metadataSource was persisted.
     return <String>{
       ...artworkDownloadSourceCandidates(catalog),
       ...artworkDownloadSourceCandidates(direct),
@@ -1420,7 +1552,12 @@ class LocalTrackDownloadHelper {
       // Decode away from the UI/raster threads. Invoking a Flutter GPU codec
       // from post-frame library maintenance can race Android surface startup,
       // while the CPU decoder verifies the complete frame safely.
-      return await compute(_validatedThumbnailExtension, data);
+      return await (_thumbnailValidator?.call(data) ??
+          runBackgroundTransform(
+            data,
+            _validatedThumbnailExtension,
+            debugName: 'BStream download cover validation',
+          ));
     } catch (_) {
       // A matching filename or magic prefix is insufficient: truncated image
       // data would otherwise become the permanent local-first cover.

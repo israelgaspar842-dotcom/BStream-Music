@@ -44,11 +44,16 @@ class ArtworkProgressColorService {
     this.maximumCacheEntries = 32,
     this.imageLoadTimeout = const Duration(seconds: 20),
     this.imageProviderForSource,
+    this.preserveSourceSaturation = false,
   }) : assert(maximumCacheEntries > 0),
        assert(imageLoadTimeout > Duration.zero);
 
   final int maximumCacheEntries;
   final Duration imageLoadTimeout;
+
+  /// Menus retain grayscale covers and their actual saturation instead of the
+  /// minimum colorfulness used by a playback progress indicator.
+  final bool preserveSourceSaturation;
   @visibleForTesting
   final ImageProvider<Object>? Function(String source)? imageProviderForSource;
   final LinkedHashMap<String, Color> _cache = LinkedHashMap<String, Color>();
@@ -320,7 +325,10 @@ class ArtworkProgressColorService {
       }
 
       final hue = (math.atan2(hueY, hueX) * 180 / math.pi + 360) % 360;
-      final saturation = (saturationSum / totalWeight).clamp(0.28, 0.62);
+      final saturation = (saturationSum / totalWeight).clamp(
+        preserveSourceSaturation ? 0.0 : 0.28,
+        preserveSourceSaturation ? 1.0 : 0.62,
+      );
       return HSLColor.fromAHSL(1, hue, saturation, 0.73).toColor();
     } finally {
       sampledImage?.dispose();
@@ -340,6 +348,26 @@ final artworkProgressColorProvider = FutureProvider.autoDispose
     .family<Color, String?>((ref, source) {
       final service = ref.watch(artworkProgressColorServiceProvider);
       final lease = service.acquire(source);
+      ref.onDispose(lease.release);
+      return lease.future;
+    });
+
+/// Detail pages and playback menus keep the actual saturation of neutral covers.
+/// Their small color samples share pending requests and the cache across visits.
+final artworkSurfaceColorServiceProvider =
+    Provider<ArtworkProgressColorService>((ref) {
+      final service = ArtworkProgressColorService(
+        preserveSourceSaturation: true,
+      );
+      ref.onDispose(service.dispose);
+      return service;
+    });
+
+final artworkSurfaceColorProvider = FutureProvider.autoDispose
+    .family<Color, String>((ref, source) {
+      final lease = ref
+          .watch(artworkSurfaceColorServiceProvider)
+          .acquire(source);
       ref.onDispose(lease.release);
       return lease.future;
     });

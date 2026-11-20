@@ -31,6 +31,21 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>CSV playlist</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array><string>public.comma-separated-values-text</string></array>
+		</dict>
+	</array>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>CFBundleShortVersionString</key>
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>
@@ -41,6 +56,15 @@
 	<true/>
 	<key>NSAppleMusicUsageDescription</key>
 	<string>BStream Music necesita acceso para mostrar y reproducir la música guardada en tu dispositivo.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>BStream Music necesita acceso a tus fotos para elegir un fondo personalizado.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>BStream Music usa tu red local para encontrar dispositivos compatibles y transmitir tu música cuando eliges Transmitir a.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_googlecast._tcp</string>
+		<string>_CC1AD845._googlecast._tcp</string>
+	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

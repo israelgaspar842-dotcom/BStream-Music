@@ -10,6 +10,7 @@ const _unsetPlayerSnapshotValue = Object();
 class PlayerSnapshot {
   const PlayerSnapshot({
     required this.status,
+    this.playWhenReady,
     this.title,
     this.artist,
     this.album,
@@ -28,6 +29,13 @@ class PlayerSnapshot {
   });
 
   final PlayerStatus status;
+
+  /// Playback intent is independent of whether a source is currently audible.
+  /// A bounded automatic load/recovery can still be playing from the system
+  /// media session's perspective. Null keeps legacy backends compatible.
+  final bool? playWhenReady;
+
+  bool get wantsToPlay => playWhenReady ?? status == PlayerStatus.playing;
   final String? title;
   final String? artist;
   final String? album;
@@ -46,6 +54,7 @@ class PlayerSnapshot {
 
   PlayerSnapshot copyWith({
     PlayerStatus? status,
+    Object? playWhenReady = _unsetPlayerSnapshotValue,
     Object? title = _unsetPlayerSnapshotValue,
     Object? artist = _unsetPlayerSnapshotValue,
     Object? album = _unsetPlayerSnapshotValue,
@@ -64,6 +73,9 @@ class PlayerSnapshot {
   }) {
     return PlayerSnapshot(
       status: status ?? this.status,
+      playWhenReady: identical(playWhenReady, _unsetPlayerSnapshotValue)
+          ? this.playWhenReady
+          : playWhenReady as bool?,
       title: identical(title, _unsetPlayerSnapshotValue)
           ? this.title
           : title as String?,
@@ -174,13 +186,26 @@ abstract interface class SkipSilenceCapablePlayer {
 /// prepared remote sources inside ExoPlayer so track boundaries do not depend
 /// on a Dart completion callback.
 abstract interface class NativeRemoteQueuePlayer {
-  Future<void> playRemoteSource(RemotePlaybackSource source);
+  Future<void> playRemoteSource(
+    RemotePlaybackSource source, {
+    Duration initialPosition = Duration.zero,
+  });
 
   /// Reconciles only the sources after the currently playing remote item.
   /// Previously played sources remain available for native Previous controls.
   Future<void> updateRemoteQueue(
     List<RemotePlaybackSource> upcoming, {
     bool finalize = true,
+  });
+}
+
+/// Optional same-recording upgrade. Preparation happens on a muted second
+/// deck while the current source remains audible. A failed or stale upgrade
+/// leaves that source and its logical queue item untouched.
+abstract interface class AudioSourceUpgradePlayer {
+  Future<bool> upgradeRemoteSource(
+    RemotePlaybackSource source, {
+    bool Function()? shouldContinue,
   });
 }
 
@@ -192,9 +217,21 @@ abstract class PlayerService {
   /// reopening the current track.
   bool get supportsLocalQueueReplacement;
 
-  Future<void> playRemote(TrackInfo track);
-  Future<void> playLocal(LocalTrack track);
-  Future<void> playLocalQueue(List<LocalTrack> tracks, int initialIndex);
+  /// Opens the selected recording at [initialPosition] before it becomes
+  /// audible. This is a one-time starting position, not a persistent clip.
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  });
+  Future<void> playLocal(
+    LocalTrack track, {
+    Duration initialPosition = Duration.zero,
+  });
+  Future<void> playLocalQueue(
+    List<LocalTrack> tracks,
+    int initialIndex, {
+    Duration initialPosition = Duration.zero,
+  });
 
   /// Replaces the loaded local queue while retaining the current item when it
   /// is still present. [preferredIndex] is used if that item was removed.

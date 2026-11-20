@@ -13,8 +13,10 @@ import '../../../../services/local_media/local_media_providers.dart';
 import '../../../../services/player/player_service.dart';
 import '../../domain/entities/device_audio_track.dart';
 import '../providers/music_providers.dart';
+import 'glass_popup_menu_button.dart';
 import 'scrolled_under_tab_frame.dart';
 import 'source_image.dart';
+import 'track_play_button.dart';
 
 enum _LocalMusicRouteType { root, allSongs, folder }
 
@@ -85,12 +87,16 @@ class _LocalMusicPanelState extends ConsumerState<LocalMusicPanel>
     with WidgetsBindingObserver {
   late _LocalMusicRoute _route;
   bool _catalogActionBusy = false;
+  final _filterController = TextEditingController();
+  final _filterFocus = FocusNode();
+  bool _filterVisible = false;
 
   bool get _canPop => _route.type != _LocalMusicRouteType.root;
 
   @override
   void initState() {
     super.initState();
+    _filterController.addListener(_onFilterChanged);
     _route =
         widget.navigationController?._route ?? const _LocalMusicRoute.root();
     widget.navigationController?._attach(this);
@@ -114,6 +120,9 @@ class _LocalMusicPanelState extends ConsumerState<LocalMusicPanel>
 
   @override
   void dispose() {
+    _filterController.removeListener(_onFilterChanged);
+    _filterController.dispose();
+    _filterFocus.dispose();
     if (AppPlatform.isIOS) {
       WidgetsBinding.instance.removeObserver(this);
     }
@@ -129,14 +138,45 @@ class _LocalMusicPanelState extends ConsumerState<LocalMusicPanel>
   }
 
   void _openRoute(_LocalMusicRoute route) {
+    _filterFocus.unfocus();
+    _filterController.clear();
+    _filterVisible = false;
     widget.navigationController?._route = route;
     setState(() => _route = route);
   }
 
   bool _popRoute() {
+    if (_filterVisible) {
+      _closeFilter();
+      return true;
+    }
     if (!_canPop) return false;
     _openRoute(const _LocalMusicRoute.root());
     return true;
+  }
+
+  void _onFilterChanged() => setState(() {});
+
+  void _showFilter() {
+    setState(() => _filterVisible = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _filterVisible) _filterFocus.requestFocus();
+    });
+  }
+
+  void _closeFilter() {
+    _filterFocus.unfocus();
+    _filterController.clear();
+    setState(() => _filterVisible = false);
+  }
+
+  void _clearOrCloseFilter() {
+    if (_filterController.text.isNotEmpty) {
+      _filterController.clear();
+      _filterFocus.requestFocus();
+    } else {
+      _closeFilter();
+    }
   }
 
   @override
@@ -209,12 +249,12 @@ class _LocalMusicPanelState extends ConsumerState<LocalMusicPanel>
         }
 
         final tracks = result.tracks;
-        final folders = result.folders;
         return switch (_route.type) {
           _LocalMusicRouteType.root => _LocalMusicRootView(
             bottomContentPadding: widget.bottomContentPadding,
             tracks: tracks,
-            folders: folders,
+            folders: result.folders,
+            totalDuration: result.totalDuration,
             refreshBusy: _catalogActionBusy,
             onRefresh: () => _refresh(query),
             onOpenAll: tracks.isEmpty
@@ -222,17 +262,24 @@ class _LocalMusicPanelState extends ConsumerState<LocalMusicPanel>
                 : () => _openRoute(const _LocalMusicRoute.allSongs()),
             onOpenFolder: (folderId) =>
                 _openRoute(_LocalMusicRoute.folder(folderId)),
+            onOpenPlayer: widget.onOpenPlayer,
           ),
           _LocalMusicRouteType.allSongs => _LocalTrackDetailView(
             bottomContentPadding: widget.bottomContentPadding,
             title: strings.allLocalSongs,
             tracks: tracks,
+            totalDuration: result.totalDuration,
+            filterController: _filterController,
+            filterFocus: _filterFocus,
+            filterVisible: _filterVisible,
+            onShowFilter: _showFilter,
+            onClearOrCloseFilter: _clearOrCloseFilter,
             queueSourceId: 'device-local:all',
             onBack: _popRoute,
             onOpenPlayer: widget.onOpenPlayer,
           ),
           _LocalMusicRouteType.folder => _buildFolderDetail(
-            folders,
+            result.folders,
             widget.bottomContentPadding,
           ),
         };
@@ -257,6 +304,12 @@ class _LocalMusicPanelState extends ConsumerState<LocalMusicPanel>
       bottomContentPadding: bottomContentPadding,
       title: folder?.name ?? strings.localMusicFolders,
       tracks: folder?.tracks ?? const <DeviceAudioTrack>[],
+      totalDuration: folder?.totalDuration,
+      filterController: _filterController,
+      filterFocus: _filterFocus,
+      filterVisible: _filterVisible,
+      onShowFilter: _showFilter,
+      onClearOrCloseFilter: _clearOrCloseFilter,
       queueSourceId: 'device-local:folder:${folderId ?? 'unknown'}',
       onBack: _popRoute,
       onOpenPlayer: widget.onOpenPlayer,
@@ -312,19 +365,23 @@ class _LocalMusicRootView extends ConsumerWidget {
     required this.bottomContentPadding,
     required this.tracks,
     required this.folders,
+    required this.totalDuration,
     required this.refreshBusy,
     required this.onRefresh,
     required this.onOpenAll,
     required this.onOpenFolder,
+    required this.onOpenPlayer,
   });
 
   final double bottomContentPadding;
   final List<DeviceAudioTrack> tracks;
   final List<DeviceAudioFolder> folders;
+  final Duration? totalDuration;
   final bool refreshBusy;
   final VoidCallback onRefresh;
   final VoidCallback? onOpenAll;
   final ValueChanged<String> onOpenFolder;
+  final VoidCallback onOpenPlayer;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -371,9 +428,22 @@ class _LocalMusicRootView extends ConsumerWidget {
               title: strings.allLocalSongs,
               subtitle: strings.songCountWithDuration(
                 tracks.length,
-                sumKnownDurations(tracks.map((track) => track.duration)),
+                totalDuration,
               ),
               onTap: onOpenAll,
+              trailing: TrackPlayButton(
+                key: const ValueKey('local-all-songs-play'),
+                tooltip: strings.playAll,
+                isPlaying: false,
+                onPressed: tracks.isEmpty
+                    ? null
+                    : () => _playCollection(
+                        context,
+                        ref,
+                        tracks,
+                        'device-local:all',
+                      ),
+              ),
             ),
           ),
         ),
@@ -408,11 +478,22 @@ class _LocalMusicRootView extends ConsumerWidget {
                   title: folder.name,
                   subtitle: strings.songCountWithDuration(
                     folder.tracks.length,
-                    sumKnownDurations(
-                      folder.tracks.map((track) => track.duration),
-                    ),
+                    folder.totalDuration,
                   ),
                   onTap: () => onOpenFolder(folder.id),
+                  trailing: TrackPlayButton(
+                    key: ValueKey('local-folder-play-${folder.id}'),
+                    tooltip: strings.playAll,
+                    isPlaying: false,
+                    onPressed: folder.tracks.isEmpty
+                        ? null
+                        : () => _playCollection(
+                            context,
+                            ref,
+                            folder.tracks,
+                            'device-local:folder:${folder.id}',
+                          ),
+                  ),
                 ),
               );
             },
@@ -421,6 +502,42 @@ class _LocalMusicRootView extends ConsumerWidget {
       ],
     );
   }
+
+  Future<void> _playCollection(
+    BuildContext context,
+    WidgetRef ref,
+    List<DeviceAudioTrack> tracks,
+    String sourceId,
+  ) async {
+    final strings = ref.read(appStringsProvider);
+    final addedAt = DateTime.now();
+    final queue = tracks
+        .map(
+          (track) => track.toTransientLocalTrack(
+            unknownArtist: strings.unknownArtist,
+            addedAt: addedAt,
+          ),
+        )
+        .toList(growable: false);
+    final playback = ref
+        .read(playerControllerProvider.notifier)
+        .playLocal(
+          queue.first,
+          queue: queue,
+          useNativeQueue: false,
+          queueSourceId: sourceId,
+        );
+    onOpenPlayer();
+    try {
+      await playback;
+    } catch (_) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(strings.error)));
+      }
+    }
+  }
 }
 
 class _LocalTrackDetailView extends ConsumerWidget {
@@ -428,6 +545,12 @@ class _LocalTrackDetailView extends ConsumerWidget {
     required this.bottomContentPadding,
     required this.title,
     required this.tracks,
+    required this.totalDuration,
+    required this.filterController,
+    required this.filterFocus,
+    required this.filterVisible,
+    required this.onShowFilter,
+    required this.onClearOrCloseFilter,
     required this.queueSourceId,
     required this.onBack,
     required this.onOpenPlayer,
@@ -436,6 +559,12 @@ class _LocalTrackDetailView extends ConsumerWidget {
   final double bottomContentPadding;
   final String title;
   final List<DeviceAudioTrack> tracks;
+  final Duration? totalDuration;
+  final TextEditingController filterController;
+  final FocusNode filterFocus;
+  final bool filterVisible;
+  final VoidCallback onShowFilter;
+  final VoidCallback onClearOrCloseFilter;
   final String queueSourceId;
   final VoidCallback onBack;
   final VoidCallback onOpenPlayer;
@@ -443,14 +572,17 @@ class _LocalTrackDetailView extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final strings = ref.watch(appStringsProvider);
-    final playback = ref.watch(
-      playerControllerProvider.select(
-        (value) => (
-          trackId: value.value?.trackId,
-          status: value.value?.status ?? PlayerStatus.idle,
-        ),
-      ),
-    );
+    final query = filterController.text.trim().toLowerCase();
+    final visibleTracks = query.isEmpty
+        ? tracks
+        : tracks
+              .where(
+                (track) =>
+                    track.title.toLowerCase().contains(query) ||
+                    (track.artist?.toLowerCase().contains(query) ?? false) ||
+                    (track.album?.toLowerCase().contains(query) ?? false),
+              )
+              .toList();
     return ScrolledUnderTabFrame(
       surfaceKey: const ValueKey('local-detail-header-surface'),
       header: Row(
@@ -471,15 +603,39 @@ class _LocalTrackDetailView extends ConsumerWidget {
               style: appTabTitleStyle(context),
             ),
           ),
-          IconButton.filled(
-            key: const ValueKey('local-play-all'),
-            tooltip: strings.playAll,
-            onPressed: tracks.isEmpty
-                ? null
-                : () => _playTrack(context, ref, tracks.first),
-            icon: const Icon(Icons.play_arrow_rounded),
+          GlassPopupMenuButton<bool>(
+            key: const ValueKey('local-detail-menu'),
+            tooltip: strings.moreOptions,
+            icon: Icon(
+              Icons.more_vert_rounded,
+              color: AppColors.menuIconFor(context),
+            ),
+            onSelected: (_) => onShowFilter(),
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                key: const ValueKey('local-detail-search'),
+                value: true,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.search_rounded),
+                    const SizedBox(width: 12),
+                    Text(strings.searchPlaylistSongs),
+                  ],
+                ),
+              ),
+            ],
           ),
         ],
+      ),
+      pinnedFooterHasOwnSurface: true,
+      pinnedFooter: _LocalSearchFooter(
+        controller: filterController,
+        focusNode: filterFocus,
+        visible: filterVisible,
+        hint: strings.filterSongs,
+        closeTooltip: strings.close,
+        onClearOrClose: onClearOrCloseFilter,
       ),
       scrollKey: ValueKey('local-detail-scroll-$queueSourceId'),
       slivers: [
@@ -492,41 +648,34 @@ class _LocalTrackDetailView extends ConsumerWidget {
               10,
             ),
             child: Text(
-              strings.songCountWithDuration(
-                tracks.length,
-                sumKnownDurations(tracks.map((track) => track.duration)),
-              ),
+              strings.songCountWithDuration(tracks.length, totalDuration),
               style: appListCardSubtitleStyle(context),
             ),
           ),
         ),
-        if (tracks.isEmpty)
+        if (visibleTracks.isEmpty)
           SliverToBoxAdapter(
             child: _LocalEmptyState(
-              title: strings.localMusicEmptyTitle,
-              message: strings.localMusicEmptyBody,
+              title: query.isEmpty
+                  ? strings.localMusicEmptyTitle
+                  : strings.noSongsToShow,
+              message: query.isEmpty ? strings.localMusicEmptyBody : '',
             ),
           )
         else
           SliverList.separated(
-            itemCount: tracks.length,
-            separatorBuilder: (_, _) => const SizedBox(height: 7),
+            itemCount: visibleTracks.length,
+            separatorBuilder: (_, _) => const SizedBox(height: appTrackRowGap),
             itemBuilder: (context, index) {
-              final track = tracks[index];
-              final isCurrent = playback.trackId == track.id;
-              final isPlaying =
-                  isCurrent && playback.status == PlayerStatus.playing;
+              final track = visibleTracks[index];
               return Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 6),
                 child: _DeviceAudioTrackCard(
                   track: track,
-                  isCurrent: isCurrent,
-                  isPlaying: isPlaying,
                   playTooltip: strings.play,
                   pauseTooltip: strings.pause,
                   onTap: () => _openOrPlay(context, ref, track),
-                  onPlayPause: () =>
-                      _toggleOrPlay(context, ref, track, isCurrent, isPlaying),
+                  onPlayPause: () => _toggleOrPlay(context, ref, track),
                 ),
               );
             },
@@ -556,12 +705,11 @@ class _LocalTrackDetailView extends ConsumerWidget {
     BuildContext context,
     WidgetRef ref,
     DeviceAudioTrack track,
-    bool isCurrent,
-    bool isPlaying,
   ) async {
     final player = ref.read(playerControllerProvider.notifier);
-    if (isCurrent) {
-      if (isPlaying) {
+    final snapshot = ref.read(playerControllerProvider).value;
+    if (snapshot?.trackId == track.id) {
+      if (snapshot?.status == PlayerStatus.playing) {
         await player.pause();
       } else {
         await player.resume();
@@ -609,11 +757,86 @@ class _LocalTrackDetailView extends ConsumerWidget {
   }
 }
 
-class _DeviceAudioTrackCard extends StatelessWidget {
+class _LocalSearchFooter extends StatelessWidget {
+  const _LocalSearchFooter({
+    required this.controller,
+    required this.focusNode,
+    required this.visible,
+    required this.hint,
+    required this.closeTooltip,
+    required this.onClearOrClose,
+  });
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final bool visible;
+  final String hint;
+  final String closeTooltip;
+  final VoidCallback onClearOrClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final duration = MediaQuery.disableAnimationsOf(context)
+        ? Duration.zero
+        : const Duration(milliseconds: 180);
+    return IgnorePointer(
+      ignoring: !visible,
+      child: ExcludeSemantics(
+        excluding: !visible,
+        child: AnimatedOpacity(
+          opacity: visible ? 1 : 0,
+          duration: duration,
+          child: ClipRect(
+            child: AnimatedSize(
+              duration: duration,
+              alignment: Alignment.topCenter,
+              child: visible
+                  ? Padding(
+                      padding: const EdgeInsets.fromLTRB(6, 4, 6, 6),
+                      child: AppSurfaceInput(
+                        key: const ValueKey('local-filter-surface'),
+                        child: TextField(
+                          controller: controller,
+                          focusNode: focusNode,
+                          textAlignVertical: TextAlignVertical.center,
+                          decoration: InputDecoration(
+                            hintText: hint,
+                            prefixIcon: const Icon(Icons.search_rounded),
+                            suffixIcon: IconButton(
+                              key: const ValueKey(
+                                'local-filter-clear-or-close',
+                              ),
+                              tooltip: closeTooltip,
+                              onPressed: onClearOrClose,
+                              icon: const Icon(Icons.close_rounded),
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+final _localCardPlaybackProvider = Provider.autoDispose((ref) {
+  return ref.watch(
+    playerControllerProvider.select((player) {
+      final snapshot = player.value;
+      return (
+        trackId: snapshot?.trackId,
+        playing: snapshot?.status == PlayerStatus.playing,
+      );
+    }),
+  );
+});
+
+class _DeviceAudioTrackCard extends ConsumerWidget {
   const _DeviceAudioTrackCard({
     required this.track,
-    required this.isCurrent,
-    required this.isPlaying,
     required this.playTooltip,
     required this.pauseTooltip,
     required this.onTap,
@@ -621,15 +844,21 @@ class _DeviceAudioTrackCard extends StatelessWidget {
   });
 
   final DeviceAudioTrack track;
-  final bool isCurrent;
-  final bool isPlaying;
   final String playTooltip;
   final String pauseTooltip;
   final VoidCallback onTap;
   final VoidCallback onPlayPause;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final playback = ref.watch(
+      _localCardPlaybackProvider.select((value) {
+        final current = value.trackId == track.id;
+        return (current: current, playing: current && value.playing);
+      }),
+    );
+    final isCurrent = playback.current;
+    final isPlaying = playback.playing;
     final colors = Theme.of(context).colorScheme;
     final artist = track.artist?.trim();
     final album = track.album?.trim();
@@ -651,7 +880,7 @@ class _DeviceAudioTrackCard extends StatelessWidget {
       emphasized: isCurrent,
       child: Material(
         key: ValueKey('local-track-${track.id}'),
-        color: AppColors.cardSurfaceFor(context, solidInLiquidGlass: true),
+        color: AppColors.cardSurfaceFor(context),
         shape: shape,
         clipBehavior: Clip.antiAlias,
         child: ListTile(
@@ -693,14 +922,11 @@ class _DeviceAudioTrackCard extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
             style: appListCardSubtitleStyle(context),
           ),
-          trailing: IconButton(
+          trailing: TrackPlayButton(
             key: ValueKey('local-track-play-${track.id}'),
             tooltip: isPlaying ? pauseTooltip : playTooltip,
             onPressed: onPlayPause,
-            icon: Icon(
-              isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-              color: colors.primary,
-            ),
+            isPlaying: isPlaying,
           ),
         ),
       ),

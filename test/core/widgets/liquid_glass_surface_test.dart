@@ -3,10 +3,74 @@ import 'dart:ui' show PointerDeviceKind;
 import 'dart:ui' as ui;
 
 import 'package:bstream_music/core/widgets/liquid_glass_surface.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  for (final platform in [TargetPlatform.android, TargetPlatform.windows]) {
+    testWidgets('$platform header optics use cacheable compatible blends', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _harness(
+          platform: platform,
+          edgeTreatment: LiquidGlassEdgeTreatment.bottom,
+          child: const Text('Encabezado'),
+        ),
+      );
+      final paints = _paintOptics(tester);
+      expect(paints, hasLength(2));
+      expect(
+        paints.every((paint) => paint.blendMode == BlendMode.srcOver),
+        isTrue,
+      );
+      final optics = tester.widget<CustomPaint>(
+        find.byKey(LiquidGlassSurface.opticsKey),
+      );
+      expect(optics.isComplex, isTrue);
+      expect(optics.willChange, isFalse);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  for (final brightness in Brightness.values) {
+    testWidgets(
+      'material opacity preserves refraction strength in $brightness',
+      (tester) async {
+        Widget surface(double opacity) => _harness(
+          child: const Text('Legible'),
+          brightness: brightness,
+          intensity: LiquidGlassSurface.chromeIntensity,
+          materialOpacity: opacity,
+        );
+        double tintAlpha() =>
+            (tester
+                        .widget<DecoratedBox>(
+                          find.byKey(LiquidGlassSurface.surfaceTintKey),
+                        )
+                        .decoration
+                    as BoxDecoration)
+                .color!
+                .a;
+        await tester.pumpWidget(surface(1));
+        final opaqueTint = tintAlpha();
+        final originalShadow = _paintShadow(tester).first.color.a;
+        await tester.pumpWidget(surface(LiquidGlassSurface.chromeOpacity));
+        expect(tintAlpha(), lessThan(opaqueTint));
+        expect(_paintShadow(tester).first.color.a, lessThan(originalShadow));
+        expect(
+          tester
+              .widget<LiquidGlassSurface>(find.byType(LiquidGlassSurface))
+              .intensity,
+          LiquidGlassSurface.chromeIntensity,
+        );
+        expect(find.text('Legible'), findsOneWidget);
+        expect(find.byType(BackdropFilter), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
   testWidgets(
     'static surface uses a continuous clip with neutral bounded optics',
     (tester) async {
@@ -65,15 +129,23 @@ void main() {
       final shadowLayer = tester.widget<CustomPaint>(
         find.byKey(LiquidGlassSurface.shadowKey),
       );
+      expect(shadowLayer.child, isNull);
+      expect(shadowLayer.isComplex, isTrue);
       expect(
-        shadowLayer.child,
-        isA<ClipRRect>(),
-        reason:
-            'Exterior depth must wrap the continuously clipped sheet instead '
-            'of darkening the translucent center.',
+        find.descendant(
+          of: find.byKey(LiquidGlassSurface.shadowKey),
+          matching: find.byType(BackdropFilter),
+        ),
+        findsNothing,
+        reason: 'Static shadows must be cacheable independently of live glass.',
       );
       final materialStack = tester.widget<Stack>(
-        find.descendant(of: surface, matching: find.byType(Stack)).first,
+        find
+            .descendant(
+              of: find.byType(ClipRRect).first,
+              matching: find.byType(Stack),
+            )
+            .first,
       );
       expect(materialStack.children, hasLength(4));
       expect(
@@ -101,6 +173,45 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets('keyboard transition pauses then restores live glass effects', (
+    tester,
+  ) async {
+    final effectsEnabled = ValueNotifier(true);
+    addTearDown(effectsEnabled.dispose);
+    Widget surface() => _harness(
+      child: const Text('Keyboard remains usable'),
+      effectsEnabled: effectsEnabled,
+    );
+
+    await tester.pumpWidget(surface());
+    expect(find.byType(BackdropFilter), findsOneWidget);
+    expect(find.byKey(LiquidGlassSurface.opticsKey), findsOneWidget);
+    final backdrop = tester.renderObject(find.byType(BackdropFilter));
+
+    effectsEnabled.value = false;
+    await tester.pump();
+    expect(
+      tester.widget<BackdropFilter>(find.byType(BackdropFilter)).enabled,
+      isFalse,
+    );
+    expect(tester.renderObject(find.byType(BackdropFilter)), same(backdrop));
+    expect(find.byKey(LiquidGlassSurface.opticsKey), findsNothing);
+    expect(find.byKey(LiquidGlassSurface.surfaceTintKey), findsOneWidget);
+    expect(find.text('Keyboard remains usable'), findsOneWidget);
+
+    effectsEnabled.value = true;
+    await tester.pump();
+    expect(find.byType(BackdropFilter), findsOneWidget);
+    expect(
+      tester.widget<BackdropFilter>(find.byType(BackdropFilter)).enabled,
+      isTrue,
+    );
+    expect(tester.renderObject(find.byType(BackdropFilter)), same(backdrop));
+    expect(find.byKey(LiquidGlassSurface.opticsKey), findsOneWidget);
+    expect(find.text('Keyboard remains usable'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('edge preference never creates a second backdrop capture', (
     tester,
@@ -216,7 +327,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final darkTint = _surfaceTintDecoration(tester).color!;
-    expect(darkTint, const Color(0xFF121212).withValues(alpha: 0.4));
+    expect(darkTint, const Color(0xFF101010).withValues(alpha: 0.43));
   });
 
   testWidgets('dark hover droplet preserves backdrop chroma at full reveal', (
@@ -242,7 +353,7 @@ void main() {
     expect(painter.debugShadowColor, Colors.black.withValues(alpha: 0.1));
     expect(painter.debugFillGradientColors, <Color>[
       Colors.white.withValues(alpha: 0.028),
-      Colors.transparent,
+      Colors.black.withValues(alpha: 0.03),
       Colors.black.withValues(alpha: 0.065),
     ]);
     expect(painter.debugRimGradientColors, <Color>[
@@ -555,69 +666,72 @@ void main() {
     expect(find.byKey(LiquidGlassSurface.adaptiveEdgeKey), findsNothing);
   });
 
-  testWidgets('android retains its shared capture throughout motion', (
-    tester,
-  ) async {
-    final sharedBackdrop = BackdropKey();
-    await tester.pumpWidget(
-      _harness(
-        platform: TargetPlatform.android,
-        backdropGroupKey: sharedBackdrop,
-        child: const Text('Android'),
-      ),
-    );
+  for (final mobilePlatform in [TargetPlatform.android, TargetPlatform.iOS]) {
+    testWidgets('$mobilePlatform keeps full blur throughout motion', (
+      tester,
+    ) async {
+      final sharedBackdrop = BackdropKey();
+      await tester.pumpWidget(
+        _harness(
+          platform: mobilePlatform,
+          backdropGroupKey: sharedBackdrop,
+          child: const Text('Android'),
+        ),
+      );
 
-    final restingMaterial = tester.widget<BackdropFilter>(
-      find.byKey(LiquidGlassSurface.backdropKey),
-    );
-    final restingFilter = restingMaterial.filter;
-    expect(find.byType(BackdropFilter), findsOneWidget);
-    expect(restingMaterial.backdropGroupKey, same(sharedBackdrop));
-    expect(restingMaterial.enabled, isTrue);
-    expect(find.byKey(LiquidGlassSurface.adaptiveEdgeKey), findsNothing);
+      final restingMaterial = tester.widget<BackdropFilter>(
+        find.byKey(LiquidGlassSurface.backdropKey),
+      );
+      final restingFilter = restingMaterial.filter;
+      expect(find.byType(BackdropFilter), findsOneWidget);
+      expect(restingMaterial.backdropGroupKey, same(sharedBackdrop));
+      expect(restingMaterial.enabled, isTrue);
+      expect(find.byKey(LiquidGlassSurface.adaptiveEdgeKey), findsNothing);
 
-    await tester.pumpWidget(
-      _harness(
-        platform: TargetPlatform.android,
-        backdropGroupKey: sharedBackdrop,
-        backdropMotion: true,
-        child: const Text('Android con bounds móviles'),
-      ),
-    );
-    final movingMaterial = tester.widget<BackdropFilter>(
-      find.byKey(LiquidGlassSurface.backdropKey),
-    );
-    expect(find.byType(BackdropFilter), findsOneWidget);
-    expect(movingMaterial.backdropGroupKey, same(sharedBackdrop));
-    expect(movingMaterial.enabled, isTrue);
-    expect(identical(movingMaterial.filter, restingFilter), isFalse);
-    expect(
-      movingMaterial.filter.toString(),
-      contains('blur(4.0, 4.0'),
-      reason: 'Mobile motion uses the lighter transient blur.',
-    );
-    expect(find.byKey(LiquidGlassSurface.adaptiveEdgeKey), findsNothing);
+      await tester.pumpWidget(
+        _harness(
+          platform: mobilePlatform,
+          backdropGroupKey: sharedBackdrop,
+          backdropMotion: true,
+          child: const Text('Android con bounds móviles'),
+        ),
+      );
+      final movingMaterial = tester.widget<BackdropFilter>(
+        find.byKey(LiquidGlassSurface.backdropKey),
+      );
+      expect(find.byType(BackdropFilter), findsOneWidget);
+      expect(movingMaterial.backdropGroupKey, same(sharedBackdrop));
+      expect(movingMaterial.enabled, isTrue);
+      expect(identical(movingMaterial.filter, restingFilter), isTrue);
+      expect(
+        movingMaterial.filter.toString(),
+        contains('blur(22.0, 22.0'),
+        reason: 'Scrolling must not lower the material blur quality.',
+      );
+      expect(find.byKey(LiquidGlassSurface.adaptiveEdgeKey), findsNothing);
 
-    await tester.pumpWidget(
-      _harness(
-        platform: TargetPlatform.android,
-        backdropGroupKey: sharedBackdrop,
-        child: const Text('Android otra vez en reposo'),
-      ),
-    );
-    final settledMaterial = tester.widget<BackdropFilter>(
-      find.byKey(LiquidGlassSurface.backdropKey),
-    );
-    expect(find.byType(BackdropFilter), findsOneWidget);
-    expect(settledMaterial.backdropGroupKey, same(sharedBackdrop));
-    expect(settledMaterial.enabled, isTrue);
-    expect(identical(settledMaterial.filter, restingFilter), isTrue);
-  });
+      await tester.pumpWidget(
+        _harness(
+          platform: mobilePlatform,
+          backdropGroupKey: sharedBackdrop,
+          child: const Text('Android otra vez en reposo'),
+        ),
+      );
+      final settledMaterial = tester.widget<BackdropFilter>(
+        find.byKey(LiquidGlassSurface.backdropKey),
+      );
+      expect(find.byType(BackdropFilter), findsOneWidget);
+      expect(settledMaterial.backdropGroupKey, same(sharedBackdrop));
+      expect(settledMaterial.enabled, isTrue);
+      expect(identical(settledMaterial.filter, restingFilter), isTrue);
+    });
+  }
 
   testWidgets(
-    'grouped sheets reuse one native blur without separate rim captures',
+    'sheets share the same blur while keeping separate capture groups',
     (tester) async {
       final sharedBackdrop = BackdropKey();
+      final otherBackdrop = BackdropKey();
       await tester.pumpWidget(
         _baseHarness(
           platform: TargetPlatform.windows,
@@ -638,6 +752,13 @@ void main() {
                   child: const Text('Navegación'),
                 ),
               ),
+              Expanded(
+                child: LiquidGlassSurface(
+                  blurSigma: 12,
+                  backdropGroupKey: otherBackdrop,
+                  child: const Text('Buscar'),
+                ),
+              ),
             ],
           ),
         ),
@@ -648,15 +769,16 @@ void main() {
             find.byKey(LiquidGlassSurface.backdropKey),
           )
           .toList(growable: false);
-      expect(groupedBlurs, hasLength(2));
-      expect(
-        identical(groupedBlurs.first.filter, groupedBlurs.last.filter),
-        isTrue,
-        reason:
-            'Equal grouped sheets should submit the same immutable filter to '
-            'the engine instead of allocating one native blur per sheet.',
-      );
-      expect(find.byType(BackdropFilter), findsNWidgets(2));
+      expect(groupedBlurs, hasLength(3));
+      for (final blur in groupedBlurs.skip(1)) {
+        expect(blur.filter, same(groupedBlurs.first.filter));
+      }
+      expect(groupedBlurs.map((blur) => blur.backdropGroupKey), [
+        sharedBackdrop,
+        sharedBackdrop,
+        otherBackdrop,
+      ]);
+      expect(find.byType(BackdropFilter), findsNWidgets(3));
       expect(find.byKey(LiquidGlassSurface.adaptiveEdgeKey), findsNothing);
     },
   );
@@ -918,6 +1040,11 @@ class _RRectPaintRecordingCanvas implements ui.Canvas {
   final List<ui.Paint> superellipsePaints = <ui.Paint>[];
 
   @override
+  void drawLine(ui.Offset first, ui.Offset second, ui.Paint paint) {
+    superellipsePaints.add(paint);
+  }
+
+  @override
   void drawRRect(ui.RRect rrect, ui.Paint paint) {
     superellipsePaints.add(paint);
   }
@@ -933,8 +1060,10 @@ class _RRectPaintRecordingCanvas implements ui.Canvas {
 
 Widget _harness({
   required Widget child,
+  ValueListenable<bool>? effectsEnabled,
   double blurSigma = 22,
   double intensity = 1,
+  double materialOpacity = 1,
   BackdropKey? backdropGroupKey,
   bool adaptiveEdgeEnabled = true,
   bool backdropMotion = false,
@@ -949,17 +1078,34 @@ Widget _harness({
   return _baseHarness(
     platform: platform,
     brightness: brightness,
-    child: LiquidGlassSurface(
-      blurSigma: blurSigma,
-      intensity: intensity,
-      backdropGroupKey: backdropGroupKey,
-      adaptiveEdgeEnabled: adaptiveEdgeEnabled,
-      backdropMotion: backdropMotion,
-      perimeterOpticsEnabled: perimeterOpticsEnabled,
-      edgeTreatment: edgeTreatment,
-      borderRadius: borderRadius,
-      child: child,
-    ),
+    child: effectsEnabled == null
+        ? LiquidGlassSurface(
+            blurSigma: blurSigma,
+            intensity: intensity,
+            materialOpacity: materialOpacity,
+            backdropGroupKey: backdropGroupKey,
+            adaptiveEdgeEnabled: adaptiveEdgeEnabled,
+            backdropMotion: backdropMotion,
+            perimeterOpticsEnabled: perimeterOpticsEnabled,
+            edgeTreatment: edgeTreatment,
+            borderRadius: borderRadius,
+            child: child,
+          )
+        : LiquidGlassEffectsScope(
+            enabled: effectsEnabled,
+            child: LiquidGlassSurface(
+              blurSigma: blurSigma,
+              intensity: intensity,
+              materialOpacity: materialOpacity,
+              backdropGroupKey: backdropGroupKey,
+              adaptiveEdgeEnabled: adaptiveEdgeEnabled,
+              backdropMotion: backdropMotion,
+              perimeterOpticsEnabled: perimeterOpticsEnabled,
+              edgeTreatment: edgeTreatment,
+              borderRadius: borderRadius,
+              child: child,
+            ),
+          ),
   );
 }
 

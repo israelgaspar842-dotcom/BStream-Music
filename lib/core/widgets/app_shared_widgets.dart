@@ -93,12 +93,21 @@ class AppSurfaceInput extends StatelessWidget {
       return child;
     }
     if (mode.isLiquidGlass) {
-      return LiquidGlassSurface(
+      Widget glass(bool moving, Widget child) => LiquidGlassSurface(
         borderRadius: BorderRadius.circular(borderRadius),
         blurSigma: 10,
         intensity: 0.9,
+        backdropMotion: moving,
         child: child,
       );
+      final motion = LiquidGlassMotionScope.maybeOf(context);
+      return motion == null
+          ? glass(false, child)
+          : ValueListenableBuilder<bool>(
+              valueListenable: motion,
+              child: child,
+              builder: (context, moving, child) => glass(moving, child!),
+            );
     }
     return ClipRRect(
       borderRadius: BorderRadius.circular(borderRadius),
@@ -117,12 +126,14 @@ class AppInsetHeaderSurface extends StatelessWidget {
     required this.child,
     this.padding = const EdgeInsets.symmetric(horizontal: 6),
     this.borderRadius = appCardRadius,
+    this.backdropGroupKey,
     super.key,
   });
 
   final Widget child;
   final EdgeInsetsGeometry padding;
   final double borderRadius;
+  final BackdropKey? backdropGroupKey;
 
   @override
   Widget build(BuildContext context) {
@@ -156,6 +167,7 @@ class AppInsetHeaderSurface extends StatelessWidget {
         key: const ValueKey('app-inset-header-liquid-glass'),
         borderRadius: radius,
         blurSigma: 12,
+        backdropGroupKey: backdropGroupKey,
         intensity: 1.02,
         child: surface,
       );
@@ -163,6 +175,7 @@ class AppInsetHeaderSurface extends StatelessWidget {
     return ClipRRect(
       borderRadius: radius,
       child: BackdropFilter(
+        backdropGroupKey: backdropGroupKey,
         filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
         child: surface,
       ),

@@ -4,8 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/platform/app_platform.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_ui.dart';
+import '../../../../core/widgets/horizontal_shelf_scroll_behavior.dart';
+import '../../../../core/widgets/painted_glass_button_style.dart';
 import '../../../../services/youtube_music/account/youtube_music_account.dart';
 import '../../../../services/youtube_music/innertube_search_service.dart';
 import '../../data/datasources/remote_music_datasource.dart';
@@ -13,12 +16,20 @@ import '../../domain/entities/track_info.dart';
 import '../providers/music_providers.dart';
 import '../providers/subscribed_artists_controller.dart';
 import '../providers/youtube_music_auth_controller.dart';
+import '../widgets/artwork_detail_scaffold.dart';
 import '../widgets/artwork_gradient_header_background.dart';
+import '../widgets/expanded_artwork_header_background.dart';
 import '../widgets/mini_player.dart';
 import '../widgets/source_image.dart';
-import '../widgets/surface_detail_app_bar.dart';
 import '../widgets/track_result_tile.dart';
+import 'artist_releases_page.dart';
+import 'artist_songs_page.dart';
 import 'remote_collection_detail_page.dart';
+
+const _artistContentMaxWidth = 1080.0;
+const _artistContentHorizontalInset = 6.0;
+const _artistSectionTitleInset = 6.0;
+const _artistReleaseShelfInset = 2.0;
 
 typedef ArtistProfileRequest = ({
   String artistBrowseId,
@@ -108,7 +119,6 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
 
   @override
   Widget build(BuildContext context) {
-    final strings = ref.watch(appStringsProvider);
     final profileState = ref.watch(artistProfileProvider(_request));
     final defaultMode = defaultMiniPlayerModeForPlatform(
       Theme.of(context).platform,
@@ -144,34 +154,33 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
           singles: const <InnerTubeAlbum>[],
         );
 
-    return Scaffold(
+    return ArtworkDetailScaffold(
       key: const ValueKey('artist-profile-page'),
       extendBody: underlayMiniPlayer,
-      extendBodyBehindAppBar: true,
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      appBar: SurfaceDetailAppBar(
-        appBarKey: const ValueKey('artist-profile-app-bar'),
-        surfaceKey: const ValueKey('artist-profile-app-bar-surface'),
-        blurKey: const ValueKey('artist-profile-app-bar-blur'),
-        statusBarSurfaceKey: const ValueKey(
-          'artist-profile-status-bar-surface',
-        ),
-        title: Text(
-          strings.artistProfile,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-      ),
+      backButtonKey: const ValueKey('artist-profile-back'),
+      statusBarFadeExtent: 0,
       // Render the identity and artwork immediately. Mix pages feel faster
       // because their header metadata is already known before tracks load;
       // artist pages now follow the same progressive pattern.
-      body: _buildProfile(
-        context,
-        profile,
-        profileLoaded: profileState.hasValue,
-        profileLoading: profileState.isLoading,
-        profileFailed: profileState.hasError && !profileState.hasValue,
-        bottomContentPadding: bottomContentPadding,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          RepaintBoundary(
+            key: const ValueKey('artist-profile-artwork-underlay'),
+            child: ArtworkColorPageBackground(
+              artworkSource: profile.artist.thumbnailUrl,
+              keyPrefix: 'artist-profile',
+            ),
+          ),
+          _buildProfile(
+            context,
+            profile,
+            profileLoaded: profileState.hasValue,
+            profileLoading: profileState.isLoading,
+            profileFailed: profileState.hasError && !profileState.hasValue,
+            bottomContentPadding: bottomContentPadding,
+          ),
+        ],
       ),
       bottomNavigationBar: ColoredBox(
         color: underlayMiniPlayer
@@ -228,80 +237,55 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
       scrollCacheExtent: const ScrollCacheExtent.pixels(800),
       slivers: [
         SliverToBoxAdapter(
-          child: SizedBox(
-            key: const ValueKey('artist-profile-app-bar-spacer'),
-            height: surfaceDetailAppBarBodyInset(context),
-            child: AppColors.surfaceBackgroundModeFor(context).usesBackdrop
-                ? ArtworkGradientHeaderBackground(
-                    artworkSource: profile.artist.thumbnailUrl,
-                    cacheWidth: 640,
-                    keyPrefix: 'artist-profile-app-bar-underlay',
-                  )
-                : null,
-          ),
-        ),
-        SliverToBoxAdapter(
           child: RepaintBoundary(
             key: const ValueKey('artist-profile-header'),
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: ArtworkGradientHeaderBackground(
-                    artworkSource: profile.artist.thumbnailUrl,
-                    cacheWidth: 640,
-                    keyPrefix: 'artist-profile',
-                  ),
-                ),
-                _ArtistHeader(
-                  profile: profile,
-                  radioLabel: strings.artistMix,
-                  subscribeLabel: subscribed
-                      ? strings.unsubscribe
-                      : strings.subscribe,
-                  playLabel: strings.play,
-                  showSubscription: account != null,
-                  subscriptionTooltip:
-                      profileLoaded && subscriptionChannelId == null
-                      ? strings.artistSubscriptionUnavailable
-                      : null,
-                  subscriptionBusy:
-                      _subscriptionBusy ||
-                      profileLoading ||
-                      (account != null && subscription.isLoading),
-                  radioBusy: _radioBusy,
-                  canStartRadio:
-                      !_popularPlaybackBusy &&
-                      ((profile.radioPlaylistId?.trim().isNotEmpty == true &&
-                              (profile.radioSeedVideoId?.trim().isNotEmpty ==
-                                      true ||
-                                  tracks.isNotEmpty ||
-                                  widget.seedVideoId?.trim().isNotEmpty ==
-                                      true)) ||
-                          tracks.isNotEmpty ||
-                          widget.seedVideoId?.trim().isNotEmpty == true),
-                  canPlayAll:
-                      profileLoaded &&
-                      !_radioBusy &&
-                      (profile.playPlaylistId?.trim().isNotEmpty == true ||
-                          tracks.isNotEmpty),
-                  subscribed: subscribed,
-                  playAllBusy: _popularPlaybackBusy,
-                  onRadio: () => _startRadio(profile, tracks),
-                  onPlayAll: () => _playArtistQueue(profile, tracks),
-                  onSubscription: () {
-                    if (account == null || subscriptionChannelId == null) {
-                      _showMessage(strings.artistSubscriptionUnavailable);
-                      return;
-                    }
-                    _toggleSubscription(
-                      account,
-                      subscriptionChannelId,
-                      subscribed,
-                      profile,
-                    );
-                  },
-                ),
-              ],
+            child: _ArtistHeader(
+              profile: profile,
+              radioLabel: strings.artistMix,
+              subscribeLabel: subscribed
+                  ? strings.unsubscribe
+                  : strings.subscribe,
+              playLabel: strings.play,
+              showSubscription: account != null,
+              subscriptionTooltip:
+                  profileLoaded && subscriptionChannelId == null
+                  ? strings.artistSubscriptionUnavailable
+                  : null,
+              subscriptionBusy:
+                  _subscriptionBusy ||
+                  profileLoading ||
+                  (account != null && subscription.isLoading),
+              radioBusy: _radioBusy,
+              canStartRadio:
+                  !_popularPlaybackBusy &&
+                  ((profile.radioPlaylistId?.trim().isNotEmpty == true &&
+                          (profile.radioSeedVideoId?.trim().isNotEmpty ==
+                                  true ||
+                              tracks.isNotEmpty ||
+                              widget.seedVideoId?.trim().isNotEmpty == true)) ||
+                      tracks.isNotEmpty ||
+                      widget.seedVideoId?.trim().isNotEmpty == true),
+              canPlayAll:
+                  profileLoaded &&
+                  !_radioBusy &&
+                  (profile.playPlaylistId?.trim().isNotEmpty == true ||
+                      tracks.isNotEmpty),
+              subscribed: subscribed,
+              playAllBusy: _popularPlaybackBusy,
+              onRadio: () => _startRadio(profile, tracks),
+              onPlayAll: () => _playArtistQueue(profile, tracks),
+              onSubscription: () {
+                if (account == null || subscriptionChannelId == null) {
+                  _showMessage(strings.artistSubscriptionUnavailable);
+                  return;
+                }
+                _toggleSubscription(
+                  account,
+                  subscriptionChannelId,
+                  subscribed,
+                  profile,
+                );
+              },
             ),
           ),
         ),
@@ -334,27 +318,46 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
             ),
           ),
           SliverPadding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+            padding: const EdgeInsets.fromLTRB(
+              _artistContentHorizontalInset,
+              0,
+              _artistContentHorizontalInset,
+              10,
+            ),
             sliver: SliverList.separated(
               itemCount: tracks.length,
-              separatorBuilder: (_, _) => const SizedBox(height: 6),
+              separatorBuilder: (_, _) =>
+                  const SizedBox(height: appTrackRowGap),
               itemBuilder: (context, index) {
                 final track = tracks[index];
                 return Center(
                   child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 1080),
+                    constraints: const BoxConstraints(
+                      maxWidth: _artistContentMaxWidth,
+                    ),
                     child: TrackResultTile(
                       key: ValueKey('artist-popular-${track.id}'),
                       track: track,
                       queue: tracks,
                       queueSourceId: 'artist:${widget.artistBrowseId}:popular',
                       onOpenPlayer: _returnToPlayer,
+                      surfaceOpacity: 0.52,
                     ),
                   ),
                 );
               },
             ),
           ),
+          if (profile.songsBrowseTarget != null)
+            SliverToBoxAdapter(
+              child: Center(
+                child: TextButton(
+                  key: const ValueKey('artist-view-all-songs'),
+                  onPressed: () => _openAllSongs(profile),
+                  child: Text(strings.viewAll),
+                ),
+              ),
+            ),
         ],
         if (profile.albums.isNotEmpty)
           SliverToBoxAdapter(
@@ -363,6 +366,13 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
               title: strings.albums,
               releases: profile.albums,
               onOpen: _openRelease,
+              viewAllLabel: strings.viewAll,
+              onViewAll: () => _openAllReleases(
+                profile,
+                profile.albumsBrowseTarget,
+                strings.albums,
+                profile.albums,
+              ),
             ),
           ),
         if (profile.singles.isNotEmpty)
@@ -372,6 +382,13 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
               title: strings.singles,
               releases: profile.singles,
               onOpen: _openRelease,
+              viewAllLabel: strings.viewAll,
+              onViewAll: () => _openAllReleases(
+                profile,
+                profile.singlesBrowseTarget,
+                strings.singles,
+                profile.singles,
+              ),
             ),
           ),
         SliverToBoxAdapter(
@@ -571,7 +588,7 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
             ?release.year?.trim().isEmpty == false ? release.year : null,
           ],
           fallbackIcon: Icons.album_rounded,
-          useCollectionArtworkForTrackFallback: true,
+          preferCollectionArtworkForTracks: true,
           queueSourceId: 'artist:${widget.artistBrowseId}:${release.browseId}',
           tracksProvider: homeAlbumTracksProvider(release.browseId),
           emptyMessage: strings.albumWithoutSongs,
@@ -582,9 +599,67 @@ class _ArtistProfilePageState extends ConsumerState<ArtistProfilePage> {
     );
   }
 
+  void _openAllSongs(InnerTubeArtistProfile profile) {
+    final target = profile.songsBrowseTarget;
+    if (target == null) return;
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => ArtistSongsPage(
+          artistBrowseId: widget.artistBrowseId,
+          artistName: profile.artist.name,
+          artistThumbnailUrl: profile.artist.thumbnailUrl,
+          target: target,
+          onOpenPlayer: _returnToPlayer,
+        ),
+      ),
+    );
+  }
+
+  void _openAllReleases(
+    InnerTubeArtistProfile profile,
+    InnerTubeBrowseTarget? target,
+    String categoryTitle,
+    List<InnerTubeAlbum> initialReleases,
+  ) {
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => ArtistReleasesPage(
+          artistBrowseId: widget.artistBrowseId,
+          artistName: profile.artist.name,
+          artistThumbnailUrl: profile.artist.thumbnailUrl,
+          categoryTitle: categoryTitle,
+          target: target,
+          initialReleases: initialReleases,
+          onOpenPlayer: _returnToPlayer,
+        ),
+      ),
+    );
+  }
+
   void _returnToPlayer() {
     if (Navigator.of(context).canPop()) Navigator.of(context).pop();
     widget.onOpenPlayer();
+  }
+}
+
+class _ArtistContent extends StatelessWidget {
+  const _ArtistContent({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        horizontal: _artistContentHorizontalInset,
+      ),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: _artistContentMaxWidth),
+          child: SizedBox(width: double.infinity, child: child),
+        ),
+      ),
+    );
   }
 }
 
@@ -626,221 +701,351 @@ class _ArtistHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final actionStyle = paintedGlassButtonStyle(context);
     final description = profile.description?.trim();
     final subscriberCount = profile.subscriberCount?.trim();
     final monthlyListenerCount = profile.monthlyListenerCount?.trim();
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 1080),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final wide = constraints.maxWidth >= 700;
-              final artwork = ClipOval(
-                key: const ValueKey('artist-profile-artwork'),
+        constraints: const BoxConstraints(maxWidth: _artistContentMaxWidth),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 700;
+            final desktop = !AppPlatform.isMobileTargetPlatform(theme.platform);
+            final hasArtwork =
+                profile.artist.thumbnailUrl?.trim().isNotEmpty == true;
+            final artworkHeight = hasArtwork
+                ? constraints.maxWidth.clamp(240.0, wide ? 440.0 : 480.0)
+                : (wide ? 216.0 : 176.0);
+            final details = Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: wide
+                  ? CrossAxisAlignment.start
+                  : CrossAxisAlignment.center,
+              children: [
+                Text(
+                  key: const ValueKey('artist-profile-name'),
+                  profile.artist.name,
+                  textAlign: wide ? TextAlign.start : TextAlign.center,
+                  style: theme.textTheme.headlineLarge?.copyWith(
+                    color: AppColors.contentTitleFor(context),
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                if (subscriberCount?.isNotEmpty == true ||
+                    monthlyListenerCount?.isNotEmpty == true) ...[
+                  const SizedBox(height: 5),
+                  Column(
+                    crossAxisAlignment: wide
+                        ? CrossAxisAlignment.start
+                        : CrossAxisAlignment.center,
+                    children: [
+                      if (subscriberCount?.isNotEmpty == true)
+                        Text(
+                          key: const ValueKey('artist-subscriber-count'),
+                          subscriberCount!,
+                          textAlign: wide ? TextAlign.start : TextAlign.center,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: AppColors.contentSubtitleFor(context),
+                          ),
+                        ),
+                      if (subscriberCount?.isNotEmpty == true &&
+                          monthlyListenerCount?.isNotEmpty == true)
+                        const SizedBox(height: 2),
+                      if (monthlyListenerCount?.isNotEmpty == true)
+                        Text(
+                          key: const ValueKey('artist-monthly-listener-count'),
+                          monthlyListenerCount!,
+                          textAlign: wide ? TextAlign.start : TextAlign.center,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: AppColors.contentSubtitleFor(context),
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+                if (description != null && description.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  _ArtistDescription(
+                    description: description,
+                    textAlign: wide ? TextAlign.start : TextAlign.center,
+                  ),
+                ],
+                const SizedBox(height: 16),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Expanded(
+                      child: Wrap(
+                        alignment: wide
+                            ? WrapAlignment.start
+                            : WrapAlignment.center,
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: [
+                          FilledButton.icon(
+                            key: const ValueKey('artist-mix'),
+                            style: actionStyle,
+                            onPressed: canStartRadio && !radioBusy
+                                ? onRadio
+                                : null,
+                            icon: radioBusy
+                                ? const SizedBox.square(
+                                    dimension: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.radio_rounded),
+                            label: Text(radioLabel),
+                          ),
+                          if (showSubscription)
+                            Tooltip(
+                              message: subscriptionTooltip ?? '',
+                              child: FilledButton.tonalIcon(
+                                key: const ValueKey('artist-subscription'),
+                                style: actionStyle,
+                                onPressed: subscriptionBusy
+                                    ? null
+                                    : onSubscription,
+                                icon: subscriptionBusy
+                                    ? const SizedBox.square(
+                                        dimension: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : Icon(
+                                        subscribed
+                                            ? Icons.notifications_active_rounded
+                                            : Icons.add_rounded,
+                                      ),
+                                label: Text(subscribeLabel),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    SizedBox.square(
+                      dimension: 54,
+                      child: IconButton.filled(
+                        key: const ValueKey('artist-play-all'),
+                        style: paintedGlassButtonStyle(context, circular: true),
+                        tooltip: playLabel,
+                        onPressed: canPlayAll && !playAllBusy
+                            ? onPlayAll
+                            : null,
+                        icon: playAllBusy
+                            ? const SizedBox.square(
+                                dimension: 21,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2.4,
+                                ),
+                              )
+                            : const Icon(Icons.play_arrow_rounded, size: 30),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            );
+            if (desktop) {
+              final artwork = ClipRRect(
+                borderRadius: BorderRadius.circular(appArtworkRadius),
                 child: SizedBox.square(
-                  dimension: wide ? 216 : 176,
-                  child: SourceImage(
+                  key: const ValueKey('artist-profile-artwork'),
+                  dimension: wide ? 224 : 196,
+                  child: ProportionalArtwork(
                     source: profile.artist.thumbnailUrl,
-                    cacheWidth: 640,
-                    fit: BoxFit.cover,
+                    cacheWidth: wide ? 640 : 512,
                     fallback: ColoredBox(
                       color: theme.colorScheme.surfaceContainerHighest,
                       child: Icon(
                         Icons.person_rounded,
-                        size: wide ? 88 : 72,
-                        color: theme.colorScheme.onSurfaceVariant,
+                        size: 64,
+                        color: AppColors.contentSubtitleFor(context),
                       ),
                     ),
                   ),
                 ),
               );
-              final details = Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: wide
-                    ? CrossAxisAlignment.start
-                    : CrossAxisAlignment.center,
-                children: [
-                  Text(
-                    key: const ValueKey('artist-profile-name'),
-                    profile.artist.name,
-                    textAlign: wide ? TextAlign.start : TextAlign.center,
-                    style: theme.textTheme.headlineLarge?.copyWith(
-                      color: AppColors.contentTitleFor(context),
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                  if (subscriberCount?.isNotEmpty == true ||
-                      monthlyListenerCount?.isNotEmpty == true) ...[
-                    const SizedBox(height: 5),
-                    Column(
-                      crossAxisAlignment: wide
-                          ? CrossAxisAlignment.start
-                          : CrossAxisAlignment.center,
-                      children: [
-                        if (subscriberCount?.isNotEmpty == true)
-                          Text(
-                            key: const ValueKey('artist-subscriber-count'),
-                            subscriberCount!,
-                            textAlign: wide
-                                ? TextAlign.start
-                                : TextAlign.center,
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: AppColors.contentSubtitleFor(context),
-                            ),
-                          ),
-                        if (subscriberCount?.isNotEmpty == true &&
-                            monthlyListenerCount?.isNotEmpty == true)
-                          const SizedBox(height: 2),
-                        if (monthlyListenerCount?.isNotEmpty == true)
-                          Text(
-                            key: const ValueKey(
-                              'artist-monthly-listener-count',
-                            ),
-                            monthlyListenerCount!,
-                            textAlign: wide
-                                ? TextAlign.start
-                                : TextAlign.center,
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: AppColors.contentSubtitleFor(context),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ],
-                  if (description != null && description.isNotEmpty) ...[
-                    const SizedBox(height: 10),
-                    Text(
-                      description,
-                      maxLines: 4,
-                      overflow: TextOverflow.ellipsis,
-                      textAlign: wide ? TextAlign.start : TextAlign.center,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: AppColors.contentSubtitleFor(context),
-                        height: 1.4,
+              return Padding(
+                padding: EdgeInsets.fromLTRB(
+                  wide ? 28 : 20,
+                  MediaQuery.paddingOf(context).top + 24,
+                  wide ? 28 : 20,
+                  20,
+                ),
+                child: wide
+                    ? Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          artwork,
+                          const SizedBox(width: 28),
+                          Expanded(child: details),
+                        ],
+                      )
+                    : Column(
+                        children: [
+                          artwork,
+                          const SizedBox(height: 18),
+                          details,
+                        ],
                       ),
-                    ),
-                  ],
-                  const SizedBox(height: 16),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Expanded(
-                        child: Wrap(
-                          alignment: wide
-                              ? WrapAlignment.start
-                              : WrapAlignment.center,
-                          spacing: 10,
-                          runSpacing: 10,
-                          children: [
-                            FilledButton.icon(
-                              key: const ValueKey('artist-mix'),
-                              onPressed: canStartRadio && !radioBusy
-                                  ? onRadio
-                                  : null,
-                              icon: radioBusy
-                                  ? const SizedBox.square(
-                                      dimension: 18,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(Icons.radio_rounded),
-                              label: Text(radioLabel),
-                            ),
-                            if (showSubscription)
-                              Tooltip(
-                                message: subscriptionTooltip ?? '',
-                                child: FilledButton.tonalIcon(
-                                  key: const ValueKey('artist-subscription'),
-                                  onPressed: subscriptionBusy
-                                      ? null
-                                      : onSubscription,
-                                  icon: subscriptionBusy
-                                      ? const SizedBox.square(
-                                          dimension: 18,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                          ),
-                                        )
-                                      : Icon(
-                                          subscribed
-                                              ? Icons
-                                                    .notifications_active_rounded
-                                              : Icons.add_rounded,
-                                        ),
-                                  label: Text(subscribeLabel),
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      SizedBox.square(
-                        dimension: 54,
-                        child: IconButton.filled(
-                          key: const ValueKey('artist-play-all'),
-                          tooltip: playLabel,
-                          onPressed: canPlayAll && !playAllBusy
-                              ? onPlayAll
-                              : null,
-                          icon: playAllBusy
-                              ? const SizedBox.square(
-                                  dimension: 21,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2.4,
-                                  ),
-                                )
-                              : const Icon(Icons.play_arrow_rounded, size: 30),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
               );
-              if (!wide) {
-                return Column(
+            }
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: ExpandedArtworkHeaderBackground(
+                    artworkSource: profile.artist.thumbnailUrl,
+                    artworkHeight: artworkHeight,
+                    keyPrefix: 'artist-profile',
+                  ),
+                ),
+                Column(
                   mainAxisSize: MainAxisSize.min,
-                  children: [artwork, const SizedBox(height: 16), details],
-                );
-              }
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  artwork,
-                  const SizedBox(width: 28),
-                  Expanded(child: details),
-                ],
-              );
-            },
-          ),
+                  children: [
+                    SizedBox(
+                      key: const ValueKey('artist-profile-artwork'),
+                      height: artworkHeight * 0.90,
+                      width: double.infinity,
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 8, 18, 16),
+                      child: details,
+                    ),
+                  ],
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
   }
 }
 
-class _SectionTitle extends StatelessWidget {
-  const _SectionTitle({required this.title, super.key});
+class _ArtistDescription extends ConsumerStatefulWidget {
+  const _ArtistDescription({
+    required this.description,
+    required this.textAlign,
+  });
 
-  final String title;
+  final String description;
+  final TextAlign textAlign;
+
+  @override
+  ConsumerState<_ArtistDescription> createState() => _ArtistDescriptionState();
+}
+
+class _ArtistDescriptionState extends ConsumerState<_ArtistDescription> {
+  bool _expanded = false;
+
+  @override
+  void didUpdateWidget(covariant _ArtistDescription oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.description != widget.description) _expanded = false;
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 1080),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(18, 22, 18, 12),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              title,
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                color: AppColors.contentHeadingFor(context),
-                fontWeight: FontWeight.w900,
-              ),
+    final strings = ref.watch(appStringsProvider);
+    final style = DefaultTextStyle.of(context).style.merge(
+      Theme.of(context).textTheme.bodyMedium?.copyWith(
+        color: AppColors.contentSubtitleFor(context),
+        height: 1.4,
+      ),
+    );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: widget.textAlign == TextAlign.center
+          ? CrossAxisAlignment.center
+          : CrossAxisAlignment.start,
+      children: [
+        AnimatedSize(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.topCenter,
+          child: _expanded
+              ? Text(
+                  key: const ValueKey('artist-profile-description'),
+                  widget.description,
+                  textAlign: widget.textAlign,
+                  style: style,
+                )
+              : const SizedBox.shrink(),
+        ),
+        Semantics(
+          expanded: _expanded,
+          child: TextButton(
+            key: const ValueKey('artist-description-toggle'),
+            onPressed: () => setState(() => _expanded = !_expanded),
+            style: TextButton.styleFrom(
+              minimumSize: const Size(0, 32),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              textStyle: Theme.of(context).textTheme.labelSmall,
+            ),
+            child: Text(_expanded ? strings.showLess : strings.showMore),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SectionTitle extends StatelessWidget {
+  const _SectionTitle({
+    required this.title,
+    this.viewAllLabel,
+    this.onViewAll,
+    super.key,
+  });
+
+  final String title;
+  final String? viewAllLabel;
+  final VoidCallback? onViewAll;
+
+  @override
+  Widget build(BuildContext context) {
+    return _ArtistContent(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(0, 22, 0, 12),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: _artistSectionTitleInset,
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      color: AppColors.contentHeadingFor(context),
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+                if (onViewAll != null)
+                  TextButton(
+                    key: ValueKey('artist-view-all-$title'),
+                    onPressed: onViewAll,
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(0, 36),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      visualDensity: VisualDensity.compact,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: Text(viewAllLabel ?? title),
+                  ),
+              ],
             ),
           ),
         ),
@@ -854,37 +1059,51 @@ class _ReleaseShelf extends StatelessWidget {
     required this.title,
     required this.releases,
     required this.onOpen,
+    required this.viewAllLabel,
+    this.onViewAll,
     super.key,
   });
 
   final String title;
   final List<InnerTubeAlbum> releases;
   final ValueChanged<InnerTubeAlbum> onOpen;
+  final String viewAllLabel;
+  final VoidCallback? onViewAll;
 
   @override
   Widget build(BuildContext context) {
     final wide = MediaQuery.sizeOf(context).width >= 700;
-    final cardWidth = wide ? 176.0 : 148.0;
+    final cardWidth = wide ? 186.0 : 156.0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _SectionTitle(title: title),
-        SizedBox(
-          height: wide ? 238 : 210,
-          child: ListView.separated(
-            scrollCacheExtent: const ScrollCacheExtent.pixels(760),
-            padding: const EdgeInsets.symmetric(horizontal: 18),
-            scrollDirection: Axis.horizontal,
-            itemCount: releases.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 10),
-            itemBuilder: (context, index) {
-              final release = releases[index];
-              return _ReleaseCard(
-                release: release,
-                width: cardWidth,
-                onTap: () => onOpen(release),
-              );
-            },
+        _SectionTitle(
+          title: title,
+          viewAllLabel: viewAllLabel,
+          onViewAll: onViewAll,
+        ),
+        _ArtistContent(
+          child: SizedBox(
+            height: wide ? 248 : 218,
+            child: HorizontalShelfScroll(
+              child: ListView.separated(
+                scrollCacheExtent: const ScrollCacheExtent.pixels(760),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: _artistReleaseShelfInset,
+                ),
+                scrollDirection: Axis.horizontal,
+                itemCount: releases.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 10),
+                itemBuilder: (context, index) {
+                  final release = releases[index];
+                  return _ReleaseCard(
+                    release: release,
+                    width: cardWidth,
+                    onTap: () => onOpen(release),
+                  );
+                },
+              ),
+            ),
           ),
         ),
       ],
@@ -916,7 +1135,7 @@ class _ReleaseCard extends StatelessWidget {
         child: InkWell(
           onTap: onTap,
           child: Padding(
-            padding: const EdgeInsets.all(4),
+            padding: const EdgeInsets.fromLTRB(0, 4, 8, 4),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [

@@ -103,6 +103,7 @@ class LiveOverlayQueueEntry {
 @immutable
 class LiveOverlayAppearance {
   const LiveOverlayAppearance({
+    this.style = LiveWidgetStyle.classic,
     this.accentSeedArgb = 0xFFF5F7F5,
     this.accentDarkArgb = 0xFF8E9891,
     this.playbackProgressPermille = 0,
@@ -115,12 +116,14 @@ class LiveOverlayAppearance {
        assert(playbackDurationMilliseconds >= 0);
 
   final int accentSeedArgb;
+  final LiveWidgetStyle style;
   final int accentDarkArgb;
   final int playbackProgressPermille;
   final int playbackPositionMilliseconds;
   final int playbackDurationMilliseconds;
 
   Map<String, Object> toJson() => <String, Object>{
+    'style': style.code,
     'accent': <String, String>{
       'seed': _cssColor(accentSeedArgb),
       'dark': _cssColor(accentDarkArgb),
@@ -133,6 +136,7 @@ class LiveOverlayAppearance {
   @override
   bool operator ==(Object other) =>
       other is LiveOverlayAppearance &&
+      style == other.style &&
       accentSeedArgb == other.accentSeedArgb &&
       accentDarkArgb == other.accentDarkArgb &&
       playbackProgressPermille == other.playbackProgressPermille &&
@@ -141,6 +145,7 @@ class LiveOverlayAppearance {
 
   @override
   int get hashCode => Object.hash(
+    style,
     accentSeedArgb,
     accentDarkArgb,
     playbackProgressPermille,
@@ -270,6 +275,14 @@ final liveOverlayAccentProvider = Provider<AppAccent>((ref) {
   return ref.watch(settingsControllerProvider).value?.accent ?? AppAccent.white;
 });
 
+final liveOverlayStyleProvider = Provider<LiveWidgetStyle>((ref) {
+  return ref.watch(
+    settingsControllerProvider.select(
+      (settings) => settings.value?.liveWidgetStyle ?? LiveWidgetStyle.classic,
+    ),
+  );
+});
+
 final liveOverlayControllerProvider =
     NotifierProvider<LiveOverlayController, LiveOverlaySnapshot>(
       LiveOverlayController.new,
@@ -278,11 +291,14 @@ final liveOverlayControllerProvider =
 class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
   late LiveOverlayClient _client;
   late LiveOverlayArtworkLoader _artworkLoader;
+  ProviderSubscription<LiveOverlaySnapshot>? _broadcastSubscription;
   var _latestQueue = const <LiveOverlayQueueEntry>[];
   var _latestAppearance = const LiveOverlayAppearance();
   var _liveQueue = const <LiveQueueItem>[];
   PlayerSnapshot? _playback;
+  var _playbackQueue = const PlaybackQueueState();
   var _accent = AppAccent.white;
+  var _style = LiveWidgetStyle.classic;
   var _strings = const AppStrings(AppLanguage.spanish);
   String? _currentLiveItemId;
   var _operationGeneration = 0;
@@ -295,10 +311,12 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
     _client = ref.watch(liveOverlayClientProvider);
     _artworkLoader = ref.watch(liveOverlayArtworkLoaderProvider);
     _accent = ref.read(liveOverlayAccentProvider);
+    _style = ref.read(liveOverlayStyleProvider);
     _strings = ref.read(appStringsProvider);
     _liveQueue =
         ref.read(tiktokLiveControllerProvider).value?.liveQueue ?? const [];
     _playback = ref.read(playerControllerProvider).value;
+    _playbackQueue = ref.read(playbackQueueProvider);
     _rebuildQueue(publish: false);
 
     ref.listen<AsyncValue<TikTokLiveState>>(tiktokLiveControllerProvider, (
@@ -314,9 +332,18 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
       _playback = next.value;
       _rebuildQueue();
     });
+    ref.listen<PlaybackQueueState>(playbackQueueProvider, (_, next) {
+      _playbackQueue = next;
+      _rebuildQueue();
+    });
     ref.listen<AppAccent>(liveOverlayAccentProvider, (_, next) {
       if (_accent == next) return;
       _accent = next;
+      _rebuildQueue();
+    });
+    ref.listen<LiveWidgetStyle>(liveOverlayStyleProvider, (_, next) {
+      if (_style == next) return;
+      _style = next;
       _rebuildQueue();
     });
     ref.listen<AppStrings>(appStringsProvider, (_, next) {
@@ -326,6 +353,7 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
     });
     ref.onDispose(() {
       _disposed = true;
+      _releaseBroadcastSubscription();
       unawaited(_client.dispose());
     });
     return const LiveOverlaySnapshot();
@@ -333,6 +361,13 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
 
   Future<void> start() async {
     if (state.isActive || state.isBusy) return;
+    // Riverpod pauses a provider with no visible listeners. A running browser
+    // source must still receive playback and appearance changes after Settings
+    // closes, so retain the subscription only for the server's active lifetime.
+    _broadcastSubscription ??= ref.container.listen(
+      liveOverlayControllerProvider,
+      (_, _) {},
+    );
     final operation = ++_operationGeneration;
     state = const LiveOverlaySnapshot(status: LiveOverlayStatus.starting);
     _scheduleArtworkResolution();
@@ -349,6 +384,7 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
             : LiveOverlayStatus.error,
         error: _messageFor(error, stackTrace),
       );
+      _releaseBroadcastSubscription();
     }
   }
 
@@ -367,6 +403,7 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
       await _client.stop();
       if (_disposed || operation != _operationGeneration) return;
       state = const LiveOverlaySnapshot();
+      _releaseBroadcastSubscription();
     } catch (error, stackTrace) {
       if (_disposed || operation != _operationGeneration) return;
       state = LiveOverlaySnapshot(
@@ -377,20 +414,31 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
     }
   }
 
+  void _releaseBroadcastSubscription() {
+    final subscription = _broadcastSubscription;
+    _broadcastSubscription = null;
+    subscription?.close();
+  }
+
   void _rebuildQueue({bool publish = true}) {
+    final isLiveQueueActive = ref
+        .read(playerControllerProvider.notifier)
+        .isLiveQueueActive;
     if (_currentLiveItemId != null &&
         !_liveQueue.any((item) => item.id == _currentLiveItemId)) {
       _currentLiveItemId = null;
     }
-    final selection = selectLiveOverlayQueue(
-      _liveQueue,
-      playback: _playback,
-      isLiveQueueActive: ref
-          .read(playerControllerProvider.notifier)
-          .isLiveQueueActive,
-      previousCurrentItemId: _currentLiveItemId,
-    );
-    _currentLiveItemId = selection.currentItemId;
+    final selection = isLiveQueueActive
+        ? selectLiveOverlayQueue(
+            _liveQueue,
+            playback: _playback,
+            isLiveQueueActive: true,
+            previousCurrentItemId: _currentLiveItemId,
+          )
+        : selectPlaybackOverlayQueue(_playbackQueue, playback: _playback);
+    if (isLiveQueueActive) {
+      _currentLiveItemId = selection.currentItemId;
+    }
     final next = List<LiveOverlayQueueEntry>.unmodifiable(
       selection.entries.map((entry) {
         final source = entry.artworkSource;
@@ -400,7 +448,9 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
         return entry.withArtworkDataUri(_resolvedArtwork[source]);
       }),
     );
-    final nextAppearance = _currentAppearance();
+    final nextAppearance = _currentAppearance(
+      hasCurrentItem: selection.currentItemId != null,
+    );
     if (_sameQueue(_latestQueue, next) && _latestAppearance == nextAppearance) {
       return;
     }
@@ -466,26 +516,29 @@ class LiveOverlayController extends Notifier<LiveOverlaySnapshot> {
     }
   }
 
-  LiveOverlayAppearance _currentAppearance() {
-    var durationMilliseconds = _currentLiveItemId == null
-        ? 0
-        : _playback?.duration?.inMilliseconds ?? 0;
-    var positionMilliseconds = _currentLiveItemId == null
-        ? 0
-        : _playback?.position.inMilliseconds ?? 0;
+  LiveOverlayAppearance _currentAppearance({required bool hasCurrentItem}) {
+    // The selected queue owns the progress; the remembered LIVE cursor is
+    // independent and may be absent or retained during normal playback.
+    var durationMilliseconds = hasCurrentItem
+        ? _playback?.duration?.inMilliseconds ?? 0
+        : 0;
+    var positionMilliseconds = hasCurrentItem
+        ? _playback?.position.inMilliseconds ?? 0
+        : 0;
     if (durationMilliseconds < 0) durationMilliseconds = 0;
     if (positionMilliseconds < 0) positionMilliseconds = 0;
     if (durationMilliseconds > 0 &&
         positionMilliseconds > durationMilliseconds) {
       positionMilliseconds = durationMilliseconds;
     }
-    final progress = durationMilliseconds <= 0 || _currentLiveItemId == null
+    final progress = durationMilliseconds <= 0
         ? 0
         : ((positionMilliseconds.clamp(0, durationMilliseconds) * 1000) /
                   durationMilliseconds)
               .round()
               .clamp(0, 1000);
     return LiveOverlayAppearance(
+      style: _style,
       accentSeedArgb: _accent.seedColor.toARGB32(),
       accentDarkArgb: _accent.darkColor.toARGB32(),
       playbackProgressPermille: progress,
@@ -639,7 +692,7 @@ LiveOverlayQueueSelection selectLiveOverlayQueue(
             title: item.displayTitle,
             artist: local?.artist ?? remote?.artist ?? '',
             status: isLiveQueueActive && item.id == currentItemId
-                ? 'playing'
+                ? playback?.status.name ?? item.status.name
                 : item.status.name,
             artworkSource: artwork?.trim().isEmpty ?? true
                 ? null
@@ -650,6 +703,51 @@ LiveOverlayQueueSelection selectLiveOverlayQueue(
   return LiveOverlayQueueSelection(
     entries: entries,
     currentItemId: currentItemId,
+  );
+}
+
+LiveOverlayQueueSelection selectPlaybackOverlayQueue(
+  PlaybackQueueState queue, {
+  PlayerSnapshot? playback,
+}) {
+  final items = queue.entries;
+  if (items.isEmpty) {
+    return const LiveOverlayQueueSelection(entries: <LiveOverlayQueueEntry>[]);
+  }
+
+  var startIndex = queue.currentIndex;
+  if (startIndex < 0 || startIndex >= items.length) {
+    final trackId = playback?.trackId;
+    startIndex = trackId == null
+        ? 0
+        : items.indexWhere(
+            (item) => item.id == trackId || item.logicalEntryId == trackId,
+          );
+    if (startIndex < 0) startIndex = 0;
+  }
+
+  final current = items[startIndex];
+  final entries = List<LiveOverlayQueueEntry>.unmodifiable(
+    items.skip(startIndex).take(liveOverlayMaximumItems).map((item) {
+      final artwork = item.thumbnailUrl?.trim();
+      return LiveOverlayQueueEntry(
+        id: item.logicalEntryId?.trim().isNotEmpty == true
+            ? item.logicalEntryId!.trim()
+            : item.id,
+        title: item.title,
+        artist: item.artist,
+        status: item.id == current.id
+            ? playback?.status.name ?? 'playing'
+            : 'queued',
+        artworkSource: artwork == null || artwork.isEmpty ? null : artwork,
+      );
+    }),
+  );
+  return LiveOverlayQueueSelection(
+    entries: entries,
+    currentItemId: current.logicalEntryId?.trim().isNotEmpty == true
+        ? current.logicalEntryId!.trim()
+        : current.id,
   );
 }
 

@@ -58,6 +58,9 @@ enum AudioStreamSource {
 
   /// An InnerTube client selected after the default path was rejected.
   innerTubeFallback,
+
+  /// A verified higher-quality rendition of the same catalog recording.
+  jioSaavn,
 }
 
 /// Controls which portion of a resolver chain may be used.
@@ -94,6 +97,9 @@ class AudioStreamResolution {
     this.videoId,
     this.formatId,
     this.codec,
+    this.bitrate,
+    this.sampleRate,
+    this.channels,
     this.clientProfileKey,
     this.expiresAt,
   });
@@ -122,6 +128,15 @@ class AudioStreamResolution {
   /// Codec reported by the extractor (for example `mp4a.40.2` or `opus`).
   final String? codec;
 
+  /// Bitrate in bits per second of the selected audio format, if reported.
+  final int? bitrate;
+
+  /// Sample rate in hertz of the selected audio format, if reported.
+  final int? sampleRate;
+
+  /// Number of audio channels of the selected format, if reported.
+  final int? channels;
+
   /// Exact InnerTube client profile that produced the signed media URL.
   final String? clientProfileKey;
 
@@ -144,6 +159,9 @@ class AudioStreamResolution {
       videoId: videoId,
       formatId: formatId,
       codec: codec,
+      bitrate: bitrate,
+      sampleRate: sampleRate,
+      channels: channels,
       clientProfileKey: clientProfileKey,
       expiresAt: expiresAt,
     );
@@ -164,6 +182,9 @@ class AudioStreamResolution {
       videoId: track.id.isEmpty ? null : track.id,
       formatId: track.streamFormatId,
       codec: track.streamCodec,
+      bitrate: track.streamBitrate,
+      sampleRate: track.streamSampleRate,
+      channels: track.streamChannels,
       clientProfileKey: track.streamClientProfileKey,
     );
   }

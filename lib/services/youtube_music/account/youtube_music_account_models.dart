@@ -7,7 +7,15 @@ library;
 
 enum RemotePlaylistVisibility { private, unlisted, public, unknown }
 
-enum RemotePaginationTermination { exhausted, repeatedContinuation, pageLimit }
+enum RemotePaginationTermination {
+  exhausted,
+  repeatedContinuation,
+  pageLimit,
+
+  /// The server returned an unknown or non-progressing collection page. Never
+  /// interpret this as remote removals or a successfully exhausted playlist.
+  invalidResponse,
+}
 
 class RemoteAccountProfile {
   const RemoteAccountProfile({
@@ -183,6 +191,8 @@ class RemotePlaylistSnapshot {
   final RemotePaginationTermination termination;
   final int pagesFetched;
 
+  /// Header counts may include tracks hidden by YouTube. The gateway validates
+  /// the page sequence before reporting an exhausted snapshot.
   bool get isComplete => termination == RemotePaginationTermination.exhausted;
 }
 

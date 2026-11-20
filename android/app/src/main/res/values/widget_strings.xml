@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="widget_glass_name" translatable="false">IVG Music · Liquid Glass</string>
+    <string name="widget_player_name">IVG Music</string>
+    <string name="widget_description">IVG Music: canción actual y controles</string>
+    <string name="widget_artwork_description">Portada de la canción</string>
+    <string name="widget_previous">Anterior</string>
+    <string name="widget_play_pause">Reproducir o pausar</string>
+    <string name="widget_next">Siguiente</string>
+    <string name="widget_repeat">Repetir</string>
+    <string name="widget_repeat_all">Repetir cola</string>
+    <string name="widget_repeat_one">Repetir canciÃ³n</string>
+    <string name="widget_favorite">Favoritos</string>
+    <string name="widget_queue_title">Cola de reproducción</string>
+    <string name="widget_queue_empty">No hay canciones en la cola</string>
+    <string name="widget_loading">Cargando canción</string>
+</resources>

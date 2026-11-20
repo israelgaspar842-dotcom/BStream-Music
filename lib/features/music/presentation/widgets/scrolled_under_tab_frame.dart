@@ -2,11 +2,12 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart'
-    show ScrollCacheExtent, SliverPaintOrder;
+    show ScrollCacheExtent, ScrollDirection, SliverPaintOrder;
 
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_ui.dart';
 import '../../../../core/widgets/liquid_glass_surface.dart';
+import 'surface_detail_app_bar.dart';
 
 /// Pinned title bars need a little more optical depth than floating pills so
 /// text stays legible while rows and artwork move directly behind them.
@@ -22,6 +23,8 @@ class ScrolledUnderTabFrame extends StatefulWidget {
     this.surfaceKey,
     this.pinnedFooter,
     this.pinnedFooterSurfaceKey,
+    this.pinnedFooterHasOwnSurface = false,
+    this.hidePinnedFooterOnScroll = false,
     this.scrollKey,
     this.scrollCacheExtent,
     this.headerTransitionKey,
@@ -35,6 +38,11 @@ class ScrolledUnderTabFrame extends StatefulWidget {
   final Key? surfaceKey;
   final Widget? pinnedFooter;
   final Key? pinnedFooterSurfaceKey;
+
+  /// A rounded input can supply its own fill and backdrop instead of painting
+  /// another full-width surface underneath it.
+  final bool pinnedFooterHasOwnSurface;
+  final bool hidePinnedFooterOnScroll;
   final Key? scrollKey;
   final ScrollCacheExtent? scrollCacheExtent;
   final Key? headerTransitionKey;
@@ -47,8 +55,25 @@ class ScrolledUnderTabFrame extends StatefulWidget {
 
 class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
   bool _scrolledUnder = false;
+  bool _footerVisible = true;
+  final GlassScrollMotionNotifier _glassScrollMotion =
+      GlassScrollMotionNotifier();
+
+  @override
+  void dispose() {
+    _glassScrollMotion.dispose();
+    super.dispose();
+  }
 
   bool _handleScrollNotification(ScrollNotification notification) {
+    _glassScrollMotion.handleNotification(notification);
+    if (widget.hidePinnedFooterOnScroll &&
+        notification.depth == 0 &&
+        notification.metrics.axis == Axis.vertical &&
+        notification is UserScrollNotification &&
+        notification.direction != ScrollDirection.idle) {
+      _setFooterVisible(notification.direction == ScrollDirection.forward);
+    }
     if (notification.depth == 0 && notification is ScrollUpdateNotification) {
       _updateFromMetrics(notification.metrics);
     }
@@ -63,6 +88,9 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
   }
 
   void _updateFromMetrics(ScrollMetrics metrics) {
+    if (widget.hidePinnedFooterOnScroll && metrics.extentBefore <= 0) {
+      _setFooterVisible(true);
+    }
     final next = switch (metrics.axisDirection) {
       AxisDirection.down => metrics.extentBefore > 0,
       AxisDirection.up => metrics.extentAfter > 0,
@@ -70,6 +98,11 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
     };
     if (next == _scrolledUnder || !mounted) return;
     setState(() => _scrolledUnder = next);
+  }
+
+  void _setFooterVisible(bool visible) {
+    if (!mounted || _footerVisible == visible) return;
+    setState(() => _footerVisible = visible);
   }
 
   Widget _buildHeaderSurface(
@@ -115,13 +148,18 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
       return surface;
     }
     if (mode.isLiquidGlass) {
-      return LiquidGlassSurface(
-        key: const ValueKey('tab-header-liquid-glass'),
-        borderRadius: BorderRadius.zero,
-        blurSigma: 8,
-        intensity: tabHeaderLiquidGlassIntensity,
-        edgeTreatment: LiquidGlassEdgeTreatment.bottom,
+      return ValueListenableBuilder<bool>(
+        valueListenable: _glassScrollMotion,
         child: surface,
+        builder: (context, moving, child) => LiquidGlassSurface(
+          key: const ValueKey('tab-header-liquid-glass'),
+          borderRadius: BorderRadius.zero,
+          blurSigma: 8,
+          intensity: tabHeaderLiquidGlassIntensity,
+          edgeTreatment: LiquidGlassEdgeTreatment.bottom,
+          backdropMotion: moving,
+          child: child!,
+        ),
       );
     }
     return ClipRect(
@@ -137,6 +175,13 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
     Widget footer, {
     required Duration animationDuration,
   }) {
+    if (widget.pinnedFooterHasOwnSurface) {
+      return Material(
+        key: widget.pinnedFooterSurfaceKey,
+        color: Colors.transparent,
+        child: footer,
+      );
+    }
     final mode = AppColors.surfaceBackgroundModeFor(context);
     final liquidGlass = mode.isLiquidGlass;
     final surface = Material(
@@ -197,7 +242,7 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
         key: ValueKey('scrolled-under-tab-hidden-header'),
       ),
     };
-    final pinnedFooter = switch (widget.pinnedFooter) {
+    final footerSurface = switch (widget.pinnedFooter) {
       final footer? => _buildPinnedFooterSurface(
         context,
         footer,
@@ -205,6 +250,31 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
       ),
       null => null,
     };
+    final pinnedFooter = footerSurface == null
+        ? null
+        : !widget.hidePinnedFooterOnScroll
+        ? footerSurface
+        : ClipRect(
+            child: AnimatedSize(
+              key: const ValueKey('tab-floating-footer'),
+              duration: disableAnimations
+                  ? Duration.zero
+                  : const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.topCenter,
+              child: Align(
+                alignment: Alignment.topCenter,
+                heightFactor: _footerVisible ? 1 : 0,
+                child: IgnorePointer(
+                  ignoring: !_footerVisible,
+                  child: ExcludeSemantics(
+                    excluding: !_footerVisible,
+                    child: footerSurface,
+                  ),
+                ),
+              ),
+            ),
+          );
 
     final hasHeaderTransition =
         widget.headerTransitionKey != null ||
@@ -259,15 +329,22 @@ class _ScrolledUnderTabFrameState extends State<ScrolledUnderTabFrame> {
         onNotification: _handleMetricsNotification,
         child: NotificationListener<ScrollNotification>(
           onNotification: _handleScrollNotification,
-          child: CustomScrollView(
-            key: widget.scrollKey,
-            scrollCacheExtent: widget.scrollCacheExtent,
-            // The first sliver paints last, keeping pinned chrome above rows.
-            paintOrder: SliverPaintOrder.firstIsTop,
-            slivers: [
-              if (pinnedHeader != null) PinnedHeaderSliver(child: pinnedHeader),
-              ...widget.slivers,
-            ],
+          child: LiquidGlassMotionScope(
+            motion: _glassScrollMotion,
+            child: CustomScrollView(
+              key: widget.scrollKey,
+              scrollCacheExtent: widget.scrollCacheExtent,
+              keyboardDismissBehavior: widget.hidePinnedFooterOnScroll
+                  ? ScrollViewKeyboardDismissBehavior.onDrag
+                  : ScrollViewKeyboardDismissBehavior.manual,
+              // The first sliver paints last, keeping pinned chrome above rows.
+              paintOrder: SliverPaintOrder.firstIsTop,
+              slivers: [
+                if (pinnedHeader != null)
+                  PinnedHeaderSliver(child: pinnedHeader),
+                ...widget.slivers,
+              ],
+            ),
           ),
         ),
       ),

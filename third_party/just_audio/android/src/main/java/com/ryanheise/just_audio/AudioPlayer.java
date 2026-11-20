@@ -1,6 +1,8 @@
 package com.ryanheise.just_audio;
 
 import android.content.Context;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.media.audiofx.AudioEffect;
 import android.media.audiofx.Equalizer;
 import android.media.audiofx.LoudnessEnhancer;
@@ -29,6 +31,7 @@ import androidx.media3.common.AudioAttributes;
 import androidx.media3.exoplayer.NoSampleRenderer;
 import androidx.media3.exoplayer.Renderer;
 import androidx.media3.exoplayer.RenderersFactory;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.extractor.DefaultExtractorsFactory;
@@ -71,6 +74,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.WeakHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AudioPlayer implements MethodCallHandler, Player.Listener, MetadataOutput {
     public static final int ERROR_ABORT = 10000000;
@@ -82,6 +87,35 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private static final long SKIPPED_POSITION_DRIFT_THRESHOLD_MS = 200L;
 
     private static Random random = new Random();
+
+    // BStream's music/crossfade engines share an explicit media-device preference.
+    // Weak keys never keep released Flutter players alive. No communication-mode,
+    // SCO, speakerphone or global Bluetooth state is changed here.
+    private static final WeakHashMap<AudioPlayer, Boolean> bstreamPlayers = new WeakHashMap<>();
+    private static Integer bstreamPreferredDeviceId;
+
+    public static Integer getBStreamPreferredAudioDeviceId() {
+        return bstreamPreferredDeviceId;
+    }
+
+    public static boolean setBStreamPreferredAudioDevice(Context context, Integer deviceId) {
+        AudioDeviceInfo device = findBStreamAudioDevice(context, deviceId);
+        if (deviceId != null && device == null) return false;
+        bstreamPreferredDeviceId = deviceId;
+        for (AudioPlayer instance : new ArrayList<>(bstreamPlayers.keySet())) {
+            if (instance.player != null) instance.player.setPreferredAudioDevice(device);
+        }
+        return true;
+    }
+
+    private static AudioDeviceInfo findBStreamAudioDevice(Context context, Integer deviceId) {
+        if (deviceId == null || Build.VERSION.SDK_INT < 23) return null;
+        AudioManager manager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        for (AudioDeviceInfo device : manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+            if (device.getId() == deviceId && device.isSink()) return device;
+        }
+        return null;
+    }
 
     private final Context context;
     private final MethodChannel methodChannel;
@@ -108,6 +142,13 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private List<Object> rawAudioEffects;
     private List<AudioEffect> audioEffects = new ArrayList<AudioEffect>();
     private Map<String, AudioEffect> audioEffectsMap = new HashMap<String, AudioEffect>();
+    private final BStreamEqualizerConfiguration bstreamEqualizer = new BStreamEqualizerConfiguration();
+    private boolean bstreamEqualizerRegistered;
+    private BStreamAudioRenderersFactory bstreamRenderersFactory;
+    private AudioSink.AudioTrackConfig lastAudioTrackConfig;
+    private PlaybackParameters bstreamPlaybackParameters = PlaybackParameters.DEFAULT;
+    private final AtomicBoolean bstreamEqualizerStatusPending = new AtomicBoolean();
+    private volatile boolean bstreamEqualizerDisposed;
     private int lastPlaylistLength = 0;
     private Map<String, Object> pendingPlaybackEvent;
 
@@ -130,7 +171,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             long now = System.currentTimeMillis();
             long newBufferedPosition = player.getBufferedPosition();
             boolean bufferBroadcastDue = newBufferedPosition != bufferedPosition
-                && (lastBufferPositionBroadcastTime == 0L
+                && (!player.isLoading()
+                    || lastBufferPositionBroadcastTime == 0L
                     || now < lastBufferPositionBroadcastTime
                     || now - lastBufferPositionBroadcastTime
                         >= BUFFER_POSITION_BROADCAST_INTERVAL_MS);
@@ -147,15 +189,16 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 handler.postDelayed(this, 200);
                 break;
             case Player.STATE_READY:
-                if (player.getPlayWhenReady()) {
-                    handler.postDelayed(
-                        this,
-                        skipSilenceEnabled
-                            ? SKIPPED_POSITION_POLL_INTERVAL_MS
-                            : BUFFER_POSITION_BROADCAST_INTERVAL_MS);
-                } else {
-                    handler.postDelayed(this, 1000);
+                if (player.getPlayWhenReady() && skipSilenceEnabled) {
+                    handler.postDelayed(this, SKIPPED_POSITION_POLL_INTERVAL_MS);
+                } else if (player.isLoading()) {
+                    handler.postDelayed(this, BUFFER_POSITION_BROADCAST_INTERVAL_MS);
                 }
+                // A paused standby or a deck whose buffer is not changing has
+                // nothing to publish. Media3's loading callback restarts this
+                // watcher when it refills; Dart extrapolates ordinary position
+                // independently. Silence skipping still samples the native
+                // clock while the active deck is playing.
                 break;
             default:
                 // Stop watching buffer
@@ -174,7 +217,16 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         boolean useLazyPreparation
     ) {
         this.context = applicationContext;
+        bstreamPlayers.put(this, Boolean.TRUE);
         this.rawAudioEffects = rawAudioEffects;
+        for (Object rawAudioEffect : rawAudioEffects) {
+            Map<?, ?> effect = (Map<?, ?>)rawAudioEffect;
+            if ("bstreamAudioEqualizer".equals(effect.get("type"))) {
+                bstreamEqualizerRegistered = true;
+                bstreamEqualizer.configure(Boolean.TRUE.equals(effect.get("enabled")),
+                        effect.get("gainsDb") == null ? new double[BStreamEqualizerConfiguration.FREQUENCIES.length] : decodeEqualizerGains(effect.get("gainsDb")));
+            }
+        }
         this.offloadSchedulingEnabled = offloadSchedulingEnabled != null ? offloadSchedulingEnabled : false;
         this.useLazyPreparation = useLazyPreparation;
 
@@ -199,6 +251,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         methodChannel.setMethodCallHandler(this);
         eventChannel = new BetterEventChannel(messenger, "com.ryanheise.just_audio.events." + id);
         dataEventChannel = new BetterEventChannel(messenger, "com.ryanheise.just_audio.data." + id);
+        bstreamEqualizer.setStatusListener(this::publishBstreamEqualizerStatus);
         processingState = ProcessingState.idle;
         if (audioLoadConfiguration != null) {
             Map<?, ?> loadControlMap = (Map<?, ?>)audioLoadConfiguration.get("androidLoadControl");
@@ -247,6 +300,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (this.audioSessionId != null) {
             for (Object rawAudioEffect : rawAudioEffects) {
                 Map<?, ?> json = (Map<?, ?>)rawAudioEffect;
+                // BStream's DSP lives in the PCM sink, independently from
+                // audio-session effects, ownership and OEM AudioFX support.
+                if ("bstreamAudioEqualizer".equals(json.get("type"))) continue;
                 AudioEffect audioEffect = decodeAudioEffect(rawAudioEffect, this.audioSessionId);
                 if ((Boolean)json.get("enabled")) {
                     audioEffect.setEnabled(true);
@@ -385,6 +441,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             return true;
         }
         return false;
+    }
+
+    @Override
+    public void onIsLoadingChanged(boolean isLoading) {
+        // Also take the final sample when loading stops. The watcher bypasses
+        // its rate limit for this sample, then sleeps until a refill, play or
+        // silence-option change needs it again.
+        startWatchingBuffer();
     }
 
     @Override
@@ -598,6 +662,15 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 break;
             case "androidEqualizerGetParameters":
                 result.success(equalizerAudioEffectGetParameters());
+                break;
+            case "bstreamEqualizerConfigure":
+                bstreamEqualizer.configure(Boolean.TRUE.equals(call.argument("enabled")),
+                        decodeEqualizerGains(call.argument("gainsDb")));
+                result.success(bstreamEqualizerStatus());
+                methodChannel.invokeMethod("bstreamEqualizerStatusChanged", bstreamEqualizerStatus());
+                break;
+            case "bstreamEqualizerReadStatus":
+                result.success(bstreamEqualizerStatus());
                 break;
             case "androidEqualizerBandSetGain":
                 equalizerBandSetGain(call.argument("bandIndex"), call.argument("gain"));
@@ -830,7 +903,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private void ensurePlayerInitialized() {
         if (player == null) {
             RenderersFactory renderersFactory = (eventHandler, videoListener, audioListener, textOutput, metadataOutput) -> {
-                DefaultRenderersFactory defaultRenderersFactory = new DefaultRenderersFactory(context) {
+                DefaultRenderersFactory defaultRenderersFactory = bstreamEqualizerRegistered
+                        ? new BStreamAudioRenderersFactory(context, bstreamEqualizer)
+                        : new DefaultRenderersFactory(context) {
                     @Override
                     protected AudioSink buildAudioSink(
                             Context context,
@@ -843,6 +918,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                             .build();
                     }
                 };
+                if (defaultRenderersFactory instanceof BStreamAudioRenderersFactory) {
+                    bstreamRenderersFactory = (BStreamAudioRenderersFactory) defaultRenderersFactory;
+                }
                 Renderer[] defaultRenderers = defaultRenderersFactory
                     .createRenderers(eventHandler, videoListener, audioListener, textOutput, metadataOutput);
                 Renderer[] allRenderers = Arrays.copyOf(defaultRenderers, defaultRenderers.length + 1);
@@ -858,10 +936,27 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 builder.setLivePlaybackSpeedControl(livePlaybackSpeedControl);
             }
             player = builder.build();
+            if (bstreamEqualizerRegistered) {
+                player.addAnalyticsListener(new AnalyticsListener() {
+                    @Override
+                    public void onAudioTrackInitialized(
+                            EventTime eventTime, AudioSink.AudioTrackConfig audioTrackConfig) {
+                        lastAudioTrackConfig = audioTrackConfig;
+                    }
+                });
+            }
+            player.setPreferredAudioDevice(findBStreamAudioDevice(context, bstreamPreferredDeviceId));
             player.setTrackSelectionParameters(
                 player.getTrackSelectionParameters()
                     .buildUpon()
-                    .setAudioOffloadPreferences(audioOffloadPreferences)
+                    // This engine is audio-only, even when a resolver returns
+                    // a muxed source. Canvas/artwork use their own video player.
+                    .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+                    .setAudioOffloadPreferences(bstreamEqualizerRegistered
+                        ? new AudioOffloadPreferences.Builder()
+                            .setAudioOffloadMode(AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED)
+                            .build()
+                        : audioOffloadPreferences)
                     .build()
             );
             setAudioSessionId(player.getAudioSessionId());
@@ -896,6 +991,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     private Map<String, Object> equalizerAudioEffectGetParameters() {
         Equalizer equalizer = (Equalizer)audioEffectsMap.get("AndroidEqualizer");
+        if (equalizer == null) throw new IllegalStateException("AndroidEqualizer is unavailable");
         ArrayList<Object> rawBands = new ArrayList<>();
         for (short i = 0; i < equalizer.getNumberOfBands(); i++) {
             rawBands.add(mapOf(
@@ -915,8 +1011,61 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         );
     }
 
+    private static double[] decodeEqualizerGains(Object raw) {
+        if (!(raw instanceof List) || ((List<?>)raw).size() != BStreamEqualizerConfiguration.FREQUENCIES.length) {
+            throw new IllegalArgumentException("Equalizer needs ten gains");
+        }
+        double[] gains = new double[BStreamEqualizerConfiguration.FREQUENCIES.length];
+        for (int i = 0; i < gains.length; i++) {
+            Object value = ((List<?>)raw).get(i);
+            if (!(value instanceof Number)) throw new IllegalArgumentException("Invalid EQ gain");
+            gains[i] = ((Number)value).doubleValue();
+        }
+        return gains;
+    }
+
+    private Map<String, Object> bstreamEqualizerStatus() {
+        BStreamEqualizerConfiguration.Snapshot settings = bstreamEqualizer.snapshot();
+        ArrayList<Object> bands = new ArrayList<>();
+        for (int i = 0; i < settings.gainsDb.length; i++) {
+            double center = BStreamEqualizerConfiguration.FREQUENCIES[i];
+            bands.add(mapOf("index", i, "centerFrequency", center,
+                    "lowerFrequency", i == 0 ? 20.0 : Math.sqrt(
+                            BStreamEqualizerConfiguration.FREQUENCIES[i - 1] * center),
+                    "upperFrequency", i == settings.gainsDb.length - 1 ? 20000.0 : Math.sqrt(
+                            BStreamEqualizerConfiguration.FREQUENCIES[i + 1] * center),
+                    "gain", settings.gainsDb[i]));
+        }
+        boolean supported = bstreamEqualizerRegistered && bstreamEqualizer.isAvailable();
+        return mapOf("supported", supported, "enabled", supported && settings.active(),
+                "configured", bstreamEqualizer.isConfigured(), "hasControl", true,
+                "engine", "bstream-dsp", "preampDb", supported && settings.active() ? settings.preampDb : 0.0,
+                "error", bstreamEqualizer.failure(),
+                "processedFrames", bstreamEqualizer.processedFrames(),
+                "sampleRate", bstreamEqualizer.sampleRate(),
+                "channelCount", bstreamEqualizer.channelCount(),
+                "pcmEncoding", bstreamEqualizer.encoding(),
+                "lastAudioTrackEncoding", lastAudioTrackConfig == null ? 0 : lastAudioTrackConfig.encoding,
+                "lastAudioTrackSampleRate", lastAudioTrackConfig == null ? 0 : lastAudioTrackConfig.sampleRate,
+                "revision", settings.revision, "appliedRevision", bstreamEqualizer.appliedRevision(),
+                "parameters", mapOf("minDecibels", -12.0, "maxDecibels", 12.0, "bands", bands));
+    }
+
+    private void publishBstreamEqualizerStatus() {
+        if (!bstreamEqualizerRegistered || bstreamEqualizerDisposed ||
+                !bstreamEqualizerStatusPending.compareAndSet(false, true)) return;
+        handler.post(() -> {
+            bstreamEqualizerStatusPending.set(false);
+            if (!bstreamEqualizerDisposed) {
+                methodChannel.invokeMethod("bstreamEqualizerStatusChanged", bstreamEqualizerStatus());
+            }
+        });
+    }
+
     private void equalizerBandSetGain(int bandIndex, double gain) {
-        ((Equalizer)audioEffectsMap.get("AndroidEqualizer")).setBandLevel((short)bandIndex, (short)(Math.round(gain * 100.0))); // target gain needs to be provided in milliBel, the user provides the value in deciBel
+        Equalizer equalizer = (Equalizer)audioEffectsMap.get("AndroidEqualizer");
+        if (equalizer == null) throw new IllegalStateException("AndroidEqualizer is unavailable");
+        equalizer.setBandLevel((short)bandIndex, (short)(Math.round(gain * 100.0))); // target gain needs to be provided in milliBel, the user provides the value in deciBel
     }
 
     /// Creates an event based on the current state.
@@ -1057,6 +1206,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         player.setPlayWhenReady(false);
         updatePosition();
         enqueuePlaybackEvent();
+        startWatchingBuffer();
         if (playResult != null) {
             playResult.success(new HashMap<String, Object>());
             playResult = null;
@@ -1068,27 +1218,46 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     public void setSpeed(final float speed) {
-        PlaybackParameters params = player.getPlaybackParameters();
+        PlaybackParameters params = bstreamEqualizerRegistered
+                ? bstreamPlaybackParameters : player.getPlaybackParameters();
         if (params.speed == speed) return;
-        player.setPlaybackParameters(new PlaybackParameters(speed, params.pitch));
+        bstreamPlaybackParameters = new PlaybackParameters(speed, params.pitch);
+        player.setPlaybackParameters(bstreamPlaybackParameters);
+        updateBStreamOutputPolicy();
         if (player.getPlayWhenReady())
             updatePosition();
         enqueuePlaybackEvent();
     }
 
     public void setPitch(final float pitch) {
-        PlaybackParameters params = player.getPlaybackParameters();
+        PlaybackParameters params = bstreamEqualizerRegistered
+                ? bstreamPlaybackParameters : player.getPlaybackParameters();
         if (params.pitch == pitch) return;
-        player.setPlaybackParameters(new PlaybackParameters(params.speed, pitch));
+        bstreamPlaybackParameters = new PlaybackParameters(params.speed, pitch);
+        player.setPlaybackParameters(bstreamPlaybackParameters);
+        updateBStreamOutputPolicy();
         enqueuePlaybackEvent();
     }
 
     public void setSkipSilenceEnabled(final boolean enabled) {
         player.setSkipSilenceEnabled(enabled);
         skipSilenceEnabled = enabled;
+        updateBStreamOutputPolicy();
         updatePosition();
         enqueuePlaybackEvent();
         startWatchingBuffer();
+    }
+
+    private void updateBStreamOutputPolicy() {
+        if (bstreamRenderersFactory == null) return;
+        if (bstreamRenderersFactory.setPlaybackProcessing(skipSilenceEnabled, bstreamPlaybackParameters)
+                && player.getPlaybackState() != Player.STATE_IDLE) {
+            // A prepared AudioTrack cannot switch precision in place. Media3
+            // retains the current item, position, play intent and playlist.
+            updatePosition();
+            player.stop();
+            player.prepare();
+        }
     }
 
     public void setLoopMode(final int mode) {
@@ -1118,6 +1287,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     public void dispose() {
+        bstreamEqualizerDisposed = true;
+        bstreamEqualizer.setStatusListener(null);
+        bstreamPlayers.remove(this);
         if (processingState == ProcessingState.loading) {
             abortExistingConnection(true);
         }
@@ -1133,6 +1305,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             processingState = ProcessingState.idle;
             broadcastImmediatePlaybackEvent();
         }
+        handler.removeCallbacks(bufferWatcher);
         eventChannel.endOfStream();
         dataEventChannel.endOfStream();
     }

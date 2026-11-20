@@ -16,48 +16,109 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 void main() {
   setUpAll(sqfliteFfiInit);
 
-  test('fresh v8 contains catalog and sync schema', () async {
-    final sandbox = await Directory.systemTemp.createTemp('bstream-v8-fresh-');
-    final service = _TestDatabase(p.join(sandbox.path, 'library.db'));
-    addTearDown(() async {
-      await service.close();
-      await sandbox.delete(recursive: true);
-    });
+  test(
+    'fresh database contains catalog, sync, ordering, and artwork schema',
+    () async {
+      final sandbox = await Directory.systemTemp.createTemp(
+        'bstream-v10-fresh-',
+      );
+      final service = _TestDatabase(p.join(sandbox.path, 'library.db'));
+      addTearDown(() async {
+        await service.close();
+        await sandbox.delete(recursive: true);
+      });
 
-    final db = await service.database;
-    expect(await db.getVersion(), AppConstants.databaseVersion);
-    expect(AppConstants.databaseVersion, 8);
-    final tables = (await db.rawQuery(
-      "SELECT name FROM sqlite_master WHERE type = 'table'",
-    )).map((row) => row['name']).toSet();
-    expect(
-      tables,
-      containsAll(const <String>{
-        'catalog_tracks',
-        'playlist_items',
-        'ytm_playlist_bindings',
-        'ytm_playlist_base_items',
-        'playlist_sync_intents',
-        'playlist_sync_conflicts',
-      }),
-    );
-    final itemColumns = (await db.rawQuery(
-      'PRAGMA table_info(playlist_items)',
-    )).map((row) => row['name']).toSet();
-    expect(
-      itemColumns,
-      containsAll(const <String>{
-        'item_id',
-        'remote_video_id',
-        'remote_set_video_id',
-        'position',
-      }),
-    );
-    final conflictColumns = (await db.rawQuery(
-      'PRAGMA table_info(playlist_sync_conflicts)',
-    )).map((row) => row['name']).toSet();
-    expect(conflictColumns, contains('message'));
-  });
+      final db = await service.database;
+      expect(await db.getVersion(), AppConstants.databaseVersion);
+      expect(AppConstants.databaseVersion, 11);
+      final playlistColumns = (await db.rawQuery(
+        'PRAGMA table_info(playlists)',
+      )).map((row) => row['name']).toSet();
+      expect(playlistColumns, contains('custom_artwork_file_name'));
+      final tables = (await db.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type = 'table'",
+      )).map((row) => row['name']).toSet();
+      expect(
+        tables,
+        containsAll(const <String>{
+          'catalog_tracks',
+          'playlist_items',
+          'ytm_playlist_bindings',
+          'ytm_playlist_base_items',
+          'playlist_sync_intents',
+          'playlist_sync_conflicts',
+          'library_track_order',
+        }),
+      );
+      final itemColumns = (await db.rawQuery(
+        'PRAGMA table_info(playlist_items)',
+      )).map((row) => row['name']).toSet();
+      expect(
+        itemColumns,
+        containsAll(const <String>{
+          'item_id',
+          'remote_video_id',
+          'remote_set_video_id',
+          'position',
+        }),
+      );
+      final conflictColumns = (await db.rawQuery(
+        'PRAGMA table_info(playlist_sync_conflicts)',
+      )).map((row) => row['name']).toSet();
+      expect(conflictColumns, contains('message'));
+    },
+  );
+
+  test(
+    'downloaded song order persists and new tracks remain at the end',
+    () async {
+      final sandbox = await Directory.systemTemp.createTemp(
+        'bstream-library-order-',
+      );
+      final service = _TestDatabase(p.join(sandbox.path, 'library.db'));
+      addTearDown(() async {
+        await service.close();
+        await sandbox.delete(recursive: true);
+      });
+
+      LocalTrack track(String id, int day) => LocalTrack(
+        id: id,
+        title: id,
+        artist: 'Artist',
+        filePath: p.join(sandbox.path, '$id.m4a'),
+        addedAt: DateTime.utc(2025, 1, day),
+      );
+
+      await service.saveLocalTrack(track('first', 1));
+      await service.saveLocalTrack(track('second', 2));
+      await service.saveLocalTrack(track('third', 3));
+      expect(
+        (await service.getLocalTracks()).map((track) => track.id),
+        <String>['third', 'second', 'first'],
+      );
+
+      await service.reorderLocalTracks(<String>['second', 'first', 'third']);
+      expect(
+        (await service.getLocalTracks()).map((track) => track.id),
+        <String>['second', 'first', 'third'],
+      );
+
+      await service.saveLocalTrack(track('new-download', 4));
+      expect(
+        (await service.getLocalTracks()).map((track) => track.id),
+        <String>['second', 'first', 'third', 'new-download'],
+      );
+      await service.deleteLocalTrack('first');
+      expect(
+        (await service.getLocalTracks()).map((track) => track.id),
+        <String>['second', 'third', 'new-download'],
+      );
+      await expectLater(
+        service.reorderLocalTracks(<String>['second', 'second']),
+        throwsArgumentError,
+      );
+    },
+  );
 
   test(
     'playlist updates preserve creation time and revision semantics',
@@ -170,7 +231,10 @@ void main() {
       );
       expect(catalog.entries.last.track.provider, CatalogProvider.legacy);
       expect(catalog.entries.map((entry) => entry.id).toSet(), hasLength(3));
-      expect((await service.database).getVersion(), completion(8));
+      expect(
+        (await service.database).getVersion(),
+        completion(AppConstants.databaseVersion),
+      );
     },
   );
 
@@ -368,6 +432,123 @@ void main() {
       )).single;
       expect(jsonDecode(playlistRow['track_ids']! as String), <String>[
         'download-a',
+      ]);
+    },
+  );
+
+  test(
+    'Favorites commit preserves 1156 downloaded sources and their remote order',
+    () async {
+      final sandbox = await Directory.systemTemp.createTemp(
+        'bstream-favorites-large-downloads-',
+      );
+      final service = _TestDatabase(p.join(sandbox.path, 'library.db'));
+      addTearDown(() async {
+        await service.close();
+        await sandbox.delete(recursive: true);
+      });
+      const count = 1156;
+      final now = DateTime.utc(2026, 11, 6);
+      String videoId(int index) => index.toString().padLeft(11, '0');
+      await service.createCatalogPlaylist(
+        id: Playlist.favoritesId,
+        name: 'Favoritos',
+        now: now,
+      );
+      final db = await service.database;
+      await db.transaction((transaction) async {
+        final batch = transaction.batch();
+        for (var index = 0; index < count; index++) {
+          batch.insert('local_tracks', <String, Object?>{
+            'id': 'download-$index',
+            'title': 'Song $index',
+            'artist': 'Artist',
+            'file_path': p.join(sandbox.path, '$index.m4a'),
+            'source_id': videoId(index),
+            'added_at': now.toIso8601String(),
+          });
+        }
+        await batch.commit(noResult: true);
+      });
+      final store = SqlitePlaylistSyncStore(
+        service,
+        conflictIdFactory: () => 'unused-conflict',
+      );
+      const key = PlaylistSyncKey(
+        accountKey: 'account',
+        playlistId: Playlist.favoritesId,
+      );
+      final before = (await service.getCatalogPlaylist(
+        Playlist.favoritesId,
+      ))!.playlist;
+      await store.upsertBinding(
+        PlaylistSyncBinding(
+          key: key,
+          remotePlaylistId: 'LM',
+          mode: PlaylistSyncMode.automatic,
+          localRevisionAtBase: before.localRevision,
+          createdAt: now,
+          updatedAt: now,
+        ),
+      );
+      // Reverse server order and shift every proposed local ID by one. Source
+      // remapping must resolve all references, including across lookup chunks.
+      final merged = PlaylistSyncSnapshot(
+        remotePlaylistId: 'LM',
+        title: 'Favoritos',
+        items: <PlaylistSyncItem>[
+          for (var index = count - 1; index >= 0; index--)
+            PlaylistSyncItem(
+              localItemId: 'favorite-$index',
+              localTrackId: 'download-${(index + 1) % count}',
+              videoId: videoId(index),
+              setVideoId: 'set-$index',
+              track: CatalogTrack.youtube(
+                videoId: videoId(index),
+                title: 'Song $index',
+              ),
+            ),
+        ],
+      );
+
+      await store.commitSynchronized(
+        key: key,
+        mergedLocal: merged,
+        verifiedRemote: merged,
+        expectedLocalRevision: before.localRevision,
+        now: now.add(const Duration(seconds: 1)),
+      );
+
+      final favorites = (await service.getCatalogPlaylist(
+        Playlist.favoritesId,
+      ))!;
+      expect(favorites.entries, hasLength(count));
+      expect(favorites.entries.map((entry) => entry.videoId), [
+        for (var index = count - 1; index >= 0; index--) videoId(index),
+      ]);
+      expect(favorites.entries.map((entry) => entry.localTrackId), [
+        for (var index = count - 1; index >= 0; index--) 'download-$index',
+      ]);
+      expect(
+        (await store.loadWork(key))!.base!.items.map((item) => item.setVideoId),
+        [for (var index = count - 1; index >= 0; index--) 'set-$index'],
+      );
+      final localRows = await db.query(
+        'local_tracks',
+        columns: const ['id', 'source_id', 'catalog_key'],
+      );
+      expect(localRows, hasLength(count));
+      for (final row in localRows) {
+        expect(row['catalog_key'], 'youtube:${row['source_id']}');
+      }
+      final legacy = (await db.query(
+        'playlists',
+        columns: const ['track_ids'],
+        where: 'id = ?',
+        whereArgs: const [Playlist.favoritesId],
+      )).single;
+      expect(jsonDecode(legacy['track_ids']! as String), [
+        for (var index = count - 1; index >= 0; index--) 'download-$index',
       ]);
     },
   );

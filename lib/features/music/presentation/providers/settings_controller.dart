@@ -5,6 +5,12 @@ final settingsControllerProvider =
       SettingsController.new,
     );
 
+final appBackgroundImageServiceProvider = Provider<AppBackgroundImageService>(
+  (ref) => AppBackgroundImageService(),
+);
+
+const _unchangedAppBackground = Object();
+
 const supportedCrossfadeDurations = <Duration>[
   Duration(seconds: 1),
   Duration(seconds: 2),
@@ -85,6 +91,15 @@ const defaultLocalMusicFilters = <LocalMusicFilter>{
   LocalMusicFilter.hideTracksUnder30Seconds,
 };
 
+AudioQualityProfile _audioQualityProfileFromCode(
+  String? code, {
+  required AudioQualityProfile fallback,
+}) => switch (code) {
+  'high' => AudioQualityProfile.high,
+  'standard' => AudioQualityProfile.standard,
+  _ => fallback,
+};
+
 class SettingsState {
   const SettingsState({
     required this.downloadDirectory,
@@ -92,7 +107,16 @@ class SettingsState {
     this.themeMode = AppThemeMode.system,
     this.accent = AppAccent.white,
     this.surfaceBackgroundMode = SurfaceBackgroundMode.accent,
+    this.appBackgroundFileName,
+    this.appBackgroundPath,
     this.playerStyle = defaultPlayerStyle,
+    this.playerFont = defaultPlayerFont,
+    this.liveWidgetStyle = LiveWidgetStyle.classic,
+    this.showAudioQuality = true,
+    this.jioSaavnEnabled = true,
+    this.wifiAudioQuality = AudioQualityProfile.high,
+    this.mobileAudioQuality = AudioQualityProfile.standard,
+    this.downloadAudioQuality = AudioQualityProfile.high,
     this.animatedArtworkEnabled = defaultAnimatedArtworkEnabled,
     this.playerArtworkStyle = defaultPlayerArtworkStyle,
     this.appleAnimatedArtworkEnabled = false,
@@ -100,14 +124,19 @@ class SettingsState {
     this.miniPlayerMode = defaultMiniPlayerMode,
     this.miniPlayerBackgroundMode = defaultMiniPlayerBackgroundMode,
     this.lyricsTextAlignment = LyricsTextAlignment.normal,
+    this.enabledLyricsProviders = defaultLyricsProviders,
     this.lyricsAnimationStyle = LyricsAnimationStyle.smooth,
+    this.lyricsBackgroundStyle = defaultLyricsBackgroundStyle,
     this.lyricsRomanizationEnabled = false,
+    this.lyricsTranslationEnabled = false,
     this.lyricsRomanizationLanguages = defaultLyricsRomanizationLanguages,
     this.recommendationHistoryEnabled = true,
     this.localMusicFilters = defaultLocalMusicFilters,
     this.crossfadeEnabled = false,
     this.crossfadeDuration = defaultCrossfadeDuration,
     this.skipSilenceEnabled = false,
+    this.equalizer = const EqualizerSettings(),
+    this.equalizerProfiles = const EqualizerProfiles(),
   });
 
   final String downloadDirectory;
@@ -115,7 +144,20 @@ class SettingsState {
   final AppThemeMode themeMode;
   final AppAccent accent;
   final SurfaceBackgroundMode surfaceBackgroundMode;
+
+  /// Relative file name owned by [AppBackgroundImageService].
+  final String? appBackgroundFileName;
+
+  /// Resolved path in the current app container; never persisted directly.
+  final String? appBackgroundPath;
   final PlayerStyle playerStyle;
+  final PlayerFont playerFont;
+  final LiveWidgetStyle liveWidgetStyle;
+  final bool showAudioQuality;
+  final bool jioSaavnEnabled;
+  final AudioQualityProfile wifiAudioQuality;
+  final AudioQualityProfile mobileAudioQuality;
+  final AudioQualityProfile downloadAudioQuality;
   final bool animatedArtworkEnabled;
   final PlayerArtworkStyle playerArtworkStyle;
   final bool appleAnimatedArtworkEnabled;
@@ -123,14 +165,19 @@ class SettingsState {
   final MiniPlayerMode miniPlayerMode;
   final MiniPlayerBackgroundMode miniPlayerBackgroundMode;
   final LyricsTextAlignment lyricsTextAlignment;
+  final Set<LyricsProvider> enabledLyricsProviders;
   final LyricsAnimationStyle lyricsAnimationStyle;
+  final LyricsBackgroundStyle lyricsBackgroundStyle;
   final bool lyricsRomanizationEnabled;
+  final bool lyricsTranslationEnabled;
   final Set<LyricsRomanizationLanguage> lyricsRomanizationLanguages;
   final bool recommendationHistoryEnabled;
   final Set<LocalMusicFilter> localMusicFilters;
   final bool crossfadeEnabled;
   final Duration crossfadeDuration;
   final bool skipSilenceEnabled;
+  final EqualizerSettings equalizer;
+  final EqualizerProfiles equalizerProfiles;
 
   SettingsState copyWith({
     String? downloadDirectory,
@@ -138,7 +185,16 @@ class SettingsState {
     AppThemeMode? themeMode,
     AppAccent? accent,
     SurfaceBackgroundMode? surfaceBackgroundMode,
+    Object? appBackgroundFileName = _unchangedAppBackground,
+    Object? appBackgroundPath = _unchangedAppBackground,
     PlayerStyle? playerStyle,
+    PlayerFont? playerFont,
+    LiveWidgetStyle? liveWidgetStyle,
+    bool? showAudioQuality,
+    bool? jioSaavnEnabled,
+    AudioQualityProfile? wifiAudioQuality,
+    AudioQualityProfile? mobileAudioQuality,
+    AudioQualityProfile? downloadAudioQuality,
     bool? animatedArtworkEnabled,
     PlayerArtworkStyle? playerArtworkStyle,
     bool? appleAnimatedArtworkEnabled,
@@ -146,14 +202,19 @@ class SettingsState {
     MiniPlayerMode? miniPlayerMode,
     MiniPlayerBackgroundMode? miniPlayerBackgroundMode,
     LyricsTextAlignment? lyricsTextAlignment,
+    Set<LyricsProvider>? enabledLyricsProviders,
     LyricsAnimationStyle? lyricsAnimationStyle,
+    LyricsBackgroundStyle? lyricsBackgroundStyle,
     bool? lyricsRomanizationEnabled,
+    bool? lyricsTranslationEnabled,
     Set<LyricsRomanizationLanguage>? lyricsRomanizationLanguages,
     bool? recommendationHistoryEnabled,
     Set<LocalMusicFilter>? localMusicFilters,
     bool? crossfadeEnabled,
     Duration? crossfadeDuration,
     bool? skipSilenceEnabled,
+    EqualizerSettings? equalizer,
+    EqualizerProfiles? equalizerProfiles,
   }) {
     return SettingsState(
       downloadDirectory: downloadDirectory ?? this.downloadDirectory,
@@ -162,7 +223,21 @@ class SettingsState {
       accent: accent ?? this.accent,
       surfaceBackgroundMode:
           surfaceBackgroundMode ?? this.surfaceBackgroundMode,
+      appBackgroundFileName:
+          identical(appBackgroundFileName, _unchangedAppBackground)
+          ? this.appBackgroundFileName
+          : appBackgroundFileName as String?,
+      appBackgroundPath: identical(appBackgroundPath, _unchangedAppBackground)
+          ? this.appBackgroundPath
+          : appBackgroundPath as String?,
       playerStyle: playerStyle ?? this.playerStyle,
+      playerFont: playerFont ?? this.playerFont,
+      liveWidgetStyle: liveWidgetStyle ?? this.liveWidgetStyle,
+      showAudioQuality: showAudioQuality ?? this.showAudioQuality,
+      jioSaavnEnabled: jioSaavnEnabled ?? this.jioSaavnEnabled,
+      wifiAudioQuality: wifiAudioQuality ?? this.wifiAudioQuality,
+      mobileAudioQuality: mobileAudioQuality ?? this.mobileAudioQuality,
+      downloadAudioQuality: downloadAudioQuality ?? this.downloadAudioQuality,
       animatedArtworkEnabled:
           animatedArtworkEnabled ?? this.animatedArtworkEnabled,
       playerArtworkStyle: playerArtworkStyle ?? this.playerArtworkStyle,
@@ -173,9 +248,15 @@ class SettingsState {
       miniPlayerBackgroundMode:
           miniPlayerBackgroundMode ?? this.miniPlayerBackgroundMode,
       lyricsTextAlignment: lyricsTextAlignment ?? this.lyricsTextAlignment,
+      enabledLyricsProviders:
+          enabledLyricsProviders ?? this.enabledLyricsProviders,
       lyricsAnimationStyle: lyricsAnimationStyle ?? this.lyricsAnimationStyle,
+      lyricsBackgroundStyle:
+          lyricsBackgroundStyle ?? this.lyricsBackgroundStyle,
       lyricsRomanizationEnabled:
           lyricsRomanizationEnabled ?? this.lyricsRomanizationEnabled,
+      lyricsTranslationEnabled:
+          lyricsTranslationEnabled ?? this.lyricsTranslationEnabled,
       lyricsRomanizationLanguages:
           lyricsRomanizationLanguages ?? this.lyricsRomanizationLanguages,
       recommendationHistoryEnabled:
@@ -184,6 +265,8 @@ class SettingsState {
       crossfadeEnabled: crossfadeEnabled ?? this.crossfadeEnabled,
       crossfadeDuration: crossfadeDuration ?? this.crossfadeDuration,
       skipSilenceEnabled: skipSilenceEnabled ?? this.skipSilenceEnabled,
+      equalizer: equalizer ?? this.equalizer,
+      equalizerProfiles: equalizerProfiles ?? this.equalizerProfiles,
     );
   }
 }
@@ -205,7 +288,15 @@ class SettingsController extends AsyncNotifier<SettingsState> {
   static const _themeModeKey = 'settings.themeMode';
   static const _accentKey = 'settings.accent';
   static const _surfaceBackgroundModeKey = 'settings.surfaceBackgroundMode';
+  static const _appBackgroundFileNameKey = 'settings.appBackgroundFileName';
   static const _playerStyleKey = 'settings.playerStyle';
+  static const _playerFontKey = 'settings.playerFont';
+  static const _liveWidgetStyleKey = 'settings.liveWidgetStyle';
+  static const _showAudioQualityKey = 'settings.showAudioQuality';
+  static const _jioSaavnEnabledKey = 'settings.jioSaavnEnabled';
+  static const _wifiAudioQualityKey = 'settings.wifiAudioQuality';
+  static const _mobileAudioQualityKey = 'settings.mobileAudioQuality';
+  static const _downloadAudioQualityKey = 'settings.downloadAudioQuality';
   static const _animatedArtworkEnabledKey = 'settings.animatedArtworkEnabled';
   static const _playerArtworkStyleKey = 'settings.playerArtworkStyle';
   static const _appleAnimatedArtworkEnabledKey =
@@ -215,9 +306,13 @@ class SettingsController extends AsyncNotifier<SettingsState> {
   static const _miniPlayerBackgroundModeKey =
       'settings.miniPlayerBackgroundMode';
   static const _lyricsTextAlignmentKey = 'settings.lyricsAlignment';
+  static const _enabledLyricsProvidersKey = 'settings.enabledLyricsProviders';
   static const _lyricsAnimationStyleKey = 'settings.lyricsAnimation';
+  static const _lyricsBackgroundStyleKey = 'settings.lyricsBackground';
   static const _lyricsRomanizationEnabledKey =
       'settings.lyricsRomanizationEnabled';
+  static const _lyricsTranslationEnabledKey =
+      'settings.lyricsTranslationEnabled';
   static const _lyricsRomanizationLanguagesKey =
       'settings.lyricsRomanizationLanguages';
   static const _recommendationHistoryEnabledKey =
@@ -226,19 +321,33 @@ class SettingsController extends AsyncNotifier<SettingsState> {
   static const _crossfadeEnabledKey = 'settings.crossfadeEnabled';
   static const _crossfadeSecondsKey = 'settings.crossfadeSeconds';
   static const _skipSilenceEnabledKey = 'settings.skipSilenceEnabled';
+  static const _equalizerKey = 'settings.equalizer';
   static const _mediaRootDirectoryName = 'BStream-Music';
   Future<void> _lyricsTextAlignmentWriteTail = Future<void>.value();
+  Future<void> _enabledLyricsProvidersWriteTail = Future<void>.value();
   Future<void> _animatedArtworkWriteTail = Future<void>.value();
+  Future<void> _audioSourceSettingsWriteTail = Future<void>.value();
   Future<void> _remoteArtworkWriteTail = Future<void>.value();
   Future<void> _lyricsAnimationStyleWriteTail = Future<void>.value();
+  Future<void> _lyricsBackgroundStyleWriteTail = Future<void>.value();
   Future<void> _lyricsRomanizationWriteTail = Future<void>.value();
   Future<void> _recommendationHistoryWriteTail = Future<void>.value();
   Future<void> _localMusicFiltersWriteTail = Future<void>.value();
   Future<void> _crossfadeWriteTail = Future<void>.value();
   Future<void> _skipSilenceWriteTail = Future<void>.value();
+  Future<void> _appBackgroundWriteTail = Future<void>.value();
+  Future<void> _liveWidgetStyleWriteTail = Future<void>.value();
+  Future<void> _equalizerWriteTail = Future<void>.value();
+  Timer? _equalizerSaveTimer;
+  EqualizerProfileChange? _pendingEqualizer;
+  Completer<void>? _equalizerSaveCompletion;
 
   @override
   Future<SettingsState> build() async {
+    ref.onDispose(() {
+      _equalizerSaveTimer?.cancel();
+      unawaited(_flushEqualizer().catchError((Object _) {}));
+    });
     final prefs = await SharedPreferences.getInstance();
     final defaultDirectory = await _defaultDownloadDirectory();
     final language = AppLanguageLabel.fromCode(prefs.getString(_languageKey));
@@ -251,7 +360,83 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     final surfaceBackgroundMode = SurfaceBackgroundMode.fromCode(
       prefs.getString(_surfaceBackgroundModeKey),
     );
+    final appBackgroundService = ref.read(appBackgroundImageServiceProvider);
+    var appBackgroundFileName = prefs.getString(_appBackgroundFileNameKey);
+    var appBackgroundPath = await appBackgroundService.resolve(
+      appBackgroundFileName,
+    );
+    if (appBackgroundFileName != null && appBackgroundPath == null) {
+      await prefs.remove(_appBackgroundFileNameKey);
+      appBackgroundFileName = null;
+    }
+    // Android can reclaim the activity while the system photo picker is open.
+    // Recover that choice without ever discarding a previously selected photo
+    // unless the optimized copy and preference write both succeed.
+    if (_platform == AppPlatformType.android && Platform.isAndroid) {
+      try {
+        final lyricsPhotoPending =
+            prefs.getBool(lyricsSharePhotoPendingKey) ?? false;
+        final lost = await ImagePicker().retrieveLostData();
+        if (lyricsPhotoPending) {
+          await prefs.remove(lyricsSharePhotoPendingKey);
+        }
+        // A lyric-card image belongs only to its editor. After activity death
+        // its recovered result must never replace the user's app wallpaper.
+        final files = lyricsPhotoPending ? null : lost.files;
+        if (files != null && files.isNotEmpty) {
+          final recoveredName = await appBackgroundService.saveFile(
+            File(files.first.path),
+          );
+          if (await prefs.setString(_appBackgroundFileNameKey, recoveredName)) {
+            final previousName = appBackgroundFileName;
+            appBackgroundFileName = recoveredName;
+            appBackgroundPath = await appBackgroundService.resolve(
+              recoveredName,
+            );
+            try {
+              await appBackgroundService.delete(previousName);
+            } catch (error) {
+              debugPrint('Could not remove old app background: $error');
+            }
+          } else {
+            await appBackgroundService.delete(recoveredName);
+          }
+        }
+      } catch (error) {
+        debugPrint('Could not recover selected app background: $error');
+      }
+    }
     final playerStyle = PlayerStyle.fromCode(prefs.getString(_playerStyleKey));
+    final playerFont = PlayerFont.fromCode(prefs.getString(_playerFontKey));
+    final liveWidgetStyle = LiveWidgetStyle.fromCode(
+      prefs.getString(_liveWidgetStyleKey),
+    );
+    final showAudioQuality = prefs.getBool(_showAudioQualityKey) ?? true;
+    final jioSaavnEnabled = prefs.getBool(_jioSaavnEnabledKey) ?? true;
+    final wifiAudioQuality = _audioQualityProfileFromCode(
+      prefs.getString(_wifiAudioQualityKey),
+      fallback: AudioQualityProfile.high,
+    );
+    final mobileAudioQuality = _audioQualityProfileFromCode(
+      prefs.getString(_mobileAudioQualityKey),
+      fallback: AudioQualityProfile.standard,
+    );
+    final storedDownloadAudioQuality = prefs.getString(
+      _downloadAudioQualityKey,
+    );
+    final downloadAudioQuality = storedDownloadAudioQuality == null
+        ? wifiAudioQuality
+        : _audioQualityProfileFromCode(
+            storedDownloadAudioQuality,
+            fallback: AudioQualityProfile.high,
+          );
+    if (storedDownloadAudioQuality == null) {
+      // Keep the previous Wi-Fi choice as the initial download preference.
+      await prefs.setString(
+        _downloadAudioQualityKey,
+        downloadAudioQuality.name,
+      );
+    }
     final animatedArtworkEnabled =
         prefs.getBool(_animatedArtworkEnabledKey) ??
         defaultAnimatedArtworkEnabled;
@@ -274,11 +459,17 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     final lyricsTextAlignment = LyricsTextAlignment.fromCode(
       prefs.getString(_lyricsTextAlignmentKey),
     );
+    final enabledLyricsProviders = LyricsProvider.fromCodes(
+      prefs.getStringList(_enabledLyricsProvidersKey),
+    );
     final storedLyricsAnimationStyle = prefs.getString(
       _lyricsAnimationStyleKey,
     );
     final lyricsAnimationStyle = LyricsAnimationStyle.fromCode(
       storedLyricsAnimationStyle,
+    );
+    final lyricsBackgroundStyle = LyricsBackgroundStyle.fromCode(
+      prefs.getString(_lyricsBackgroundStyleKey),
     );
     if (storedLyricsAnimationStyle == 'none') {
       await prefs.setString(
@@ -286,8 +477,11 @@ class SettingsController extends AsyncNotifier<SettingsState> {
         lyricsAnimationStyle.code,
       );
     }
+    final lyricsTranslationEnabled =
+        prefs.getBool(_lyricsTranslationEnabledKey) ?? false;
     final lyricsRomanizationEnabled =
-        prefs.getBool(_lyricsRomanizationEnabledKey) ?? false;
+        (prefs.getBool(_lyricsRomanizationEnabledKey) ?? false) &&
+        !lyricsTranslationEnabled;
     final lyricsRomanizationLanguages = LyricsRomanizationLanguage.fromCodes(
       prefs.getStringList(_lyricsRomanizationLanguagesKey),
     );
@@ -302,6 +496,18 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     );
     final crossfadeEnabled = prefs.getBool(_crossfadeEnabledKey) ?? false;
     final skipSilenceEnabled = prefs.getBool(_skipSilenceEnabledKey) ?? false;
+    var equalizer = const EqualizerSettings();
+    var equalizerProfiles = const EqualizerProfiles();
+    final storedEqualizer = prefs.getString(_equalizerKey);
+    if (storedEqualizer != null) {
+      try {
+        final decoded = jsonDecode(storedEqualizer);
+        equalizer = EqualizerSettings.fromMap(decoded);
+        equalizerProfiles = EqualizerProfiles.fromMap(decoded, equalizer);
+      } on FormatException {
+        // A corrupt optional setting must not prevent the app from starting.
+      }
+    }
     final storedDirectory = prefs.getString(_downloadDirectoryKey);
     final encodedMigrationJournal = prefs.getString(
       _downloadDirectoryMigrationJournalKey,
@@ -459,7 +665,18 @@ class SettingsController extends AsyncNotifier<SettingsState> {
       themeMode: themeMode,
       accent: accent,
       surfaceBackgroundMode: surfaceBackgroundMode,
+      appBackgroundFileName: appBackgroundPath == null
+          ? null
+          : appBackgroundFileName,
+      appBackgroundPath: appBackgroundPath,
       playerStyle: playerStyle,
+      playerFont: playerFont,
+      liveWidgetStyle: liveWidgetStyle,
+      showAudioQuality: showAudioQuality,
+      jioSaavnEnabled: jioSaavnEnabled,
+      wifiAudioQuality: wifiAudioQuality,
+      mobileAudioQuality: mobileAudioQuality,
+      downloadAudioQuality: downloadAudioQuality,
       animatedArtworkEnabled: animatedArtworkEnabled,
       playerArtworkStyle: playerArtworkStyle,
       appleAnimatedArtworkEnabled: appleAnimatedArtworkEnabled,
@@ -467,14 +684,19 @@ class SettingsController extends AsyncNotifier<SettingsState> {
       miniPlayerMode: miniPlayerMode,
       miniPlayerBackgroundMode: miniPlayerBackgroundMode,
       lyricsTextAlignment: lyricsTextAlignment,
+      enabledLyricsProviders: enabledLyricsProviders,
       lyricsAnimationStyle: lyricsAnimationStyle,
+      lyricsBackgroundStyle: lyricsBackgroundStyle,
       lyricsRomanizationEnabled: lyricsRomanizationEnabled,
+      lyricsTranslationEnabled: lyricsTranslationEnabled,
       lyricsRomanizationLanguages: lyricsRomanizationLanguages,
       recommendationHistoryEnabled: recommendationHistoryEnabled,
       localMusicFilters: localMusicFilters,
       crossfadeEnabled: crossfadeEnabled,
       crossfadeDuration: crossfadeDuration,
       skipSilenceEnabled: skipSilenceEnabled,
+      equalizer: equalizer,
+      equalizerProfiles: equalizerProfiles,
     );
   }
 
@@ -695,11 +917,158 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     state = AsyncData(current.copyWith(surfaceBackgroundMode: mode));
   }
 
+  Future<void> setAppBackgroundPhoto(File file) =>
+      _queueAppBackgroundWrite(() => _setAppBackgroundPhoto(file));
+
+  Future<void> _setAppBackgroundPhoto(File file) async {
+    final current = state.asData?.value ?? await future;
+    final service = ref.read(appBackgroundImageServiceProvider);
+    final nextFileName = await service.saveFile(file);
+    final nextPath = await service.resolve(nextFileName);
+    if (nextPath == null) {
+      await service.delete(nextFileName);
+      throw StateError('No se pudo guardar el fondo de la app.');
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!await prefs.setString(_appBackgroundFileNameKey, nextFileName)) {
+        throw StateError('No se pudo guardar el fondo de la app.');
+      }
+    } catch (_) {
+      await service.delete(nextFileName);
+      rethrow;
+    }
+    state = AsyncData(
+      current.copyWith(
+        appBackgroundFileName: nextFileName,
+        appBackgroundPath: nextPath,
+      ),
+    );
+    if (current.appBackgroundFileName != null) {
+      try {
+        await service.delete(current.appBackgroundFileName);
+      } catch (error) {
+        debugPrint('Could not remove old app background: $error');
+      }
+    }
+  }
+
+  Future<void> clearAppBackgroundPhoto() =>
+      _queueAppBackgroundWrite(_clearAppBackgroundPhoto);
+
+  Future<void> _clearAppBackgroundPhoto() async {
+    final current = state.asData?.value ?? await future;
+    if (current.appBackgroundFileName == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (!await prefs.remove(_appBackgroundFileNameKey)) {
+      throw StateError('No se pudo quitar el fondo de la app.');
+    }
+    state = AsyncData(
+      current.copyWith(appBackgroundFileName: null, appBackgroundPath: null),
+    );
+    try {
+      await ref
+          .read(appBackgroundImageServiceProvider)
+          .delete(current.appBackgroundFileName);
+    } catch (error) {
+      debugPrint('Could not remove old app background: $error');
+    }
+  }
+
+  Future<void> _queueAppBackgroundWrite(Future<void> Function() operation) {
+    final write = _appBackgroundWriteTail
+        .catchError((_) {})
+        .then((_) => operation());
+    _appBackgroundWriteTail = write.catchError((_) {});
+    return write;
+  }
+
   Future<void> setPlayerStyle(PlayerStyle style) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_playerStyleKey, style.code);
     final current = await future;
     state = AsyncData(current.copyWith(playerStyle: style));
+  }
+
+  Future<void> setPlayerFont(PlayerFont font) async {
+    final current = state.asData?.value ?? await future;
+    if (current.playerFont == font) return;
+    state = AsyncData(current.copyWith(playerFont: font));
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_playerFontKey, font.code);
+  }
+
+  Future<void> setShowAudioQuality(bool enabled) async {
+    final current = state.asData?.value ?? await future;
+    if (current.showAudioQuality == enabled) return;
+    state = AsyncData(current.copyWith(showAudioQuality: enabled));
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showAudioQualityKey, enabled);
+  }
+
+  Future<void> setJioSaavnEnabled(bool enabled) async {
+    final loaded = state.asData?.value ?? await future;
+    final current = state.asData?.value ?? loaded;
+    if (current.jioSaavnEnabled == enabled) return;
+    state = AsyncData(current.copyWith(jioSaavnEnabled: enabled));
+    await _persistAudioSourceSetting(
+      (prefs) => prefs.setBool(_jioSaavnEnabledKey, enabled),
+    );
+  }
+
+  Future<void> setWifiAudioQuality(AudioQualityProfile profile) async {
+    final loaded = state.asData?.value ?? await future;
+    final current = state.asData?.value ?? loaded;
+    if (current.wifiAudioQuality == profile) return;
+    state = AsyncData(current.copyWith(wifiAudioQuality: profile));
+    await _persistAudioSourceSetting(
+      (prefs) => prefs.setString(_wifiAudioQualityKey, profile.name),
+    );
+  }
+
+  Future<void> setMobileAudioQuality(AudioQualityProfile profile) async {
+    final loaded = state.asData?.value ?? await future;
+    final current = state.asData?.value ?? loaded;
+    if (current.mobileAudioQuality == profile) return;
+    state = AsyncData(current.copyWith(mobileAudioQuality: profile));
+    await _persistAudioSourceSetting(
+      (prefs) => prefs.setString(_mobileAudioQualityKey, profile.name),
+    );
+  }
+
+  Future<void> setDownloadAudioQuality(AudioQualityProfile profile) async {
+    final loaded = state.asData?.value ?? await future;
+    final current = state.asData?.value ?? loaded;
+    if (current.downloadAudioQuality == profile) return;
+    state = AsyncData(current.copyWith(downloadAudioQuality: profile));
+    await _persistAudioSourceSetting(
+      (prefs) => prefs.setString(_downloadAudioQualityKey, profile.name),
+    );
+  }
+
+  Future<void> _persistAudioSourceSetting(
+    Future<bool> Function(SharedPreferences prefs) persist,
+  ) async {
+    final write = _audioSourceSettingsWriteTail.catchError((_) {}).then((
+      _,
+    ) async {
+      final prefs = await SharedPreferences.getInstance();
+      await persist(prefs);
+    });
+    _audioSourceSettingsWriteTail = write.catchError((_) {});
+    await write;
+  }
+
+  Future<void> setLiveWidgetStyle(LiveWidgetStyle style) async {
+    final current = state.asData?.value ?? await future;
+    if (current.liveWidgetStyle == style) return;
+    state = AsyncData(current.copyWith(liveWidgetStyle: style));
+    final write = _liveWidgetStyleWriteTail.catchError((_) {}).then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_liveWidgetStyleKey, style.code);
+    });
+    _liveWidgetStyleWriteTail = write.catchError((_) {});
+    await write;
   }
 
   Future<void> setAnimatedArtworkEnabled(bool enabled) async {
@@ -783,6 +1152,45 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     state = AsyncData(current.copyWith(miniPlayerBackgroundMode: mode));
   }
 
+  Future<void> setEnabledLyricsProviders(Set<LyricsProvider> providers) async {
+    final selected = Set<LyricsProvider>.unmodifiable(providers);
+    final loaded = state.asData?.value ?? await future;
+    // Re-read after startup: other pending toggles may already have updated
+    // the state while this invocation was waiting for preferences to load.
+    final current = state.asData?.value ?? loaded;
+    if (current.enabledLyricsProviders.length == selected.length &&
+        current.enabledLyricsProviders.containsAll(selected)) {
+      return;
+    }
+    state = AsyncData(current.copyWith(enabledLyricsProviders: selected));
+    final write = _enabledLyricsProvidersWriteTail.catchError((_) {}).then((
+      _,
+    ) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_enabledLyricsProvidersKey, [
+        for (final provider in LyricsProvider.values)
+          if (selected.contains(provider)) provider.code,
+      ]);
+    });
+    _enabledLyricsProvidersWriteTail = write.catchError((_) {});
+    await write;
+  }
+
+  Future<void> toggleLyricsProvider(
+    LyricsProvider provider,
+    bool enabled,
+  ) async {
+    final loaded = state.asData?.value ?? await future;
+    final current = state.asData?.value ?? loaded;
+    final selected = current.enabledLyricsProviders.toSet();
+    if (enabled) {
+      selected.add(provider);
+    } else {
+      selected.remove(provider);
+    }
+    await setEnabledLyricsProviders(selected);
+  }
+
   Future<void> setLyricsTextAlignment(
     LyricsTextAlignment lyricsTextAlignment,
   ) async {
@@ -834,17 +1242,66 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     await write;
   }
 
+  Future<void> setLyricsBackgroundStyle(LyricsBackgroundStyle style) async {
+    final current = state.asData?.value ?? await future;
+    if (current.lyricsBackgroundStyle == style) return;
+    state = AsyncData(current.copyWith(lyricsBackgroundStyle: style));
+    final write = _lyricsBackgroundStyleWriteTail.catchError((_) {}).then((
+      _,
+    ) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_lyricsBackgroundStyleKey, style.code);
+    });
+    _lyricsBackgroundStyleWriteTail = write.catchError((_) {});
+    await write;
+  }
+
   Future<void> setLyricsRomanizationEnabled(bool enabled) async {
     final current = state.asData?.value ?? await future;
-    if (current.lyricsRomanizationEnabled == enabled) {
+    if (current.lyricsRomanizationEnabled == enabled &&
+        (!enabled || !current.lyricsTranslationEnabled)) {
       return;
     }
-    state = AsyncData(current.copyWith(lyricsRomanizationEnabled: enabled));
+    await _setLyricsModes(
+      current.copyWith(
+        lyricsRomanizationEnabled: enabled,
+        lyricsTranslationEnabled: enabled
+            ? false
+            : current.lyricsTranslationEnabled,
+      ),
+    );
+  }
+
+  Future<void> setLyricsTranslationEnabled(bool enabled) async {
+    final current = state.asData?.value ?? await future;
+    if (current.lyricsTranslationEnabled == enabled &&
+        (!enabled || !current.lyricsRomanizationEnabled)) {
+      return;
+    }
+    await _setLyricsModes(
+      current.copyWith(
+        lyricsTranslationEnabled: enabled,
+        lyricsRomanizationEnabled: enabled
+            ? false
+            : current.lyricsRomanizationEnabled,
+      ),
+    );
+  }
+
+  Future<void> _setLyricsModes(SettingsState next) async {
+    state = AsyncData(next);
     final write = _lyricsRomanizationWriteTail.catchError((_) {}).then((
       _,
     ) async {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_lyricsRomanizationEnabledKey, enabled);
+      await prefs.setBool(
+        _lyricsRomanizationEnabledKey,
+        next.lyricsRomanizationEnabled,
+      );
+      await prefs.setBool(
+        _lyricsTranslationEnabledKey,
+        next.lyricsTranslationEnabled,
+      );
     });
     _lyricsRomanizationWriteTail = write.catchError((_) {});
     await write;
@@ -998,6 +1455,83 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     await write;
   }
 
+  Future<void> setEqualizer(EqualizerSettings settings) async {
+    final current = state.asData?.value ?? await future;
+    final normalized = settings.normalized;
+    return _saveEqualizer(current, (
+      equalizer: normalized,
+      profiles: current.equalizerProfiles.updating(
+        current.equalizer,
+        normalized,
+      ),
+    ));
+  }
+
+  Future<void> setEqualizerBand(int index, double gain) async {
+    final current = state.asData?.value ?? await future;
+    return _saveEqualizer(
+      current,
+      current.equalizerProfiles.withBand(current.equalizer, index, gain),
+    );
+  }
+
+  Future<void> selectEqualizerPreset(EqualizerPreset preset) async {
+    final current = state.asData?.value ?? await future;
+    return _saveEqualizer(
+      current,
+      current.equalizerProfiles.choose(current.equalizer, preset),
+    );
+  }
+
+  Future<void> _saveEqualizer(
+    SettingsState current,
+    EqualizerProfileChange change,
+  ) {
+    if (current.equalizer == change.equalizer &&
+        current.equalizerProfiles == change.profiles) {
+      return Future<void>.value();
+    }
+    state = AsyncData(
+      current.copyWith(
+        equalizer: change.equalizer,
+        equalizerProfiles: change.profiles,
+      ),
+    );
+    _pendingEqualizer = change;
+    _equalizerSaveCompletion ??= Completer<void>();
+    final completion = _equalizerSaveCompletion!;
+    _equalizerSaveTimer?.cancel();
+    _equalizerSaveTimer = Timer(const Duration(milliseconds: 400), () {
+      unawaited(_flushEqualizer().catchError((Object _) {}));
+    });
+    return completion.future;
+  }
+
+  Future<void> _flushEqualizer() async {
+    final settings = _pendingEqualizer;
+    final completion = _equalizerSaveCompletion;
+    if (settings == null) return;
+    _pendingEqualizer = null;
+    _equalizerSaveCompletion = null;
+    final write = _equalizerWriteTail.catchError((_) {}).then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _equalizerKey,
+        jsonEncode({
+          ...settings.equalizer.toMap(),
+          ...settings.profiles.toMap(),
+        }),
+      );
+    });
+    _equalizerWriteTail = write.catchError((_) {});
+    try {
+      await write;
+      completion?.complete();
+    } catch (error, stack) {
+      completion?.completeError(error, stack);
+    }
+  }
+
   Future<File> createBackupFile() async {
     final current = await future;
     final player = ref.read(playerControllerProvider.notifier);
@@ -1005,7 +1539,10 @@ class SettingsController extends AsyncNotifier<SettingsState> {
     try {
       return await ref
           .read(backupServiceProvider)
-          .createBackupFile(mediaRoot: current.downloadDirectory);
+          .createBackupFile(
+            mediaRoot: current.downloadDirectory,
+            downloadedFolderName: AppStrings(current.language).downloadedSongs,
+          );
     } finally {
       await player.resumeRecommendationHistoryTracking();
     }

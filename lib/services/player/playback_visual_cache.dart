@@ -9,6 +9,8 @@ import 'package:path_provider/path_provider.dart';
 
 import '../../core/utils/image_source.dart';
 import '../../core/utils/cached_artwork_image_provider.dart';
+import 'fragmented_artwork_mp4.dart';
+import 'visual_load_diagnostics.dart';
 
 /// A session-only cache for the player, bounded to the current song and the
 /// two songs played immediately before it. Only complete downloads are used.
@@ -52,7 +54,8 @@ class PlaybackVisualCache extends ChangeNotifier {
     required Uri? videoUrl,
   }) {
     if (_disposed) return;
-    if (_activeKey != trackKey) {
+    final newlyActivated = _activeKey != trackKey;
+    if (newlyActivated) {
       final previous = _entries[_activeKey];
       previous?.cancelPending();
       _activeKey = trackKey;
@@ -61,6 +64,11 @@ class PlaybackVisualCache extends ChangeNotifier {
 
     final entry = _entries.remove(trackKey) ?? _VisualEntry(trackKey);
     _entries[trackKey] = entry;
+    if (newlyActivated &&
+        entry.videoFile != null &&
+        entry.videoUrl == videoUrl) {
+      logVisualLoad('video file cache hit', track: trackKey);
+    }
     while (_entries.length > maxRetainedTracks) {
       final oldest = _entries.keys.first;
       final evicted = _entries.remove(oldest)!;
@@ -82,6 +90,7 @@ class PlaybackVisualCache extends ChangeNotifier {
       entry.coverFallbackSource = fallbackSource;
       entry.coverFile = null;
       entry.coverFromSharedCache = false;
+      entry.coverComplete = false;
       entry.coverFailedAt = null;
       revision++;
     }
@@ -97,7 +106,7 @@ class PlaybackVisualCache extends ChangeNotifier {
 
     if (source != null &&
         isNetworkImageSource(source) &&
-        entry.coverFile == null &&
+        !entry.coverComplete &&
         entry.coverTransfer == null &&
         _mayRetry(entry.coverFailedAt)) {
       final transfer = _Transfer();
@@ -153,44 +162,66 @@ class PlaybackVisualCache extends ChangeNotifier {
   ) async {
     File? file;
     var fromSharedCache = false;
+    var completedBestRendition = false;
     try {
       final candidates = <String>{
+        ...youtubeThumbnailUpgradeCandidates(source),
         ...artworkDownloadSourceCandidates(source),
         if (fallbackSource != null && isNetworkImageSource(fallbackSource))
           ...artworkDownloadSourceCandidates(fallbackSource),
-      };
+      }.toList(growable: false);
+      int? cachedIndex;
       // The normal app cache may already contain this cover (e.g. from search
-      // or a previous offline session). Reading it must not start a download.
-      for (final candidate in candidates) {
+      // or a previous offline session). A card-sized rendition is a useful
+      // immediate preview, not proof that the full player image is ready.
+      for (var index = 0; index < candidates.length; index++) {
         if (transfer.cancelled) break;
         try {
-          final cached = await _sharedArtworkLookup(candidate);
+          final cached = await _sharedArtworkLookup(candidates[index]);
           if (cached != null &&
               await cached.exists() &&
               await cached.length() > 0) {
             file = cached;
             fromSharedCache = true;
+            cachedIndex = index;
+            _publishCover(
+              entry,
+              source,
+              transfer,
+              cached,
+              fromSharedCache: true,
+            );
             break;
           }
         } catch (_) {
           // A unavailable shared-cache database must not hide a live cover.
         }
       }
-      for (final candidate in candidates) {
-        if (transfer.cancelled || file != null) break;
-        final uri = Uri.tryParse(candidate);
+      // Only try renditions sharper than the cached preview. Do not perform
+      // background work for older songs, and keep the preview visible if the
+      // network is slow, a higher rendition is missing, or a transfer fails.
+      final attempts = cachedIndex ?? candidates.length;
+      for (var index = 0; index < attempts; index++) {
+        if (transfer.cancelled) break;
+        final uri = Uri.tryParse(candidates[index]);
         if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
           continue;
         }
-        file = await _download(
+        final downloaded = await _download(
           entry.key,
           uri,
           'cover',
           _maxCoverBytes,
           transfer,
         );
-        if (file != null) break;
+        if (downloaded != null) {
+          file = downloaded;
+          fromSharedCache = false;
+          completedBestRendition = index == 0;
+          break;
+        }
       }
+      completedBestRendition = completedBestRendition || cachedIndex == 0;
     } catch (_) {
       // A failed cache lookup or request leaves the existing artwork fallback.
     } finally {
@@ -200,15 +231,22 @@ class PlaybackVisualCache extends ChangeNotifier {
             file != null &&
             _entries[entry.key] == entry &&
             entry.coverSource == source) {
-          entry.coverFile = file;
-          entry.coverFromSharedCache = fromSharedCache;
+          entry.coverComplete = completedBestRendition;
+          entry.coverFailedAt = completedBestRendition ? null : DateTime.now();
+          _publishCover(
+            entry,
+            source,
+            transfer,
+            file,
+            fromSharedCache: fromSharedCache,
+            requirePendingTransfer: false,
+          );
           assert(() {
             debugPrint(
               'BStream visual cover ${entry.key}: ${file!.lengthSync()} bytes',
             );
             return true;
           }());
-          _changed();
         } else if (!transfer.cancelled && file == null) {
           entry.coverFailedAt = DateTime.now();
         }
@@ -216,11 +254,38 @@ class PlaybackVisualCache extends ChangeNotifier {
     }
   }
 
+  void _publishCover(
+    _VisualEntry entry,
+    String source,
+    _Transfer transfer,
+    File file, {
+    required bool fromSharedCache,
+    bool requirePendingTransfer = true,
+  }) {
+    if (_disposed ||
+        transfer.cancelled ||
+        _activeKey != entry.key ||
+        _entries[entry.key] != entry ||
+        entry.coverSource != source ||
+        (requirePendingTransfer && !identical(entry.coverTransfer, transfer))) {
+      return;
+    }
+    if (entry.coverFile?.path == file.path &&
+        entry.coverFromSharedCache == fromSharedCache) {
+      return;
+    }
+    _retireFile(entry.coverFile, owned: !entry.coverFromSharedCache);
+    entry.coverFile = file;
+    entry.coverFromSharedCache = fromSharedCache;
+    _changed();
+  }
+
   Future<void> _loadVideo(
     _VisualEntry entry,
     Uri url,
     _Transfer transfer,
   ) async {
+    final timer = Stopwatch()..start();
     File? file;
     try {
       file = await _download(entry.key, url, 'video', _maxVideoBytes, transfer);
@@ -234,6 +299,14 @@ class PlaybackVisualCache extends ChangeNotifier {
             _entries[entry.key] == entry &&
             entry.videoUrl == url) {
           entry.videoFile = file;
+          logVisualLoad(
+            transfer.diskCacheHit
+                ? 'video disk-cache hit'
+                : 'video download complete',
+            track: entry.key,
+            elapsedMs: timer.elapsedMilliseconds,
+            bytes: visualLoadTimingsEnabled ? file.lengthSync() : null,
+          );
           assert(() {
             debugPrint(
               'BStream visual video ${entry.key}: ${file!.lengthSync()} bytes',
@@ -242,6 +315,11 @@ class PlaybackVisualCache extends ChangeNotifier {
           }());
           _changed();
         } else if (!transfer.cancelled && file == null) {
+          logVisualLoad(
+            'video download failed',
+            track: entry.key,
+            elapsedMs: timer.elapsedMilliseconds,
+          );
           entry.videoFailedAt = DateTime.now();
         }
       }
@@ -261,7 +339,10 @@ class PlaybackVisualCache extends ChangeNotifier {
     final target = File(
       '${folder.path}${Platform.pathSeparator}$hash.${kind == 'video' ? 'mp4' : 'img'}',
     );
-    if (await target.exists() && await target.length() > 0) return target;
+    if (await target.exists() && await target.length() > 0) {
+      transfer.diskCacheHit = true;
+      return target;
+    }
     if (await target.exists()) {
       try {
         await target.delete();
@@ -283,6 +364,7 @@ class PlaybackVisualCache extends ChangeNotifier {
       final response = await request.close().timeout(
         const Duration(seconds: 12),
       );
+      if (transfer.cancelled) return null;
       final mime = response.headers.contentType?.mimeType;
       if (response.statusCode != HttpStatus.ok ||
           (response.contentLength >= 0 && response.contentLength > maxBytes) ||
@@ -304,6 +386,22 @@ class PlaybackVisualCache extends ChangeNotifier {
       await output.close();
       output = null;
       if (transfer.cancelled || received == 0) return null;
+      if (Platform.isWindows &&
+          kind == 'video' &&
+          url.host == 'mvod.itunes.apple.com') {
+        // Apple HLS MP4s can omit their global duration. Media Foundation
+        // otherwise treats them as completed before a frame is displayed.
+        // Prepare only this private, complete .part file, off the UI isolate.
+        final preparationTimer = Stopwatch()..start();
+        if (await repairFragmentedArtworkMp4(partial)) {
+          logVisualLoad(
+            'video Windows timeline repaired',
+            track: trackKey,
+            elapsedMs: preparationTimer.elapsedMilliseconds,
+          );
+        }
+        if (transfer.cancelled) return null;
+      }
       return await partial.rename(target.path);
     } catch (_) {
       return null;
@@ -403,6 +501,7 @@ class _VisualEntry {
   String? coverFallbackSource;
   File? coverFile;
   bool coverFromSharedCache = false;
+  bool coverComplete = false;
   DateTime? coverFailedAt;
   Uri? videoUrl;
   File? videoFile;
@@ -420,6 +519,7 @@ class _VisualEntry {
 
 class _Transfer {
   bool cancelled = false;
+  bool diskCacheHit = false;
   HttpClient? client;
   HttpClientRequest? request;
 

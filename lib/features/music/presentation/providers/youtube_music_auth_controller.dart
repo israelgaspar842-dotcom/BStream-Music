@@ -14,6 +14,10 @@ final youtubeMusicSessionStoreProvider = Provider<YouTubeMusicSessionStore>(
   (ref) => SecureYouTubeMusicSessionStore(),
 );
 
+final youtubeMusicAuthClockProvider = Provider<YouTubeMusicUtcClock>(
+  (ref) => DateTime.now,
+);
+
 final youtubeMusicAccountTransportProvider =
     Provider<IoYouTubeMusicAccountTransport>((ref) {
       final transport = IoYouTubeMusicAccountTransport();
@@ -43,6 +47,7 @@ final youtubeMusicAuthCoordinatorProvider =
       (ref) => YouTubeMusicAuthCoordinator(
         sessionStore: ref.watch(youtubeMusicSessionStoreProvider),
         accountClient: ref.watch(youtubeMusicAccountClientProvider),
+        clock: ref.watch(youtubeMusicAuthClockProvider),
       ),
     );
 
@@ -51,6 +56,23 @@ final youtubeMusicAuthControllerProvider =
       YouTubeMusicAuthController.new,
     );
 
+typedef YouTubeMusicAuthSessionIdentity = ({
+  bool isAuthenticated,
+  int generation,
+  String? accountKey,
+});
+
+/// Service dependencies only change with the session, so refreshing an avatar
+/// or display name does not rebuild gateways or interrupt playlist sync.
+final youtubeMusicAuthSessionIdentityProvider =
+    Provider<YouTubeMusicAuthSessionIdentity>((ref) {
+      return ref.watch(
+        youtubeMusicAuthControllerProvider.select(
+          (auth) => auth.sessionIdentity,
+        ),
+      );
+    });
+
 /// Shared authenticated account gateway for read/mutation feature adapters.
 ///
 /// Keeping this construction in one provider lets Home and artist
@@ -58,18 +80,27 @@ final youtubeMusicAuthControllerProvider =
 /// exposing the credential through presentation state.
 final youtubeMusicAuthenticatedAccountGatewayProvider =
     Provider<YouTubeMusicAccountGateway?>((ref) {
-      final authState = ref.watch(youtubeMusicAuthControllerProvider);
+      final authState = ref.watch(youtubeMusicAuthSessionIdentityProvider);
       if (!authState.isAuthenticated) return null;
       final authController = ref.read(
         youtubeMusicAuthControllerProvider.notifier,
       );
       final credential = authController.credentialForAuthenticatedRequests;
       if (credential == null) return null;
+      var disposed = false;
+      ref.onDispose(() => disposed = true);
       return YouTubeMusicAccountGateway(
         transport: ref.watch(youtubeMusicAccountTransportProvider),
         sessionHeaders: CredentialYouTubeMusicSessionHeadersProvider(
-          readCredential: () async =>
-              authController.credentialForAuthenticatedRequests,
+          readCredential: () async {
+            if (disposed) return null;
+            final currentIdentity = ref.read(
+              youtubeMusicAuthSessionIdentityProvider,
+            );
+            return currentIdentity == authState
+                ? authController.credentialForAuthenticatedRequests
+                : null;
+          },
         ),
         clientContext: buildYouTubeMusicAccountClientContextFromCredential(
           credential,
@@ -109,6 +140,12 @@ class YouTubeMusicAuthState {
   bool get isAuthenticated =>
       phase == YouTubeMusicAuthPhase.authenticated && profile != null;
 
+  YouTubeMusicAuthSessionIdentity get sessionIdentity => (
+    isAuthenticated: isAuthenticated,
+    generation: generation,
+    accountKey: isAuthenticated ? profile?.accountKey : null,
+  );
+
   @override
   String toString() =>
       'YouTubeMusicAuthState(phase: $phase, generation: $generation, '
@@ -116,11 +153,18 @@ class YouTubeMusicAuthState {
 }
 
 class YouTubeMusicAuthController extends Notifier<YouTubeMusicAuthState> {
+  static const profileRefreshInterval = Duration(hours: 6);
+  static const profileRefreshRetryInterval = Duration(minutes: 1);
+
   YouTubeMusicSessionCredential? _credential;
   YouTubeMusicWebAuthData? _pendingAuthData;
   YouTubeMusicAccountChannel? _expectedChannel;
   var _generation = 0;
   var _disposed = false;
+  Future<void>? _profileRefreshInFlight;
+  int? _profileRefreshGeneration;
+  DateTime? _lastProfileRefreshAttemptAt;
+  int? _lastProfileRefreshAttemptGeneration;
 
   /// Credential access for authenticated service factories only.
   ///
@@ -160,6 +204,7 @@ class YouTubeMusicAuthController extends Notifier<YouTubeMusicAuthState> {
               generation: generation,
               profile: credential.profile,
             );
+      if (credential != null) unawaited(refreshProfile());
     } on Object {
       if (!_isCurrent(generation)) return;
       _credential = null;
@@ -170,6 +215,101 @@ class YouTubeMusicAuthController extends Notifier<YouTubeMusicAuthState> {
       );
     }
   }
+
+  /// Refreshes account metadata only on demand or foreground events. There is
+  /// no timer, and rapid navigation/resumes share one request and a cooldown.
+  /// Optional refresh failures leave the usable saved session intact.
+  Future<void> refreshProfile({bool force = false}) {
+    final credential = credentialForAuthenticatedRequests;
+    if (credential == null) return Future<void>.value();
+    final generation = _generation;
+    final inFlight = _profileRefreshInFlight;
+    if (inFlight != null && _profileRefreshGeneration == generation) {
+      return inFlight;
+    }
+
+    final now = ref.read(youtubeMusicAuthClockProvider)().toUtc();
+    final minimumAge = force
+        ? profileRefreshRetryInterval
+        : profileRefreshInterval;
+    if (now.difference(credential.validatedAt) < minimumAge) {
+      return Future<void>.value();
+    }
+    final previousAttempt = _lastProfileRefreshAttemptAt;
+    if (_lastProfileRefreshAttemptGeneration == generation &&
+        previousAttempt != null &&
+        now.difference(previousAttempt) < profileRefreshRetryInterval) {
+      return Future<void>.value();
+    }
+    _lastProfileRefreshAttemptAt = now;
+    _lastProfileRefreshAttemptGeneration = generation;
+
+    late final Future<void> operation;
+    operation = _refreshProfile(credential, generation).whenComplete(() {
+      if (identical(_profileRefreshInFlight, operation)) {
+        _profileRefreshInFlight = null;
+        _profileRefreshGeneration = null;
+      }
+    });
+    _profileRefreshInFlight = operation;
+    _profileRefreshGeneration = generation;
+    return operation;
+  }
+
+  Future<void> _refreshProfile(
+    YouTubeMusicSessionCredential credential,
+    int generation,
+  ) async {
+    final coordinator = ref.read(youtubeMusicAuthCoordinatorProvider);
+    try {
+      final refreshed = await coordinator.refreshProfile(credential);
+      if (!_isCurrentProfileRefresh(credential, generation)) return;
+      await coordinator.persist(refreshed);
+      if (!_isCurrentProfileRefresh(credential, generation)) {
+        // Logout may complete while a storage write is already running. Do
+        // not leave that old write restorable, or delete a newer login that
+        // is still being validated. The concrete secure store serializes its
+        // writes/deletes so a later login will supersede this old write.
+        if (!_disposed &&
+            _credential == null &&
+            state.phase != YouTubeMusicAuthPhase.authenticating &&
+            state.phase != YouTubeMusicAuthPhase.selectingChannel &&
+            state.phase != YouTubeMusicAuthPhase.restoring) {
+          await coordinator.logout();
+        }
+        return;
+      }
+      _credential = refreshed;
+      if (!_sameProfile(credential.profile, refreshed.profile)) {
+        state = YouTubeMusicAuthState(
+          phase: YouTubeMusicAuthPhase.authenticated,
+          generation: generation,
+          profile: refreshed.profile,
+        );
+      }
+    } on Object {
+      // Metadata refresh is best effort. Existing request adapters remain
+      // responsible for handling an actual expired authenticated session.
+    }
+  }
+
+  bool _isCurrentProfileRefresh(
+    YouTubeMusicSessionCredential credential,
+    int generation,
+  ) =>
+      _isCurrent(generation) &&
+      state.isAuthenticated &&
+      identical(_credential, credential);
+
+  static bool _sameProfile(
+    YouTubeMusicAccountProfile previous,
+    YouTubeMusicAccountProfile next,
+  ) =>
+      previous.channelId == next.channelId &&
+      previous.displayName == next.displayName &&
+      previous.handle == next.handle &&
+      previous.email == next.email &&
+      previous.avatarUrl == next.avatarUrl;
 
   void beginLogin() {
     final generation = ++_generation;

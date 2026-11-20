@@ -1,21 +1,1043 @@
+import 'dart:async';
+
 import 'package:bstream_music/core/theme/app_colors.dart';
+import 'package:bstream_music/core/theme/app_theme.dart';
 import 'package:bstream_music/core/theme/app_ui.dart';
 import 'package:bstream_music/core/widgets/app_shared_widgets.dart';
 import 'package:bstream_music/features/music/domain/entities/search_result.dart';
 import 'package:bstream_music/features/music/domain/entities/track_info.dart';
+import 'package:bstream_music/features/music/domain/entities/playlist.dart';
 import 'package:bstream_music/features/music/presentation/pages/artist_profile_page.dart';
 import 'package:bstream_music/features/music/presentation/pages/remote_collection_detail_page.dart';
 import 'package:bstream_music/features/music/presentation/pages/search_view.dart';
+import 'package:bstream_music/features/music/presentation/pages/search_browse_category_page.dart';
 import 'package:bstream_music/features/music/presentation/providers/music_providers.dart';
+import 'package:bstream_music/features/music/presentation/providers/track_selection_controller.dart';
 import 'package:bstream_music/features/music/presentation/widgets/source_image.dart';
 import 'package:bstream_music/services/player/player_service.dart';
 import 'package:bstream_music/services/youtube_music/innertube_search_service.dart';
+import 'package:bstream_music/services/youtube_music/search_browse_catalog_cache.dart';
+import 'package:bstream_music/services/youtube_music/search_browse_artwork_cache.dart';
 import 'package:flutter/material.dart' hide SearchController;
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
+import 'package:flutter/foundation.dart' show ValueListenable;
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('browse cards retain one grid repaint boundary for static art', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _searchApp(
+        controller: _RecordingSearchController(SearchState()),
+        platform: TargetPlatform.windows,
+        surfaceBackgroundMode: SurfaceBackgroundMode.liquidGlass,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final grid = tester.widget<SliverGrid>(
+      find.byKey(const ValueKey('search-browse-grid')),
+    );
+    expect(
+      (grid.delegate as SliverChildBuilderDelegate).addRepaintBoundaries,
+      isTrue,
+    );
+    final card = find.byKey(const ValueKey('search-browse-card-pop'));
+    expect(
+      find.ancestor(of: card, matching: find.byType(RepaintBoundary)),
+      findsWidgets,
+      reason: 'Scrolling must still reuse the complete static card.',
+    );
+    expect(
+      find.descendant(of: card, matching: find.byType(RepaintBoundary)),
+      findsNothing,
+      reason: 'The static pattern must not add a second retained layer.',
+    );
+    expect(
+      find.byKey(const ValueKey('search-browse-pattern-pop')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'inactive browse retains live card state and artwork through refresh',
+    (tester) async {
+      final activity = ValueNotifier(false);
+      addTearDown(activity.dispose);
+      final categories = List.generate(
+        84,
+        (index) => SearchBrowseCategory(
+          id: 'live-$index',
+          title: 'Live category $index',
+          searchQuery: 'live $index',
+          target: InnerTubeBrowseTarget(browseId: 'moods', params: '$index'),
+        ),
+      );
+      final catalog = SearchBrowseCatalog(
+        categories: categories,
+        usesLiveYouTubeMusicCategories: true,
+      );
+      final refresh = Completer<SearchBrowseCatalog>();
+      var catalogRequests = 0;
+      var artworkRequests = 0;
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(SearchState()),
+          activity: activity,
+          useDefaultBrowseCatalogOverride: false,
+          catalogCache: _MemorySearchBrowseCatalogCache(
+            SearchBrowseCatalogSnapshot(
+              usesLiveYouTubeMusicCategories: true,
+              categories: const [
+                SearchBrowseCategorySnapshot(
+                  id: 'older-cached-card',
+                  title: 'Older disk catalog',
+                  searchQuery: 'cached',
+                ),
+              ],
+            ),
+          ),
+          extraOverrides: [
+            searchBrowseCatalogProvider.overrideWith((ref) {
+              catalogRequests++;
+              return catalogRequests == 1
+                  ? Future.value(catalog)
+                  : refresh.future;
+            }),
+            searchBrowseCategoryArtworkProvider.overrideWith((
+              ref,
+              category,
+            ) async {
+              // Production retains successful metadata lookups; model that cache
+              // so the test counts requests rather than provider auto-disposal.
+              ref.keepAlive();
+              artworkRequests++;
+              return 'https://img.test/${category.id}.jpg';
+            }),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(catalogRequests, 0);
+      expect(artworkRequests, 0);
+      activity.value = true;
+      await tester.pumpAndSettle();
+      final card = find.byKey(const ValueKey('search-browse-card-live-0'));
+      final cover = find.byKey(const ValueKey('search-browse-cover-live-0'));
+      final state = tester.state(card);
+      final coverState = tester.state(cover);
+      final initialArtworkRequests = artworkRequests;
+      final container = ProviderScope.containerOf(tester.element(card));
+      final grid = tester.widget<SliverGrid>(
+        find.byKey(const ValueKey('search-browse-grid')),
+      );
+      expect((grid.delegate as SliverChildBuilderDelegate).childCount, 84);
+      expect(catalogRequests, 1);
+      expect(initialArtworkRequests, greaterThan(0));
+      activity.value = false;
+      await tester.pumpAndSettle();
+      expect(tester.state(card), same(state));
+      expect(tester.state(cover), same(coverState));
+      expect(find.text('Live category 0'), findsOneWidget);
+      expect(
+        tester.widget<SourceImage>(cover).source,
+        'https://img.test/live-0.jpg',
+      );
+      expect(artworkRequests, initialArtworkRequests);
+      container.invalidate(searchBrowseCatalogProvider);
+      await tester.pumpAndSettle();
+      expect(
+        catalogRequests,
+        1,
+        reason: 'An inactive tab must not restart discovery.',
+      );
+      activity.value = true;
+      await tester.pump();
+      await tester.pump();
+      expect(catalogRequests, 2);
+      expect(tester.state(card), same(state));
+      expect(tester.state(cover), same(coverState));
+      expect(artworkRequests, initialArtworkRequests);
+      refresh.complete(
+        SearchBrowseCatalog(
+          categories: [
+            SearchBrowseCategory(
+              id: 'live-0',
+              title: 'Updated live category',
+              searchQuery: 'updated',
+              target: categories.first.target,
+            ),
+          ],
+          usesLiveYouTubeMusicCategories: true,
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Updated live category'), findsOneWidget);
+      expect(tester.state(card), same(state));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'locale change drops retained browse data without inactive discovery',
+    (tester) async {
+      final activity = ValueNotifier(true);
+      addTearDown(activity.dispose);
+      var catalogRequests = 0;
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(SearchState()),
+          activity: activity,
+          useDefaultBrowseCatalogOverride: false,
+          useTestLanguageProvider: true,
+          extraOverrides: [
+            searchBrowseCatalogProvider.overrideWith((ref) async {
+              final language = ref.watch(appStringsProvider).appLanguage;
+              catalogRequests++;
+              return SearchBrowseCatalog(
+                categories: [
+                  SearchBrowseCategory(
+                    id: 'live-${language.code}',
+                    title: language == AppLanguage.spanish
+                        ? 'Spanish live card'
+                        : 'English live card',
+                    searchQuery: language.code,
+                  ),
+                ],
+                usesLiveYouTubeMusicCategories: true,
+              );
+            }),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Spanish live card'), findsOneWidget);
+      expect(catalogRequests, 1);
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(SearchView)),
+      );
+      activity.value = false;
+      await tester.pumpAndSettle();
+      container
+          .read(_browseTestLanguageProvider.notifier)
+          .select(AppLanguage.english);
+      await tester.pumpAndSettle();
+      expect(find.text('Spanish live card'), findsNothing);
+      expect(find.text('Party'), findsOneWidget);
+      expect(catalogRequests, 1);
+      activity.value = true;
+      await tester.pumpAndSettle();
+      expect(find.text('English live card'), findsOneWidget);
+      expect(find.text('Spanish live card'), findsNothing);
+      expect(catalogRequests, 2);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'category pagination keeps shelves and retries a failed continuation',
+    (tester) async {
+      const category = SearchBrowseCategory(
+        id: 'page',
+        title: 'Concentración',
+        searchQuery: 'focus',
+      );
+      const firstItem = InnerTubeHomeCollection(
+        title: 'Primera playlist',
+        browseId: 'VLfirst',
+        kind: InnerTubeHomeCollectionKind.playlist,
+      );
+      const nextItem = InnerTubeHomeCollection(
+        title: 'Otra playlist',
+        browseId: 'VLnext',
+        kind: InnerTubeHomeCollectionKind.playlist,
+      );
+      var continuationAttempts = 0;
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(SearchState()),
+          browseCatalog: SearchBrowseCatalog(
+            categories: [category],
+            usesLiveYouTubeMusicCategories: false,
+          ),
+          extraOverrides: [
+            playerControllerProvider.overrideWith(
+              _RecordingPlayerController.new,
+            ),
+            searchBrowseCategoryPageProvider.overrideWith(
+              (ref, category) async => InnerTubeMoodGenrePage(
+                sections: [
+                  InnerTubeHomeSection(title: 'Flotando', items: [firstItem]),
+                ],
+                continuation: 'next-page',
+              ),
+            ),
+            searchBrowseCategoryContinuationProvider.overrideWith((
+              ref,
+              token,
+            ) async {
+              expect(token, 'next-page');
+              if (++continuationAttempts == 1) {
+                throw StateError('temporary network error');
+              }
+              return InnerTubeMoodGenrePage(
+                sections: [
+                  InnerTubeHomeSection(title: '', items: [firstItem, nextItem]),
+                ],
+                continuation: 'next-page',
+              );
+            }),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('search-browse-action-page')));
+      await tester.pumpAndSettle();
+      final load = find.byKey(const ValueKey('search-browse-load-more'));
+      await tester.ensureVisible(load);
+      await tester.tap(load);
+      await tester.pumpAndSettle();
+      expect(continuationAttempts, 1);
+      expect(find.text('Reintentar'), findsOneWidget);
+      expect(find.text('Flotando'), findsOneWidget);
+      await tester.tap(load);
+      await tester.pumpAndSettle();
+      expect(continuationAttempts, 2);
+      expect(
+        find.byKey(const ValueKey('browse-item-Primera playlist')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('browse-item-Otra playlist')),
+        findsOneWidget,
+      );
+      expect(find.text('Flotando'), findsOneWidget);
+      expect(
+        load,
+        findsNothing,
+        reason: 'a repeated continuation token cannot trigger a loop',
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'live category cover shows first-song artwork with opaque category colors',
+    (tester) async {
+      const category = SearchBrowseCategory(
+        id: 'focus',
+        title: 'Concentración',
+        searchQuery: 'focus',
+        target: InnerTubeBrowseTarget(
+          browseId: 'FEmusic_moods_and_genres_category',
+          params: 'focus',
+        ),
+      );
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(SearchState()),
+          browseCatalog: SearchBrowseCatalog(
+            categories: [category],
+            usesLiveYouTubeMusicCategories: true,
+          ),
+          extraOverrides: [
+            searchBrowseCategoryArtworkProvider.overrideWith(
+              (ref, category) async => 'https://img.test/first-song.jpg',
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      final cover = tester.widget<SourceImage>(
+        find.byKey(const ValueKey('search-browse-cover-focus')),
+      );
+      expect(cover.source, 'https://img.test/first-song.jpg');
+      expect(cover.cacheWidth, lessThanOrEqualTo(384));
+      expect(cover.opacity, 0.72);
+      expect(
+        find.ancestor(
+          of: find.byKey(const ValueKey('search-browse-cover-focus')),
+          matching: find.byType(Opacity),
+        ),
+        findsNothing,
+        reason: 'Artwork alpha must not allocate a layer for every card.',
+      );
+      final titlePadding = tester.widget<Padding>(
+        find.byKey(const ValueKey('search-browse-title-padding-focus')),
+      );
+      expect(
+        titlePadding.padding,
+        const EdgeInsetsDirectional.fromSTEB(14, 13, 14, 13),
+      );
+      final surface = tester.widget<Ink>(
+        find.byKey(const ValueKey('search-browse-surface-focus')),
+      );
+      expect(
+        (surface.decoration! as BoxDecoration).gradient!.colors.every(
+          (color) => color.a == 1,
+        ),
+        isTrue,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'cached category cover appears first and refreshes when metadata changes',
+    (tester) async {
+      const category = SearchBrowseCategory(
+        id: 'focus',
+        title: 'ConcentraciÃ³n',
+        searchQuery: 'focus',
+        target: InnerTubeBrowseTarget(
+          browseId: 'FEmusic_moods_and_genres_category',
+          params: 'focus',
+        ),
+      );
+      final artworkCache = _MemorySearchBrowseCategoryArtworkCache()
+        ..values['focus'] = 'https://img.test/cached-cover.jpg';
+      final refreshedArtwork = Completer<String?>();
+
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(SearchState()),
+          browseCatalog: SearchBrowseCatalog(
+            categories: [category],
+            usesLiveYouTubeMusicCategories: true,
+          ),
+          artworkCache: artworkCache,
+          extraOverrides: [
+            searchBrowseCategoryArtworkProvider.overrideWith(
+              (ref, category) => refreshedArtwork.future,
+            ),
+          ],
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        tester
+            .widget<SourceImage>(
+              find.byKey(const ValueKey('search-browse-cover-focus')),
+            )
+            .source,
+        'https://img.test/cached-cover.jpg',
+      );
+
+      refreshedArtwork.complete('https://img.test/refreshed-cover.jpg');
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<SourceImage>(
+              find.byKey(const ValueKey('search-browse-cover-focus')),
+            )
+            .source,
+        'https://img.test/refreshed-cover.jpg',
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'restores cached browse cards and covers before live catalog refresh',
+    (tester) async {
+      const category = SearchBrowseCategory(
+        id: 'yt:focus',
+        title: 'ConcentraciÃ³n',
+        searchQuery: 'ConcentraciÃ³n',
+        target: InnerTubeBrowseTarget(
+          browseId: 'FEmusic_moods_and_genres_category',
+          params: 'focus-target',
+        ),
+      );
+      final catalogCache = _MemorySearchBrowseCatalogCache(
+        SearchBrowseCatalogSnapshot(
+          usesLiveYouTubeMusicCategories: true,
+          categories: const [
+            SearchBrowseCategorySnapshot(
+              id: 'yt:focus',
+              title: 'ConcentraciÃ³n',
+              searchQuery: 'ConcentraciÃ³n',
+              browseId: 'FEmusic_moods_and_genres_category',
+              params: 'focus-target',
+            ),
+          ],
+        ),
+      );
+      final artworkCache = _MemorySearchBrowseCategoryArtworkCache()
+        ..values['yt:focus'] = 'https://img.test/cached-focus.jpg';
+      final liveCatalog = Completer<SearchBrowseCatalog>();
+      final refreshedArtwork = Completer<String?>();
+
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(SearchState()),
+          useDefaultBrowseCatalogOverride: false,
+          catalogCache: catalogCache,
+          artworkCache: artworkCache,
+          extraOverrides: [
+            searchBrowseCatalogProvider.overrideWith(
+              (ref) => liveCatalog.future,
+            ),
+            searchBrowseCategoryArtworkProvider.overrideWith(
+              (ref, category) => refreshedArtwork.future,
+            ),
+          ],
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        find.byKey(const ValueKey('search-browse-action-yt:focus')),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .widget<SourceImage>(
+              find.byKey(const ValueKey('search-browse-cover-yt:focus')),
+            )
+            .source,
+        'https://img.test/cached-focus.jpg',
+      );
+
+      liveCatalog.complete(
+        SearchBrowseCatalog(
+          categories: [category],
+          usesLiveYouTubeMusicCategories: true,
+        ),
+      );
+      refreshedArtwork.complete('https://img.test/new-focus.jpg');
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<SourceImage>(
+              find.byKey(const ValueKey('search-browse-cover-yt:focus')),
+            )
+            .source,
+        'https://img.test/new-focus.jpg',
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('offscreen cards do not start cover lookups', (tester) async {
+    tester.view.physicalSize = const Size(360, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final requested = <String>[];
+    final categories = [
+      for (var i = 0; i < 40; i++)
+        SearchBrowseCategory(
+          id: 'card-$i',
+          title: 'Categoría $i',
+          searchQuery: '$i',
+          target: InnerTubeBrowseTarget(
+            browseId: 'FEmusic_moods_and_genres_category',
+            params: 'card-$i',
+          ),
+        ),
+    ];
+    await tester.pumpWidget(
+      _searchApp(
+        controller: _RecordingSearchController(SearchState()),
+        browseCatalog: SearchBrowseCatalog(
+          categories: categories,
+          usesLiveYouTubeMusicCategories: true,
+        ),
+        extraOverrides: [
+          searchBrowseCategoryArtworkProvider.overrideWith((
+            ref,
+            category,
+          ) async {
+            requested.add(category.id);
+            return null;
+          }),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(requested, isNotEmpty);
+    expect(requested.length, lessThan(12));
+    expect(requested, isNot(contains('card-20')));
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final width in [320.0, 1000.0]) {
+    testWidgets(
+      'category shelves fit width $width and open the selected playlist',
+      (tester) async {
+        tester.view.physicalSize = Size(width, 800);
+        tester.view.devicePixelRatio = 1;
+        tester.platformDispatcher.textScaleFactorTestValue = width < 400
+            ? 1.8
+            : 1;
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+          tester.platformDispatcher.clearTextScaleFactorTestValue();
+        });
+        const category = SearchBrowseCategory(
+          id: 'focus',
+          title: 'Concentración',
+          searchQuery: 'focus',
+        );
+        final player = _RecordingPlayerController();
+        final page = InnerTubeMoodGenrePage(
+          sections: [
+            InnerTubeHomeSection(
+              title: 'Flotando',
+              items: const [
+                InnerTubeHomeCollection(
+                  title: 'Lo-fi Loft',
+                  browseId: 'VLlofi',
+                  kind: InnerTubeHomeCollectionKind.playlist,
+                ),
+              ],
+            ),
+            InnerTubeHomeSection(
+              title: 'Música clásica',
+              items: const [
+                InnerTubeHomeCollection(
+                  title: 'Dulce Piano',
+                  browseId: 'VLpiano',
+                  kind: InnerTubeHomeCollectionKind.playlist,
+                ),
+              ],
+            ),
+          ],
+        );
+        await tester.pumpWidget(
+          _searchApp(
+            controller: _RecordingSearchController(SearchState()),
+            browseCatalog: SearchBrowseCatalog(
+              categories: [category],
+              usesLiveYouTubeMusicCategories: false,
+            ),
+            extraOverrides: [
+              playerControllerProvider.overrideWith(() => player),
+              searchBrowseCategoryPageProvider.overrideWith(
+                (ref, category) async => page,
+              ),
+              homeCollectionDetailProvider.overrideWith(
+                (ref, id) async =>
+                    RemoteCollectionData(title: 'Lo-fi Loft', tracks: []),
+              ),
+            ],
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('search-browse-action-focus')),
+        );
+        await tester.pumpAndSettle();
+        expect(find.byType(SearchBrowseCategoryPage), findsOneWidget);
+        expect(find.text('Flotando'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('browse-item-Lo-fi Loft')),
+          findsOneWidget,
+        );
+        expect(
+          tester
+              .getSize(find.byKey(const ValueKey('browse-item-Lo-fi Loft')))
+              .width,
+          closeTo(width < 700 ? 164.0 : 196.0, 0.5),
+        );
+        expect(tester.takeException(), isNull);
+        await tester.tap(find.byKey(const ValueKey('browse-item-Lo-fi Loft')));
+        await tester.pumpAndSettle();
+        final detail = tester.widget<RemoteCollectionDetailPage>(
+          find.byType(RemoteCollectionDetailPage),
+        );
+        expect(detail.title, 'Lo-fi Loft');
+        expect(detail.queueSourceId, 'browse-collection:VLlofi');
+        expect(player.lastRecommendationSelected, isNull);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets(
+    'browse category cards stay opaque in every surface style and theme',
+    (tester) async {
+      for (final brightness in Brightness.values) {
+        for (final mode in SurfaceBackgroundMode.values) {
+          await tester.pumpWidget(
+            _searchApp(
+              controller: _RecordingSearchController(SearchState()),
+              brightness: brightness,
+              surfaceBackgroundMode: mode,
+            ),
+          );
+          await tester.pumpAndSettle();
+          for (final id in ['pop', 'party']) {
+            final surface = tester.widget<Ink>(
+              find.byKey(ValueKey('search-browse-surface-$id')),
+            );
+            final gradient = (surface.decoration! as BoxDecoration).gradient!;
+            expect(
+              gradient.colors.every((color) => color.a == 1),
+              isTrue,
+              reason: '$id / $mode / $brightness',
+            );
+          }
+        }
+      }
+    },
+  );
+
+  testWidgets('search adds the marked songs to an existing playlist', (
+    tester,
+  ) async {
+    final tracks = _searchTracks('Elegida', 'selected', count: 3);
+    final playlists = _SearchSelectionPlaylists();
+    final controller = _RecordingSearchController(
+      SearchState(
+        query: 'consulta',
+        pages: {
+          SearchCategory.songs: SearchPage(
+            category: SearchCategory.songs,
+            backend: SearchBackend.innerTube,
+            tracks: tracks,
+          ),
+        },
+      ),
+    );
+    await tester.pumpWidget(
+      _searchApp(
+        controller: controller,
+        extraOverrides: [
+          playlistsControllerProvider.overrideWith(() => playlists),
+          libraryTracksProvider.overrideWith((ref) async => []),
+          catalogPlaylistsProvider.overrideWith((ref) async => []),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.longPress(find.text('Elegida 1'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Elegida 2'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey('search-selection-add-to-playlist')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('playlist-picker-create')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('playlist-picker-option-selection-playlist')),
+    );
+    await tester.pumpAndSettle();
+    expect(playlists.tracks, [tracks[1], tracks[2]]);
+    expect(
+      find.byKey(const ValueKey('search-selection-toolbar')),
+      findsNothing,
+    );
+  });
+
+  for (final category in [SearchCategory.songs, SearchCategory.videos]) {
+    testWidgets('$category supports multiselect downloads without playback', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(320, 760);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      final tracks = _searchTracks('Seleccionable', 'selected', count: 3);
+      final downloads = _SearchSelectedDownloads();
+      final player = _RecordingPlayerController();
+      final controller = _RecordingSearchController(
+        SearchState(
+          query: 'consulta',
+          selectedCategory: category,
+          pages: {
+            category: SearchPage(
+              category: category,
+              backend: SearchBackend.innerTube,
+              tracks: tracks,
+            ),
+          },
+        ),
+      );
+      await tester.pumpWidget(
+        _searchApp(
+          controller: controller,
+          platform: TargetPlatform.android,
+          extraOverrides: [
+            downloadControllerProvider.overrideWith(() => downloads),
+            playerControllerProvider.overrideWith(() => player),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.longPress(find.text('Seleccionable 0'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Seleccionable 2'));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('search-selection-toolbar')),
+        findsOneWidget,
+      );
+      expect(find.byType(TextField), findsNothing);
+      expect(
+        tester
+            .widget<Checkbox>(
+              find.byKey(const ValueKey('track-result-selection-selected-1')),
+            )
+            .value,
+        isFalse,
+      );
+      await tester.tap(find.byKey(const ValueKey('search-selection-download')));
+      await tester.pumpAndSettle();
+      expect(downloads.tracks, [tracks[0], tracks[2]]);
+      expect(player.lastTrack, isNull);
+      expect(player.lastRecommendationSelected, isNull);
+      expect(
+        find.byKey(const ValueKey('search-selection-toolbar')),
+        findsNothing,
+      );
+      expect(find.byType(TextField), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('search selections clear on another query or category', (
+    tester,
+  ) async {
+    final songs = _searchTracks('Cancion', 'selected', count: 2);
+    final videos = _searchTracks('Video', 'videos', count: 2);
+    final controller = _RecordingSearchController(
+      SearchState(
+        query: 'consulta',
+        pages: {
+          SearchCategory.songs: SearchPage(
+            category: SearchCategory.songs,
+            backend: SearchBackend.innerTube,
+            tracks: songs,
+          ),
+          SearchCategory.videos: SearchPage(
+            category: SearchCategory.videos,
+            backend: SearchBackend.innerTube,
+            tracks: videos,
+          ),
+        },
+      ),
+    );
+    await tester.pumpWidget(_searchApp(controller: controller));
+    await tester.pumpAndSettle();
+    await tester.longPress(find.text('Cancion 0'));
+    await tester.pumpAndSettle();
+    await controller.selectCategory(SearchCategory.videos);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('search-selection-toolbar')),
+      findsNothing,
+    );
+    await tester.longPress(find.text('Video 0'));
+    await tester.pumpAndSettle();
+    await controller.submit('otra consulta');
+    await tester.pump();
+    final container = ProviderScope.containerOf(
+      tester.element(find.byType(SearchView)),
+    );
+    expect(
+      container.read(trackSelectionProvider(searchTrackSelectionScope)).active,
+      isFalse,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('suggests while typing and searches a selected suggestion', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final controller = _RecordingSearchController(SearchState());
+    final suggestions = _RecordingSuggestionSearch();
+
+    await tester.pumpWidget(
+      _searchApp(controller: controller, suggestionsService: suggestions),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'tay');
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(suggestions.requestedQueries, isEmpty);
+    expect(find.byKey(const ValueKey('search-suggestion-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('search-browse-grid')), findsNothing);
+
+    await tester.enterText(find.byType(TextField), 'taylor');
+    await tester.pump(const Duration(milliseconds: 310));
+    expect(suggestions.requestedQueries, <String>['taylor']);
+    suggestions.complete('taylor', <String>[
+      'taylor',
+      'Taylor Swift',
+      'Taylor Swift canciones',
+    ]);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Taylor Swift'), findsOneWidget);
+    await tester.tap(find.text('Taylor Swift'));
+    await tester.pump();
+
+    expect(controller.submittedQueries, <String>['Taylor Swift']);
+    expect(find.byKey(const ValueKey('search-suggestion-0')), findsNothing);
+  });
+
+  testWidgets('keyboard arrows select suggestions and Enter searches them', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1100, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final controller = _RecordingSearchController(SearchState());
+    final suggestions = _RecordingSuggestionSearch();
+
+    await tester.pumpWidget(
+      _searchApp(
+        controller: controller,
+        suggestionsService: suggestions,
+        platform: TargetPlatform.windows,
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'taylor');
+    await tester.pump(const Duration(milliseconds: 310));
+    suggestions.complete('taylor', ['Taylor Swift', 'Taylor Swift live']);
+    await tester.pumpAndSettle();
+
+    expect(find.text('taylor'), findsNWidgets(2));
+    expect(find.text('Taylor Swift'), findsOneWidget);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump();
+    final selectedSuggestion = tester.widget<ListTile>(
+      find.byKey(const ValueKey('search-suggestion-1')),
+    );
+    expect(selectedSuggestion.selected, isTrue);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump();
+    expect(
+      tester
+          .widget<ListTile>(find.byKey(const ValueKey('search-suggestion-2')))
+          .selected,
+      isTrue,
+    );
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+
+    expect(controller.submittedQueries, ['Taylor Swift']);
+    expect(find.byKey(const ValueKey('search-suggestion-0')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final platform in [
+    TargetPlatform.windows,
+    TargetPlatform.macOS,
+    TargetPlatform.linux,
+  ]) {
+    testWidgets('mouse selects a suggestion on $platform across frames', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1100, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      final controller = _RecordingSearchController(SearchState());
+      final suggestions = _RecordingSuggestionSearch();
+      await tester.pumpWidget(
+        _searchApp(
+          controller: controller,
+          suggestionsService: suggestions,
+          platform: platform,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'taylor');
+      await tester.pump(const Duration(milliseconds: 310));
+      suggestions.complete('taylor', ['Taylor Swift']);
+      await tester.pumpAndSettle();
+
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      addTearDown(mouse.removePointer);
+      await mouse.down(tester.getCenter(find.text('Taylor Swift')));
+      await tester.pump();
+      expect(find.text('Taylor Swift'), findsOneWidget);
+      expect(controller.submittedQueries, isEmpty);
+      await mouse.up();
+      // The fake search intentionally keeps the results in their loading state.
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 500));
+
+      expect(controller.submittedQueries, ['Taylor Swift']);
+      expect(find.byKey(const ValueKey('search-suggestion-0')), findsNothing);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'Taylor Swift',
+      );
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('ignores suggestions from an older typed query', (tester) async {
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final suggestions = _RecordingSuggestionSearch();
+
+    await tester.pumpWidget(
+      _searchApp(
+        controller: _RecordingSearchController(SearchState()),
+        suggestionsService: suggestions,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'bad');
+    await tester.pump(const Duration(milliseconds: 310));
+    expect(suggestions.requestedQueries, <String>['bad']);
+
+    await tester.enterText(find.byType(TextField), 'bad bunny');
+    await tester.pump(const Duration(milliseconds: 310));
+    suggestions.complete('bad bunny', <String>['Bad Bunny nuevo']);
+    await tester.pumpAndSettle();
+    expect(find.text('Bad Bunny nuevo'), findsOneWidget);
+
+    suggestions.complete('bad', <String>['Resultado obsoleto']);
+    await tester.pumpAndSettle();
+    expect(find.text('Resultado obsoleto'), findsNothing);
+    expect(find.text('Bad Bunny nuevo'), findsOneWidget);
+  });
+
   testWidgets('shows an adaptive browse grid above the reserved player space', (
     tester,
   ) async {
@@ -204,11 +1226,19 @@ void main() {
       expect(popRect.top, closeTo(partyRect.top, 0.1));
       expect(popRect.left, lessThan(partyRect.left));
       expect(popRect.height, greaterThanOrEqualTo(48));
-      final popLabelRect = tester.getRect(find.text('Pop'));
-      final popArtworkRect = tester.getRect(
+      expect(
         find.byKey(const ValueKey('search-browse-art-pop')),
+        findsNothing,
+        reason: 'large text gets the full card width without decorative art',
       );
-      expect(popLabelRect.overlaps(popArtworkRect), isFalse);
+      expect(
+        tester
+            .widget<Padding>(
+              find.byKey(const ValueKey('search-browse-title-padding-pop')),
+            )
+            .padding,
+        const EdgeInsetsDirectional.fromSTEB(14, 13, 14, 13),
+      );
       expect(tester.takeException(), isNull);
 
       final popAction = find.byKey(const ValueKey('search-browse-action-pop'));
@@ -286,9 +1316,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('browse cards open their collection detail by default', (
-    tester,
-  ) async {
+  testWidgets('browse cards open their shelves by default', (tester) async {
     const pop = SearchBrowseCategory(
       id: 'pop',
       title: 'Pop',
@@ -305,10 +1333,10 @@ void main() {
           usesLiveYouTubeMusicCategories: false,
         ),
         extraOverrides: [
-          searchBrowseCategoryTracksProvider.overrideWith((ref, category) {
+          searchBrowseCategoryPageProvider.overrideWith((ref, category) async {
             categoryLoads++;
             expect(category, pop);
-            return Stream.value(const <TrackInfo>[]);
+            return InnerTubeMoodGenrePage(sections: const []);
           }),
         ],
       ),
@@ -318,12 +1346,10 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('search-browse-action-pop')));
     await tester.pumpAndSettle();
 
-    final detail = tester.widget<RemoteCollectionDetailPage>(
-      find.byType(RemoteCollectionDetailPage),
+    final detail = tester.widget<SearchBrowseCategoryPage>(
+      find.byType(SearchBrowseCategoryPage),
     );
-    expect(detail.title, 'Pop');
-    expect(detail.subtitle, 'YouTube Music');
-    expect(detail.queueSourceId, 'search-browse:pop');
+    expect(detail.category, pop);
     expect(categoryLoads, 1);
     expect(controller.submittedQueries, isEmpty);
   });
@@ -360,7 +1386,7 @@ void main() {
         tester
             .getSize(find.byKey(ValueKey('search-category-${category.name}')))
             .height,
-        48,
+        60,
       );
       expect(
         tester
@@ -368,10 +1394,65 @@ void main() {
               find.byKey(ValueKey('search-category-surface-${category.name}')),
             )
             .height,
-        44,
+        60,
       );
     }
   });
+
+  testWidgets(
+    'selected search category has a soft gradient and larger content',
+    (tester) async {
+      final pages = <SearchCategory, SearchPage>{
+        for (final category in SearchCategory.values)
+          category: SearchPage(
+            category: category,
+            backend: SearchBackend.innerTube,
+          ),
+      };
+      await tester.pumpWidget(
+        _searchApp(
+          controller: _RecordingSearchController(
+            SearchState(query: 'radiohead', pages: pages),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final context = tester.element(
+        find.byKey(const ValueKey('search-category-songs')),
+      );
+      final selectedDecoration =
+          tester
+                  .widget<AnimatedContainer>(
+                    find.byKey(const ValueKey('search-category-surface-songs')),
+                  )
+                  .decoration!
+              as BoxDecoration;
+      final gradient = selectedDecoration.gradient! as LinearGradient;
+      expect(gradient.colors, hasLength(2));
+      expect(gradient.colors.first, isNot(gradient.colors.last));
+      expect(
+        gradient.colors.first,
+        isNot(Theme.of(context).colorScheme.primaryContainer),
+      );
+      expect(
+        tester
+            .widget<Icon>(
+              find.byKey(const ValueKey('search-category-icon-songs')),
+            )
+            .size,
+        20,
+      );
+      final labelStyle = tester.widget<AnimatedDefaultTextStyle>(
+        find.descendant(
+          of: find.byKey(const ValueKey('search-category-songs')),
+          matching: find.byType(AnimatedDefaultTextStyle),
+        ),
+      );
+      expect(labelStyle.style.fontSize, 13);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('shows responsive categories and clears the active search', (
     tester,
@@ -424,7 +1505,7 @@ void main() {
       );
       expect(tapTarget.height, greaterThanOrEqualTo(48));
       expect(surface.height, greaterThanOrEqualTo(44));
-      expect(surface.height, lessThan(tapTarget.height));
+      expect(surface.height, closeTo(tapTarget.height, 0.01));
     }
     expect(tester.takeException(), isNull);
 
@@ -548,7 +1629,7 @@ void main() {
         );
         expect(
           current.left - previous.right,
-          closeTo(6, 0.01),
+          closeTo(7, 0.01),
           reason:
               'category cards should retain their horizontal breathing room',
         );
@@ -683,7 +1764,7 @@ void main() {
                   .padding
               as EdgeInsets)
           .top,
-      10,
+      4,
     );
     final headerBottom = tester
         .getRect(find.byKey(const ValueKey('search-tab-header-surface')))
@@ -695,7 +1776,7 @@ void main() {
         .top;
     expect(
       categoriesTop - headerBottom,
-      closeTo(20, 0.01),
+      closeTo(10, 0.01),
       reason: 'filters should sit closer to the active search bar',
     );
 
@@ -822,6 +1903,114 @@ void main() {
 
     expect(find.byKey(const ValueKey('search-tab-title')), findsOneWidget);
     expect(find.byKey(const ValueKey('search-category-songs')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final category in [SearchCategory.songs, SearchCategory.videos]) {
+    testWidgets('${category.name} starts radio from the selected result only', (
+      tester,
+    ) async {
+      const selected = TrackInfo(
+        id: 'abc123def45',
+        title: 'Cancion elegida',
+        artist: 'Artista',
+        url: 'https://music.youtube.com/watch?v=abc123def45',
+      );
+      const unrelated = TrackInfo(
+        id: 'xyz123uvw45',
+        title: 'Otro resultado',
+        artist: 'Otro artista',
+        url: 'https://music.youtube.com/watch?v=xyz123uvw45',
+      );
+      final controller = _RecordingSearchController(
+        SearchState(
+          query: 'consulta',
+          selectedCategory: category,
+          pages: {
+            category: SearchPage(
+              category: category,
+              backend: SearchBackend.innerTube,
+              tracks: const [selected, unrelated],
+            ),
+          },
+        ),
+      );
+      final player = _RecordingPlayerController();
+      await tester.pumpWidget(
+        _searchApp(
+          controller: controller,
+          extraOverrides: [playerControllerProvider.overrideWith(() => player)],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(
+          ValueKey(
+            category == SearchCategory.songs
+                ? 'track-result-surface-${selected.id}'
+                : 'track-result-play-${selected.id}',
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(player.lastRecommendationSelected?.track, selected);
+      expect(player.lastRecommendationQueue?.map((item) => item.track), [
+        selected,
+      ]);
+      expect(player.lastRecommendationSourceId, 'search-radio:${selected.id}');
+      expect(player.lastRecommendationExtender, isNotNull);
+      expect(player.lastTrack, isNull);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('a search result without a radio ID stays a one-song queue', (
+    tester,
+  ) async {
+    const selected = TrackInfo(
+      id: 'outside',
+      title: 'Sin radio',
+      artist: 'Artista',
+      url: 'https://example.com/audio',
+    );
+    const unrelated = TrackInfo(
+      id: 'other',
+      title: 'Otro resultado',
+      artist: 'Otro artista',
+      url: 'https://example.com/other',
+    );
+    final controller = _RecordingSearchController(
+      SearchState(
+        query: 'consulta',
+        selectedCategory: SearchCategory.videos,
+        pages: {
+          SearchCategory.videos: SearchPage(
+            category: SearchCategory.videos,
+            backend: SearchBackend.innerTubeVideoFallback,
+            tracks: const [selected, unrelated],
+          ),
+        },
+      ),
+    );
+    final player = _RecordingPlayerController();
+    await tester.pumpWidget(
+      _searchApp(
+        controller: controller,
+        extraOverrides: [playerControllerProvider.overrideWith(() => player)],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.byKey(const ValueKey('track-result-surface-outside')),
+    );
+    await tester.pump();
+
+    expect(player.lastTrack, selected);
+    expect(player.lastQueue, [selected]);
+    expect(player.lastRecommendationSelected, isNull);
     expect(tester.takeException(), isNull);
   });
 
@@ -1298,7 +2487,7 @@ void main() {
       );
       expect(
         tester.widget<SourceImage>(firstTrackArtwork).fallbackSource,
-        'https://i.ytimg.com/vi/song-1/hq720.jpg',
+        isNull,
       );
       expect(playerController.lastTrack, isNull);
       expect(playerOpens, 0);
@@ -1308,6 +2497,19 @@ void main() {
 
       expect(playerController.lastTrack, tracks.first);
       expect(playerController.lastQueue, tracks);
+      expect(playerController.lastTrack!.thumbnailUrl, album.thumbnailUrl);
+      expect(
+        playerController.lastTrack!.catalogThumbnailUrl,
+        album.thumbnailUrl,
+      );
+      expect(
+        playerController.lastQueue!.map((track) => track.thumbnailUrl),
+        everyElement(album.thumbnailUrl),
+      );
+      expect(
+        playerController.lastQueue!.map((track) => track.catalogThumbnailUrl),
+        everyElement(album.thumbnailUrl),
+      );
       expect(playerController.lastQueueSourceId, 'album:MPRE-album');
       expect(playerOpens, 1);
     },
@@ -1398,13 +2600,21 @@ void main() {
 
 Widget _searchApp({
   required _RecordingSearchController controller,
+  YouTubeMusicSearchSuggestions? suggestionsService,
   VoidCallback? onOpenPlayer,
   ValueChanged<SearchBrowseCategory>? onBrowseCategorySelected,
   SearchBrowseCatalog? browseCatalog,
+  SearchBrowseCatalogCache? catalogCache,
+  bool useDefaultBrowseCatalogOverride = true,
   List<Override> extraOverrides = const [],
   TargetPlatform? platform,
+  Brightness brightness = Brightness.light,
+  SurfaceBackgroundMode surfaceBackgroundMode = SurfaceBackgroundMode.accent,
   bool disableAnimations = false,
   double bottomContentPadding = 0,
+  SearchBrowseCategoryArtworkCache? artworkCache,
+  ValueListenable<bool>? activity,
+  bool useTestLanguageProvider = false,
 }) {
   const strings = AppStrings(AppLanguage.spanish);
   final resolvedBrowseCatalog =
@@ -1416,14 +2626,33 @@ Widget _searchApp({
   return ProviderScope(
     overrides: [
       searchControllerProvider.overrideWith(() => controller),
-      appStringsProvider.overrideWithValue(strings),
-      searchBrowseCatalogProvider.overrideWithValue(
-        AsyncData(resolvedBrowseCatalog),
+      youtubeMusicSearchSuggestionsProvider.overrideWithValue(
+        suggestionsService ?? const _NoSuggestionsSearch(),
+      ),
+      if (useTestLanguageProvider)
+        appStringsProvider.overrideWith(
+          (ref) => AppStrings(ref.watch(_browseTestLanguageProvider)),
+        )
+      else
+        appStringsProvider.overrideWithValue(strings),
+      searchBrowseCatalogCacheProvider.overrideWithValue(
+        catalogCache ?? _MemorySearchBrowseCatalogCache(),
+      ),
+      if (useDefaultBrowseCatalogOverride)
+        searchBrowseCatalogProvider.overrideWithValue(
+          AsyncData(resolvedBrowseCatalog),
+        ),
+      searchBrowseCategoryArtworkCacheProvider.overrideWithValue(
+        artworkCache ?? _MemorySearchBrowseCategoryArtworkCache(),
       ),
       ...extraOverrides,
     ],
     child: MaterialApp(
-      theme: platform == null ? null : ThemeData(platform: platform),
+      theme: ThemeData(
+        platform: platform,
+        brightness: brightness,
+        extensions: [AppSurfaceTheme(backgroundMode: surfaceBackgroundMode)],
+      ),
       builder: disableAnimations
           ? (context, child) => MediaQuery(
               data: MediaQuery.of(
@@ -1433,14 +2662,138 @@ Widget _searchApp({
             )
           : null,
       home: Scaffold(
-        body: SearchView(
-          onOpenPlayer: onOpenPlayer ?? () {},
-          onBrowseCategorySelected: onBrowseCategorySelected,
-          bottomContentPadding: bottomContentPadding,
-        ),
+        body: activity == null
+            ? SearchView(
+                onOpenPlayer: onOpenPlayer ?? () {},
+                onBrowseCategorySelected: onBrowseCategorySelected,
+                bottomContentPadding: bottomContentPadding,
+              )
+            : ValueListenableBuilder<bool>(
+                valueListenable: activity,
+                builder: (context, active, _) => SearchView(
+                  active: active,
+                  onOpenPlayer: onOpenPlayer ?? () {},
+                  onBrowseCategorySelected: onBrowseCategorySelected,
+                  bottomContentPadding: bottomContentPadding,
+                ),
+              ),
       ),
     ),
   );
+}
+
+final _browseTestLanguageProvider =
+    NotifierProvider<_BrowseTestLanguage, AppLanguage>(_BrowseTestLanguage.new);
+
+class _BrowseTestLanguage extends Notifier<AppLanguage> {
+  @override
+  AppLanguage build() => AppLanguage.spanish;
+
+  void select(AppLanguage language) => state = language;
+}
+
+final class _MemorySearchBrowseCategoryArtworkCache
+    implements SearchBrowseCategoryArtworkCache {
+  _MemorySearchBrowseCategoryArtworkCache({Map<String, String>? values}) {
+    if (values != null) this.values.addAll(values);
+  }
+
+  final values = <String, String>{};
+
+  @override
+  Future<String?> read(String categoryId) async => values[categoryId];
+
+  @override
+  Future<void> write(String categoryId, String? artworkUrl) async {
+    if (artworkUrl == null) {
+      values.remove(categoryId);
+    } else {
+      values[categoryId] = artworkUrl;
+    }
+  }
+}
+
+final class _MemorySearchBrowseCatalogCache
+    implements SearchBrowseCatalogCache {
+  _MemorySearchBrowseCatalogCache([this.snapshot]);
+
+  final SearchBrowseCatalogSnapshot? snapshot;
+
+  @override
+  Future<SearchBrowseCatalogSnapshot?> read(String languageCode) async =>
+      snapshot;
+
+  @override
+  Future<void> write(
+    String languageCode,
+    SearchBrowseCatalogSnapshot catalog,
+  ) async {}
+}
+
+class _NoSuggestionsSearch implements YouTubeMusicSearchSuggestions {
+  const _NoSuggestionsSearch();
+
+  @override
+  Future<List<String>> getSearchSuggestions(
+    String query, {
+    int limit = 8,
+  }) async => const <String>[];
+}
+
+class _SearchSelectedDownloads extends DownloadController {
+  List<TrackInfo>? tracks;
+
+  @override
+  Map<String, DownloadTaskState> build() => const {};
+
+  @override
+  Future<int> downloadTracks(Iterable<TrackInfo> tracks) async {
+    this.tracks = tracks.toList();
+    return tracks.length;
+  }
+}
+
+class _SearchSelectionPlaylists extends PlaylistsController {
+  List<TrackInfo>? tracks;
+
+  @override
+  Future<List<Playlist>> build() async => [
+    Playlist(
+      id: 'selection-playlist',
+      name: 'Selección',
+      trackIds: const [],
+      createdAt: DateTime.utc(2026),
+      updatedAt: DateTime.utc(2026),
+    ),
+  ];
+
+  @override
+  Future<int> addRemoteTracksToPlaylist(
+    String playlistId,
+    Iterable<TrackInfo> tracks, {
+    bool download = false,
+  }) async {
+    expect(playlistId, 'selection-playlist');
+    expect(download, isFalse);
+    this.tracks = tracks.toList();
+    return tracks.length;
+  }
+}
+
+class _RecordingSuggestionSearch implements YouTubeMusicSearchSuggestions {
+  final List<String> requestedQueries = <String>[];
+  final Map<String, Completer<List<String>>> _pending =
+      <String, Completer<List<String>>>{};
+
+  @override
+  Future<List<String>> getSearchSuggestions(String query, {int limit = 8}) {
+    requestedQueries.add(query);
+    return (_pending[query] = Completer<List<String>>()).future;
+  }
+
+  void complete(String query, List<String> values) {
+    _pending[query]!.complete(values);
+  }
 }
 
 List<TrackInfo> _searchTracks(
@@ -1508,6 +2861,10 @@ class _RecordingPlayerController extends PlayerController {
   TrackInfo? lastTrack;
   List<TrackInfo>? lastQueue;
   String? lastQueueSourceId;
+  RecommendationPlaybackItem? lastRecommendationSelected;
+  List<RecommendationPlaybackItem>? lastRecommendationQueue;
+  String? lastRecommendationSourceId;
+  RecommendationQueueExtender? lastRecommendationExtender;
 
   @override
   Future<PlayerSnapshot> build() async =>
@@ -1522,5 +2879,18 @@ class _RecordingPlayerController extends PlayerController {
     lastTrack = track;
     lastQueue = queue == null ? null : List.unmodifiable(queue);
     lastQueueSourceId = queueSourceId;
+  }
+
+  @override
+  Future<void> playRecommendation(
+    RecommendationPlaybackItem selected, {
+    required List<RecommendationPlaybackItem> queue,
+    String? queueSourceId,
+    RecommendationQueueExtender? queueExtender,
+  }) async {
+    lastRecommendationSelected = selected;
+    lastRecommendationQueue = List.unmodifiable(queue);
+    lastRecommendationSourceId = queueSourceId;
+    lastRecommendationExtender = queueExtender;
   }
 }

@@ -6,6 +6,87 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  for (final platform in [
+    TargetPlatform.android,
+    TargetPlatform.iOS,
+    TargetPlatform.windows,
+  ]) {
+    testWidgets('native overscroll keeps $platform physics and full glass', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _FrameHarness(
+          platform: platform,
+          surfaceBackgroundMode: SurfaceBackgroundMode.liquidGlass,
+        ),
+      );
+      final scrollFinder = find.byKey(const ValueKey('test-tab-scroll'));
+      final scroll = tester.widget<CustomScrollView>(scrollFinder);
+      final context = tester.element(scrollFinder);
+      final behavior = scroll.scrollBehavior ?? ScrollConfiguration.of(context);
+      expect(scroll.scrollBehavior, isNull);
+      expect(
+        find.byType(StretchingOverscrollIndicator),
+        platform == TargetPlatform.android ? findsOneWidget : findsNothing,
+      );
+      expect(
+        behavior.getScrollPhysics(context),
+        platform == TargetPlatform.iOS
+            ? isA<BouncingScrollPhysics>()
+            : isA<ClampingScrollPhysics>(),
+      );
+      final glass = tester.widget<LiquidGlassSurface>(
+        find.byKey(const ValueKey('tab-header-liquid-glass')),
+      );
+      expect(glass.blurSigma, 8);
+      expect(glass.intensity, tabHeaderLiquidGlassIntensity);
+      expect(glass.adaptiveEdgeEnabled, isTrue);
+      expect(glass.perimeterOpticsEnabled, isTrue);
+      expect(glass.edgeTreatment, LiquidGlassEdgeTreatment.bottom);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets(
+    'filter hides downwards and reappears below the pinned title upwards',
+    (tester) async {
+      tester.view.physicalSize = const Size(360, 640);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      await tester.pumpWidget(
+        const _FrameHarness(
+          showPinnedFooter: true,
+          hidePinnedFooterOnScroll: true,
+        ),
+      );
+      final header = find.byKey(const ValueKey('test-tab-header-surface'));
+      final footer = find.byKey(const ValueKey('tab-floating-footer'));
+      final initialHeader = tester.getRect(header);
+      expect(tester.getSize(footer).height, 54);
+      await tester.drag(
+        find.byKey(const ValueKey('test-tab-scroll')),
+        const Offset(0, -320),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.getSize(footer).height, 0);
+      expect(tester.getRect(header), initialHeader);
+      expect(find.text('Filtro').hitTestable(), findsNothing);
+      await tester.drag(
+        find.byKey(const ValueKey('test-tab-scroll')),
+        const Offset(0, 70),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.getSize(footer).height, 54);
+      expect(tester.getRect(header), initialHeader);
+      expect(tester.getRect(footer).top, closeTo(initialHeader.bottom, 0.1));
+      expect(find.text('Filtro').hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets(
     'uses a translucent neutral scrolled-under surface and returns to top',
     (tester) async {
@@ -366,6 +447,39 @@ void main() {
   });
 
   testWidgets(
+    'liquid title uses motion optics only during vertical scrolling',
+    (tester) async {
+      tester.view.physicalSize = const Size(360, 640);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      await tester.pumpWidget(
+        const _FrameHarness(
+          surfaceBackgroundMode: SurfaceBackgroundMode.liquidGlass,
+        ),
+      );
+
+      final glassFinder = find.byKey(const ValueKey('tab-header-liquid-glass'));
+      bool isMoving() =>
+          tester.widget<LiquidGlassSurface>(glassFinder).backdropMotion;
+      expect(isMoving(), isFalse);
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('test-tab-scroll'))),
+      );
+      await gesture.moveBy(const Offset(0, -180));
+      await tester.pump();
+      expect(isMoving(), isTrue);
+
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(isMoving(), isFalse);
+    },
+  );
+
+  testWidgets(
     'pinned footer stays compact and blurs content from the shared scroll',
     (tester) async {
       tester.view.physicalSize = const Size(360, 640);
@@ -488,24 +602,29 @@ void main() {
 
 class _FrameHarness extends StatelessWidget {
   const _FrameHarness({
+    this.platform,
     this.showHeader = true,
     this.disableAnimations = false,
     this.surfaceBackgroundMode = SurfaceBackgroundMode.accent,
     this.textScaler = TextScaler.noScaling,
     this.showPinnedFooter = false,
+    this.hidePinnedFooterOnScroll = false,
   });
 
   final bool showHeader;
+  final TargetPlatform? platform;
   final bool disableAnimations;
   final SurfaceBackgroundMode surfaceBackgroundMode;
   final TextScaler textScaler;
   final bool showPinnedFooter;
+  final bool hidePinnedFooterOnScroll;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       theme: ThemeData(
         useMaterial3: true,
+        platform: platform,
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
         extensions: [AppSurfaceTheme(backgroundMode: surfaceBackgroundMode)],
       ),
@@ -520,6 +639,7 @@ class _FrameHarness extends StatelessWidget {
         body: ScrolledUnderTabFrame(
           surfaceKey: const ValueKey('test-tab-header-surface'),
           pinnedFooterSurfaceKey: const ValueKey('test-pinned-footer-surface'),
+          hidePinnedFooterOnScroll: hidePinnedFooterOnScroll,
           scrollKey: const ValueKey('test-tab-scroll'),
           header: showHeader
               ? const Row(

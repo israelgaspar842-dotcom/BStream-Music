@@ -1,4 +1,5 @@
 import '../../domain/entities/lyric_line.dart';
+import '../../domain/entities/lyric_word.dart';
 
 class LrcParser {
   const LrcParser();
@@ -34,7 +35,9 @@ class LrcParser {
         continue;
       }
 
-      final text = leadingTags.group(2)!.trim();
+      final sourceText = leadingTags.group(2)!.trim();
+      final wordTags = _wordTag.allMatches(sourceText).toList();
+      final text = sourceText.replaceAll(_wordTag, '').trim();
       for (final timestamp in timestamps) {
         final shiftedMilliseconds = timestamp.inMilliseconds + offset;
         parsed.add(
@@ -46,6 +49,9 @@ class LrcParser {
               text: text,
             ),
             sourceIndex: sourceIndex++,
+            enhancedSource: sourceText,
+            wordTags: wordTags,
+            wordOffset: offset + (timestamp - timestamps.first).inMilliseconds,
           ),
         );
       }
@@ -57,7 +63,84 @@ class LrcParser {
           ? byTimestamp
           : left.sourceIndex.compareTo(right.sourceIndex);
     });
-    return List.unmodifiable(parsed.map((entry) => entry.line));
+    final nextTimes = List<Duration?>.filled(parsed.length, null);
+    Duration? later;
+    for (var i = parsed.length - 1; i >= 0; i--) {
+      if (i + 1 < parsed.length &&
+          parsed[i + 1].line.timestamp > parsed[i].line.timestamp) {
+        later = parsed[i + 1].line.timestamp;
+      }
+      nextTimes[i] = later;
+    }
+    return List.unmodifiable(
+      List.generate(parsed.length, (i) {
+        final entry = parsed[i];
+        final line = entry.line;
+        final words = _words(
+          entry.enhancedSource,
+          line.text,
+          entry.wordTags,
+          entry.wordOffset,
+          nextTimes[i],
+        );
+        final timed = LyricLine(
+          timestamp: line.timestamp,
+          text: line.text,
+          words: words,
+        );
+        return timed.hasWordTiming ? timed : line;
+      }),
+    );
+  }
+
+  List<LyricWord> _words(
+    String source,
+    String text,
+    List<RegExpMatch> tags,
+    int offset,
+    Duration? nextLine,
+  ) {
+    if (tags.isEmpty) return const [];
+    if (source.substring(0, tags.first.start).trim().isNotEmpty) {
+      return const [];
+    }
+    final words = <LyricWord>[];
+    Duration shifted(Duration value) {
+      final milliseconds = value.inMilliseconds + offset;
+      return Duration(milliseconds: milliseconds < 0 ? 0 : milliseconds);
+    }
+
+    var cursor = 0;
+    for (var i = 0; i < tags.length; i++) {
+      final tag = tags[i];
+      final next = i + 1 < tags.length ? tags[i + 1] : null;
+      final raw = source.substring(tag.end, next?.start ?? source.length);
+      final part = raw.trim();
+      if (part.isEmpty) continue;
+      final start = _parseTimestamp(tag.group(1)!);
+      final end = next == null ? null : _parseTimestamp(next.group(1)!);
+      // A final closing marker or the next line is a known boundary. The last
+      // line without either remains line synced instead of guessing its pace.
+      if (start == null ||
+          (next != null && end == null) ||
+          (end == null && nextLine == null)) {
+        return const [];
+      }
+      final startOffset = text.indexOf(part, cursor);
+      if (startOffset < 0) return const [];
+      final endOffset = startOffset + part.length;
+      words.add(
+        LyricWord(
+          text: part,
+          start: shifted(start),
+          end: end == null ? nextLine! : shifted(end),
+          startOffset: startOffset,
+          endOffset: endOffset,
+        ),
+      );
+      cursor = endOffset;
+    }
+    return List.unmodifiable(words);
   }
 
   int _globalOffset(List<String> rows) {
@@ -126,6 +209,7 @@ class LrcParser {
 
   static final _leadingTags = RegExp(r'^\s*((?:\[[^\]]*\]\s*)+)(.*)$');
   static final _tag = RegExp(r'\[([^\]]*)\]');
+  static final _wordTag = RegExp(r'<(\d+(?::\d+){1,2}(?:[.,]\d+)?)>');
   static final _offset = RegExp(
     r'\[\s*offset\s*:\s*([+-]?\d+)\s*\]',
     caseSensitive: false,
@@ -133,8 +217,17 @@ class LrcParser {
 }
 
 class _IndexedLyricLine {
-  const _IndexedLyricLine({required this.line, required this.sourceIndex});
+  const _IndexedLyricLine({
+    required this.line,
+    required this.sourceIndex,
+    required this.enhancedSource,
+    required this.wordTags,
+    required this.wordOffset,
+  });
 
   final LyricLine line;
   final int sourceIndex;
+  final String enhancedSource;
+  final List<RegExpMatch> wordTags;
+  final int wordOffset;
 }

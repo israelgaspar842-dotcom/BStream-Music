@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'player_lyrics_icon.dart';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -13,15 +15,25 @@ import '../../../../core/widgets/marquee_text.dart';
 import '../../../../platform_channels/android_screen_channel.dart';
 import '../../../../platform_channels/lyrics_presentation_chrome.dart';
 import '../../../../services/lyrics/lyrics_romanization_service.dart';
+import '../../../../services/lyrics/lyrics_translation_service.dart';
 import '../../../../services/lyrics/lyrics_service.dart';
 import '../../../../services/player/player_service.dart';
 import '../../domain/entities/lyrics.dart';
 import '../providers/music_providers.dart';
 import 'lyrics_animation_transition.dart';
+import 'lyrics_background.dart';
+import 'lyrics_background_selector.dart';
+import 'lyrics_line_layout.dart';
+import 'lyrics_share_preview.dart';
+import 'lyrics_text_style_transition.dart';
+import 'lyrics_word_timing_text.dart';
 import 'mini_player.dart';
-import 'playback_gradient_background.dart';
+import 'playback_menu_bottom_sheet.dart';
 import 'playback_progress_line.dart';
+import 'playback_control_icon.dart';
+import '../providers/playback_artwork_provider.dart';
 import 'source_image.dart';
+import 'decorative_progress_transition.dart';
 import 'uniform_playback_slider_track_shape.dart';
 import 'wavy_playback_seek_bar.dart';
 
@@ -66,10 +78,19 @@ double _lyricsDesktopCompanionGapFor(
   if (width < 840) {
     return (inactive: 29, active: 30, plain: 27);
   }
-  if (width < 1200) {
-    return (inactive: 33, active: 34, plain: 30);
-  }
-  return (inactive: 36, active: 37, plain: 33);
+
+  // Scale continuously with the desktop window instead of jumping between
+  // three fixed sizes. A maximized 1920 px window gets ~48 px active lyrics,
+  // while the cap keeps very wide monitors readable without oversized lines.
+  final progress = ((width - 840) / 360).clamp(0.0, 1.0);
+  final beyondMediumWindow = math.max(0.0, width - 1200.0);
+  final active = (30.0 + (7.0 * progress) + (beyondMediumWindow * 0.015))
+      .clamp(30.0, 56.0)
+      .toDouble();
+  final plain = (27.0 + (6.0 * progress) + (beyondMediumWindow * 0.015))
+      .clamp(27.0, 52.0)
+      .toDouble();
+  return (inactive: active - 1.0, active: active, plain: plain);
 }
 
 ({
@@ -138,6 +159,10 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
   bool? _mobileLandscapeTarget;
   bool? _mobileLayoutReducedMotion;
   int _mobileLayoutAnimationRevision = 0;
+  LyricsDocument? _shareSelectionDocument;
+  Set<int> _shareSelectedLines = const {};
+
+  bool get _selectingLines => _shareSelectionDocument != null;
 
   @override
   void initState() {
@@ -325,166 +350,298 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
         ? miniPlayerHeight
         : 0.0;
     _syncLookup(lookup);
+    if (_selectingLines &&
+        !identical(
+          ref.watch(currentLyricsDocumentProvider),
+          _shareSelectionDocument,
+        )) {
+      _shareSelectionDocument = null;
+      _shareSelectedLines = const {};
+    }
 
-    final ({Widget content, bool showOffset}) lyricsPresentation =
-        lookup == null
-        ? (
-            content: _LyricsMessage(
-              icon: Icons.lyrics_outlined,
-              message: strings.noPlayback,
-            ),
-            showOffset: false,
+    final lyricsPresentation = lookup == null
+        ? _LyricsMessage(
+            icon: Icons.lyrics_outlined,
+            message: strings.noPlayback,
           )
         : _showSimilarLyrics
-        ? (content: _buildSimilarLyrics(lookup), showOffset: false)
+        ? _buildSimilarLyrics(lookup)
         : selectedLyrics != null
-        ? (
-            content: _buildLyrics(
-              selectedLyrics,
-              offset,
-              lyricsCentered,
-              lyricsAnimationStyle,
-              lyricsRomanizationEnabled,
-              lyricsRomanizationLanguages,
-            ),
-            showOffset: selectedLyrics.lines.isNotEmpty,
+        ? _buildLyrics(
+            selectedLyrics,
+            offset,
+            lyricsCentered,
+            lyricsAnimationStyle,
+            lyricsRomanizationEnabled,
+            lyricsRomanizationLanguages,
           )
         : ref
               .watch(lyricsProvider(lookup))
               .when(
-                loading: () => (
-                  content: _LyricsMessage(
-                    icon: Icons.manage_search_rounded,
-                    message: strings.lyricsLoading,
-                    loading: true,
-                  ),
-                  showOffset: false,
+                loading: () => _LyricsMessage(
+                  icon: Icons.manage_search_rounded,
+                  message: strings.lyricsLoading,
+                  loading: true,
                 ),
                 error: (error, _) {
                   final noInternet = error is LyricsConnectionException;
-                  return (
-                    content: _LyricsMessage(
-                      icon: noInternet
-                          ? Icons.wifi_off_rounded
-                          : Icons.cloud_off_rounded,
-                      message: noInternet
-                          ? strings.lyricsNoInternet
-                          : strings.lyricsLoadError,
-                      actionLabel: strings.retry,
-                      onAction: () => ref.invalidate(lyricsProvider(lookup)),
-                    ),
-                    showOffset: false,
+                  return _LyricsMessage(
+                    icon: noInternet
+                        ? Icons.wifi_off_rounded
+                        : Icons.cloud_off_rounded,
+                    message: noInternet
+                        ? strings.lyricsNoInternet
+                        : strings.lyricsLoadError,
+                    actionLabel: strings.retry,
+                    onAction: () => ref.invalidate(lyricsProvider(lookup)),
                   );
                 },
-                data: (lyrics) => (
-                  content: _buildLyrics(
-                    lyrics,
-                    offset,
-                    lyricsCentered,
-                    lyricsAnimationStyle,
-                    lyricsRomanizationEnabled,
-                    lyricsRomanizationLanguages,
-                  ),
-                  showOffset: lyrics?.lines.isNotEmpty == true,
+                data: (lyrics) => _buildLyrics(
+                  lyrics,
+                  offset,
+                  lyricsCentered,
+                  lyricsAnimationStyle,
+                  lyricsRomanizationEnabled,
+                  lyricsRomanizationLanguages,
                 ),
               );
 
     final lyricsContentLayer = _buildLyricsContentLayer(
-      content: lyricsPresentation.content,
+      content: lyricsPresentation,
       mobileLayout: mobileLayout,
-      // The compact landscape layout already gives most of its height to the
-      // artwork/timeline companion. Keep the lyrics unobstructed there; the
-      // timing control remains available in mobile portrait and on desktop.
-      showOffset:
-          lyricsPresentation.showOffset &&
-          (!mobileLayout ||
-              !landscape ||
-              !AppPlatform.isMobileTargetPlatform(Theme.of(context).platform)),
-      offset: offset,
     );
 
-    return Scaffold(
-      backgroundColor: const Color(0xFF030504),
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          const PlayerPlaybackGradientBackground(),
-          const DecoratedBox(
-            decoration: BoxDecoration(color: Color(0x52000000)),
-          ),
-          SafeArea(
-            bottom: false,
-            child: Padding(
-              padding: EdgeInsets.only(
-                bottom: systemBottomInset + bottomChromeHeight,
-              ),
-              child: mobileLayout
-                  ? _LyricsMobileOrientationLayout(
-                      landscape: landscape,
-                      animation: _mobileSideLayoutAnimation,
-                      companionWidth: animatedMobileCompanionWidth,
-                      companionSlotWidth: animatedMobileCompanionSlotWidth,
-                      header: _LyricsHeader(lookup: lookup),
-                      companion: const _LyricsPlaybackCompanion(
-                        mobileLayout: true,
-                      ),
-                      content: lyricsContentLayer,
-                    )
-                  : Column(
-                      children: [
-                        if (!showSideCompanion) _LyricsHeader(lookup: lookup),
-                        Expanded(
-                          child: FractionallySizedBox(
-                            key: const ValueKey('lyrics-side-layout-frame'),
-                            widthFactor: sideLayoutWidthFactor,
-                            alignment: Alignment.center,
-                            child: Row(
-                              children: [
-                                if (showSideCompanion)
-                                  SizedBox(
+    return PopScope(
+      canPop: !_selectingLines,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && _selectingLines) _cancelLineSelection();
+      },
+      child: Scaffold(
+        backgroundColor: const Color(0xFF030504),
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            LyricsBackground(
+              motionEnabled: !_selectingLines && !_showSimilarLyrics,
+            ),
+            SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: EdgeInsets.only(
+                  bottom: systemBottomInset + bottomChromeHeight,
+                ),
+                child: mobileLayout
+                    ? _LyricsMobileOrientationLayout(
+                        landscape: landscape,
+                        animation: _mobileSideLayoutAnimation,
+                        companionWidth: animatedMobileCompanionWidth,
+                        companionSlotWidth: animatedMobileCompanionSlotWidth,
+                        header: _LyricsHeader(lookup: lookup),
+                        companion: const _LyricsPlaybackCompanion(
+                          mobileLayout: true,
+                        ),
+                        content: lyricsContentLayer,
+                      )
+                    : Column(
+                        children: [
+                          if (!showSideCompanion) _LyricsHeader(lookup: lookup),
+                          Expanded(
+                            child: FractionallySizedBox(
+                              key: const ValueKey('lyrics-side-layout-frame'),
+                              widthFactor: sideLayoutWidthFactor,
+                              alignment: Alignment.center,
+                              child: Row(
+                                children: [
+                                  if (showSideCompanion)
+                                    SizedBox(
+                                      key: const ValueKey(
+                                        'lyrics-companion-width',
+                                      ),
+                                      width: companionWidth,
+                                      child: const _LyricsPlaybackCompanion(
+                                        mobileLayout: false,
+                                      ),
+                                    ),
+                                  if (showSideCompanion)
+                                    SizedBox(
+                                      key: const ValueKey(
+                                        'lyrics-desktop-companion-gap',
+                                      ),
+                                      width: sideCompanionGap,
+                                    ),
+                                  Expanded(
                                     key: const ValueKey(
-                                      'lyrics-companion-width',
+                                      'lyrics-content-region',
                                     ),
-                                    width: companionWidth,
-                                    child: const _LyricsPlaybackCompanion(
-                                      mobileLayout: false,
-                                    ),
+                                    child: lyricsContentLayer,
                                   ),
-                                if (showSideCompanion)
-                                  SizedBox(
-                                    key: const ValueKey(
-                                      'lyrics-desktop-companion-gap',
-                                    ),
-                                    width: sideCompanionGap,
-                                  ),
-                                Expanded(
-                                  key: const ValueKey('lyrics-content-region'),
-                                  child: lyricsContentLayer,
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-            ),
-          ),
-          if (!mobileLayout && showBottomMiniPlayer)
-            Positioned(
-              left: systemLeftInset,
-              right: systemRightInset,
-              bottom: systemBottomInset,
-              child: SizedBox(
-                key: const ValueKey('lyrics-player-dock'),
-                height: bottomChromeHeight,
-                child: MiniPlayer(
-                  mode: miniPlayerMode,
-                  backgroundMode: miniPlayerBackgroundMode,
-                  onOpenPlayer: () => Navigator.of(context).pop(),
-                ),
+                        ],
+                      ),
               ),
             ),
-        ],
+            if (!mobileLayout)
+              Positioned(
+                top: math.max(viewPadding.top, mediaPadding.top) + 12,
+                right: systemRightInset + 12,
+                // Anchor the desktop controls to the viewport, not the centered,
+                // width-limited lyrics panel (including on ultrawide displays).
+                child: _buildLyricsToolbar(mobileLayout: false),
+              ),
+            if (!mobileLayout && showBottomMiniPlayer)
+              Positioned(
+                left: systemLeftInset,
+                right: systemRightInset,
+                bottom: systemBottomInset,
+                child: SizedBox(
+                  key: const ValueKey('lyrics-player-dock'),
+                  height: bottomChromeHeight,
+                  child: MiniPlayer(
+                    mode: miniPlayerMode,
+                    backgroundMode: miniPlayerBackgroundMode,
+                    onOpenPlayer: () => Navigator.of(context).pop(),
+                  ),
+                ),
+              ),
+            if (_selectingLines)
+              Positioned(
+                left: systemLeftInset + 12,
+                right: systemRightInset + 12,
+                bottom: systemBottomInset + bottomChromeHeight + 12,
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 600),
+                    child: _buildLineSelectionBar(strings),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLineSelectionBar(AppStrings strings) {
+    return Material(
+      key: const ValueKey('lyrics-line-selection-bar'),
+      color: const Color(0xF21B1E23),
+      elevation: 8,
+      borderRadius: BorderRadius.circular(22),
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact =
+                constraints.maxWidth < 340 ||
+                MediaQuery.textScalerOf(context).scale(14) > 20;
+            return Row(
+              children: [
+                IconButton(
+                  key: const ValueKey('lyrics-line-selection-cancel'),
+                  tooltip: strings.cancel,
+                  color: Colors.white,
+                  onPressed: _cancelLineSelection,
+                  icon: const Icon(Icons.close_rounded),
+                ),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Text(
+                    strings.lyricsShareSelectedCount(
+                      _shareSelectedLines.length,
+                    ),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                if (compact)
+                  IconButton.filled(
+                    key: const ValueKey('lyrics-line-selection-share'),
+                    tooltip: strings.lyricsShareTitle,
+                    onPressed: _shareSelectedLines.isEmpty
+                        ? null
+                        : _previewSelectedLines,
+                    icon: const Icon(Icons.ios_share_rounded),
+                  )
+                else
+                  FilledButton.icon(
+                    key: const ValueKey('lyrics-line-selection-share'),
+                    onPressed: _shareSelectedLines.isEmpty
+                        ? null
+                        : _previewSelectedLines,
+                    icon: const Icon(Icons.ios_share_rounded, size: 18),
+                    label: Text(strings.lyricsShareTitle),
+                  ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  void _cancelLineSelection() {
+    setState(() {
+      _shareSelectionDocument = null;
+      _shareSelectedLines = const {};
+    });
+  }
+
+  List<String> _shareLinesFor(LyricsDocument lyrics) => lyrics.lines.isNotEmpty
+      ? lyrics.lines.map((line) => line.text).toList(growable: false)
+      : (lyrics.plainLyrics?.trim() ?? '').split('\n');
+
+  void _toggleLineSelection(LyricsDocument lyrics, int index) {
+    final lines = _shareLinesFor(lyrics);
+    if (index < 0 || index >= lines.length || lines[index].trim().isEmpty) {
+      return;
+    }
+    final selected = identical(lyrics, _shareSelectionDocument)
+        ? _shareSelectedLines
+        : const <int>{};
+    if (!selected.contains(index) && selected.length >= 5) {
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(
+        SnackBar(content: Text(ref.read(appStringsProvider).lyricsShareLimit)),
+      );
+      return;
+    }
+    setState(() {
+      _shareSelectionDocument = lyrics;
+      _shareSelectedLines = Set.unmodifiable(
+        selected.contains(index)
+            ? (Set<int>.of(selected)..remove(index))
+            : {...selected, index},
+      );
+    });
+  }
+
+  Future<void> _previewSelectedLines() async {
+    final lyrics = _shareSelectionDocument;
+    if (lyrics == null || _shareSelectedLines.isEmpty) return;
+    final lines = _shareLinesFor(lyrics);
+    final indices = _shareSelectedLines.toList()..sort();
+    final snapshot = ref.read(playerControllerProvider).value;
+    final artwork = ref.read(playbackArtworkProvider);
+    await showLyricsSharePreview(
+      context: context,
+      data: LyricsShareCardData(
+        title: snapshot?.title?.trim().isNotEmpty == true
+            ? snapshot!.title!
+            : lyrics.trackName,
+        artist: snapshot?.artist?.trim().isNotEmpty == true
+            ? snapshot!.artist!
+            : lyrics.artistName,
+        lines: [for (final index in indices) lines[index].trim()],
+        artworkSource: artwork.source,
+        artworkFallbackSource: artwork.fallback,
       ),
     );
   }
@@ -492,59 +649,66 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
   Widget _buildLyricsContentLayer({
     required Widget content,
     required bool mobileLayout,
-    required bool showOffset,
-    required Duration offset,
   }) {
-    final strings = ref.watch(appStringsProvider);
+    if (!mobileLayout) {
+      return content;
+    }
     return Stack(
       fit: StackFit.expand,
       children: [
         content,
-        if (!mobileLayout || showOffset)
+        if (!_selectingLines)
           Align(
-            alignment: Alignment.bottomCenter,
+            alignment: Alignment.bottomRight,
             child: Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: _LyricsToolbarFit(
-                enabled: mobileLayout,
-                child: Row(
-                  key: const ValueKey('lyrics-overlay-toolbar'),
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (!mobileLayout)
-                      _LyricsExitButton(
-                        tooltip: strings.choose(
-                          'Salir de Letras',
-                          'Exit Lyrics',
-                        ),
-                        onPressed: () =>
-                            unawaited(Navigator.of(context).maybePop()),
-                      ),
-                    if (!mobileLayout && showOffset) const SizedBox(width: 8),
-                    if (showOffset)
-                      _LyricsOffsetControls(
-                        offset: offset,
-                        onDecrease: offset > LyricsOffsetController.minimum
-                            ? ref
-                                  .read(lyricsOffsetControllerProvider.notifier)
-                                  .decrease
-                            : null,
-                        onIncrease: offset < LyricsOffsetController.maximum
-                            ? ref
-                                  .read(lyricsOffsetControllerProvider.notifier)
-                                  .increase
-                            : null,
-                        onReset: ref
-                            .read(lyricsOffsetControllerProvider.notifier)
-                            .reset,
-                      ),
-                  ],
-                ),
-              ),
+              padding: const EdgeInsets.only(bottom: 8, right: 12),
+              child: _buildLyricsToolbar(mobileLayout: true),
             ),
           ),
       ],
     );
+  }
+
+  Widget _buildLyricsToolbar({required bool mobileLayout}) {
+    final strings = ref.watch(appStringsProvider);
+    return Row(
+      key: const ValueKey('lyrics-overlay-toolbar'),
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _LyricsRoundButton(
+          buttonKey: const ValueKey('lyrics-settings-button'),
+          icon: Icons.settings_rounded,
+          tooltip: strings.lyricsSettings,
+          onPressed: _showLyricsSettings,
+        ),
+        if (!mobileLayout) ...[
+          const SizedBox(width: 8),
+          _LyricsRoundButton(
+            buttonKey: const ValueKey('lyrics-exit-button'),
+            icon: Icons.close_rounded,
+            tooltip: strings.choose('Salir de Letras', 'Exit Lyrics'),
+            onPressed: () => unawaited(Navigator.of(context).maybePop()),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _showLyricsSettings() async {
+    final selectLines = await showPlaybackMenuBottomSheet<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (menuContext) => _LyricsSettingsMenu(
+        onSelectLines: () => Navigator.of(menuContext).pop(true),
+      ),
+    );
+    if (!mounted || selectLines != true) return;
+    final lyrics = ref.read(currentLyricsDocumentProvider);
+    if (lyrics == null || lyrics.instrumental || !lyrics.hasContent) return;
+    setState(() {
+      _shareSelectionDocument = lyrics;
+      _shareSelectedLines = const {};
+    });
   }
 
   Widget _buildLyrics(
@@ -556,6 +720,17 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
     Set<LyricsRomanizationLanguage> lyricsRomanizationLanguages,
   ) {
     final strings = ref.watch(appStringsProvider);
+    if (ref
+            .watch(settingsControllerProvider)
+            .value
+            ?.enabledLyricsProviders
+            .isEmpty ==
+        true) {
+      return _LyricsMessage(
+        icon: Icons.lyrics_outlined,
+        message: strings.lyricsProvidersDisabledHint,
+      );
+    }
     if (lyrics == null) {
       return _LyricsMessage(
         icon: Icons.search_off_rounded,
@@ -565,12 +740,29 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
         onAction: () => setState(() => _showSimilarLyrics = true),
       );
     }
-    final sourceFooter = strings.lyricsSource;
+    final sourceFooter = strings.lyricsSourceForProvider(lyrics.provider);
     if (lyrics.instrumental) {
       return _LyricsMessage(
         icon: Icons.piano_rounded,
         message: strings.lyricsInstrumental,
         footer: sourceFooter,
+      );
+    }
+    if (ref.watch(settingsControllerProvider).value?.lyricsTranslationEnabled ==
+        true) {
+      final result = ref.watch(currentLyricsTranslationProvider).asData?.value;
+      final translated = result?.alreadyInTargetLanguage == false
+          ? result
+          : null;
+      return _buildLyricsContent(
+        lyrics,
+        offset: offset,
+        lyricsCentered: lyricsCentered,
+        lyricsAnimationStyle: lyricsAnimationStyle,
+        sourceFooter: translated == null
+            ? sourceFooter
+            : '$sourceFooter\n${strings.lyricsTranslationAttribution}',
+        translated: translated,
       );
     }
     final romanizationFuture =
@@ -634,16 +826,23 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
     required LyricsAnimationStyle lyricsAnimationStyle,
     required String sourceFooter,
     RomanizedLyricsView? romanized,
+    TranslatedLyricsView? translated,
   }) {
     if (lyrics.lines.isNotEmpty) {
       return _SyncedLyricsTimeline(
         lines: lyrics.lines,
-        romanizedLines: romanized?.syncedLines,
+        romanizedLines: translated?.syncedLines ?? romanized?.syncedLines,
+        isTranslation: translated != null,
         offset: offset,
         sourceFooter: sourceFooter,
         lyricsCentered: lyricsCentered,
         animationStyle: lyricsAnimationStyle,
         monotonicClock: widget.monotonicClock,
+        selectingLines: identical(lyrics, _shareSelectionDocument),
+        selectedLines: identical(lyrics, _shareSelectionDocument)
+            ? _shareSelectedLines
+            : const {},
+        onSelectLine: (index) => _toggleLineSelection(lyrics, index),
       );
     }
 
@@ -651,9 +850,16 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
     if (plainLyrics != null && plainLyrics.isNotEmpty) {
       return _PlainLyricsView(
         lyrics: plainLyrics,
-        romanizedLyrics: romanized?.plainLyrics?.trim(),
+        romanizedLyrics:
+            translated?.plainLyrics ?? romanized?.plainLyrics?.trim(),
+        isTranslation: translated != null,
         sourceFooter: sourceFooter,
         lyricsCentered: lyricsCentered,
+        selectingLines: identical(lyrics, _shareSelectionDocument),
+        selectedLines: identical(lyrics, _shareSelectionDocument)
+            ? _shareSelectedLines
+            : const {},
+        onSelectLine: (index) => _toggleLineSelection(lyrics, index),
       );
     }
     return _LyricsMessage(
@@ -835,6 +1041,8 @@ class _LyricsPageState extends ConsumerState<LyricsPage>
       return;
     }
     _lookupIdentity = nextIdentity;
+    _shareSelectionDocument = null;
+    _shareSelectedLines = const {};
     _showSimilarLyrics = false;
     _manualSearchTitle = '';
     if (_manualSearchController.text.isNotEmpty) {
@@ -1094,25 +1302,6 @@ class _LyricsContentSettleTransition extends StatelessWidget {
   }
 }
 
-class _LyricsToolbarFit extends StatelessWidget {
-  const _LyricsToolbarFit({required this.enabled, required this.child});
-
-  final bool enabled;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!enabled) {
-      return child;
-    }
-    return FittedBox(
-      key: const ValueKey('lyrics-mobile-toolbar-fit'),
-      fit: BoxFit.scaleDown,
-      child: child,
-    );
-  }
-}
-
 class _SimilarLyricsList extends ConsumerWidget {
   const _SimilarLyricsList({
     required this.candidates,
@@ -1217,11 +1406,18 @@ class _SimilarLyricsList extends ConsumerWidget {
   }
 }
 
-class _LyricsExitButton extends StatelessWidget {
-  const _LyricsExitButton({required this.tooltip, required this.onPressed});
+class _LyricsRoundButton extends StatelessWidget {
+  const _LyricsRoundButton({
+    required this.tooltip,
+    required this.onPressed,
+    required this.icon,
+    required this.buttonKey,
+  });
 
   final String tooltip;
   final VoidCallback onPressed;
+  final IconData icon;
+  final Key buttonKey;
 
   @override
   Widget build(BuildContext context) {
@@ -1231,37 +1427,38 @@ class _LyricsExitButton extends StatelessWidget {
       context,
     ).withValues(alpha: isDark ? 0.62 : 0.72);
     final border = AppColors.menuBorderFor(context);
-    return Container(
-      width: 48,
-      height: 48,
-      decoration: BoxDecoration(
-        color: surface,
-        shape: BoxShape.circle,
-        border: Border.all(color: border),
-        boxShadow: [
-          BoxShadow(
-            color: isDark ? const Color(0x48000000) : const Color(0x20000000),
-            blurRadius: 12,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      child: IconButton(
-        key: const ValueKey('lyrics-exit-button'),
-        tooltip: tooltip,
-        icon: const Icon(Icons.close_rounded),
-        iconSize: 24,
-        padding: EdgeInsets.zero,
-        constraints: const BoxConstraints.tightFor(width: 48, height: 48),
-        style: IconButton.styleFrom(
-          minimumSize: const Size.square(48),
-          maximumSize: const Size.square(48),
-          foregroundColor: accent,
-          backgroundColor: Colors.transparent,
-          disabledBackgroundColor: Colors.transparent,
-          shape: const CircleBorder(),
+    return SizedBox.square(
+      dimension: 48,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: surface,
+          shape: BoxShape.circle,
+          border: Border.all(color: border),
+          boxShadow: [
+            BoxShadow(
+              color: isDark ? const Color(0x48000000) : const Color(0x20000000),
+              blurRadius: 12,
+              offset: const Offset(0, 3),
+            ),
+          ],
         ),
-        onPressed: onPressed,
+        child: IconButton(
+          key: buttonKey,
+          tooltip: tooltip,
+          icon: Icon(icon),
+          iconSize: 24,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+          style: IconButton.styleFrom(
+            minimumSize: const Size.square(48),
+            maximumSize: const Size.square(48),
+            foregroundColor: accent,
+            backgroundColor: Colors.transparent,
+            disabledBackgroundColor: Colors.transparent,
+            shape: const CircleBorder(),
+          ),
+          onPressed: onPressed,
+        ),
       ),
     );
   }
@@ -1498,16 +1695,11 @@ class _LyricsCompanionControls extends ConsumerWidget {
                   child: IconButton(
                     key: const ValueKey('lyrics-companion-primary-control'),
                     tooltip: isPlaying ? strings.pause : strings.play,
-                    icon: Transform.translate(
-                      offset: isPlaying
-                          ? Offset.zero
-                          : Offset(mobileLayout ? 1.25 : 1.5, 0),
-                      transformHitTests: false,
-                      child: Icon(
-                        isPlaying
-                            ? Icons.pause_rounded
-                            : Icons.play_arrow_rounded,
-                      ),
+                    icon: PlaybackControlIcon(
+                      isLoading: playback.status == PlayerStatus.loading,
+                      isPlaying: isPlaying,
+                      loadingLabel: strings.playbackLoading,
+                      playOffset: Offset(mobileLayout ? 1.25 : 1.5, 0),
                     ),
                     iconSize: primaryIconSize,
                     padding: EdgeInsets.zero,
@@ -1735,10 +1927,10 @@ class _LyricsHeader extends ConsumerWidget {
                               .read(playerControllerProvider.notifier)
                               .togglePlayPause()
                         : null,
-                    icon: Icon(
-                      isPlaying
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded,
+                    icon: PlaybackControlIcon(
+                      isLoading: playback.status == PlayerStatus.loading,
+                      isPlaying: isPlaying,
+                      loadingLabel: strings.playbackLoading,
                     ),
                   ),
                 ),
@@ -1809,6 +2001,7 @@ class _LyricsHeaderProgress extends ConsumerWidget {
         return (
           position: snapshot?.position ?? Duration.zero,
           duration: snapshot?.duration,
+          isPlaying: snapshot?.status == PlayerStatus.playing,
         );
       }),
     );
@@ -1825,6 +2018,7 @@ class _LyricsHeaderProgress extends ConsumerWidget {
       key: const ValueKey('lyrics-header-progress'),
       value: progress,
       color: progressColor,
+      animateProgress: timeline.isPlaying,
       progressAnimationKey: const ValueKey('lyrics-header-progress-animation'),
       colorAnimationKey: const ValueKey(
         'lyrics-header-progress-color-animation',
@@ -1846,15 +2040,23 @@ class _SyncedLyricsTimeline extends ConsumerStatefulWidget {
     required this.sourceFooter,
     required this.lyricsCentered,
     required this.animationStyle,
+    required this.selectingLines,
+    required this.selectedLines,
+    required this.onSelectLine,
     this.monotonicClock,
+    this.isTranslation = false,
   });
 
   final List<LyricLine> lines;
   final List<String>? romanizedLines;
+  final bool isTranslation;
   final Duration offset;
   final String sourceFooter;
   final bool lyricsCentered;
   final LyricsAnimationStyle animationStyle;
+  final bool selectingLines;
+  final Set<int> selectedLines;
+  final ValueChanged<int> onSelectLine;
   final Duration Function()? monotonicClock;
 
   @override
@@ -1965,6 +2167,13 @@ List<_LyricsTimelineEntry> _buildLyricsTimelineEntries(
 }
 
 Duration? _inferredInstrumentalStart(LyricLine current, LyricLine next) {
+  if (current.hasWordTiming) {
+    final end = current.words.fold<Duration>(
+      current.timestamp,
+      (latest, word) => word.end > latest ? word.end : latest,
+    );
+    return next.timestamp - end >= _minimumInferredInstrumentalGap ? end : null;
+  }
   final distance = next.timestamp - current.timestamp;
   if (distance < _minimumUnmarkedLyricGap) {
     return null;
@@ -2001,13 +2210,15 @@ String? _lyricsPlaybackIdentity(PlayerSnapshot snapshot) {
   return '$title\u0000${snapshot.artist?.trim() ?? ''}';
 }
 
-class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
+class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline>
+    with WidgetsBindingObserver {
   late int _activeIndex;
   late List<_LyricsTimelineEntry> _entries;
   final ScrollController _scrollController = ScrollController();
   ProviderSubscription<_LyricsPlaybackClockSample?>? _playbackSubscription;
   Stopwatch? _ownedMonotonicClock;
   late final Duration Function() _monotonicNow;
+  late final ValueNotifier<LyricsWordPlaybackSample> _wordPlayback;
   _LyricsPlaybackClockSample? _playbackSample;
   Duration _playbackAnchor = Duration.zero;
   Duration _monotonicAnchor = Duration.zero;
@@ -2016,6 +2227,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
   Timer? _resumeAutoScrollTimer;
   bool _autoScrollSuspended = false;
   bool _tickerModeEnabled = true;
+  bool _appActive = true;
   double? _activeScaledFontSize;
   double? _layoutWidth;
   double? _viewportHeight;
@@ -2026,6 +2238,11 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
   List<String>? _measuredRomanizedLines;
   double? _measuredContentWidth;
   double? _measuredActiveFontSize;
+  double? _measuredInactiveFontSize;
+  TextStyle? _measuredInheritedStyle;
+  TextHeightBehavior? _measuredTextHeightBehavior;
+  TextWidthBasis? _measuredTextWidthBasis;
+  LyricsTextAccessibilityOverrides? _measuredAccessibility;
   TextScaler? _measuredTextScaler;
   TextDirection? _measuredTextDirection;
   Locale? _measuredLocale;
@@ -2033,6 +2250,9 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _appActive = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     final injectedClock = widget.monotonicClock;
     if (injectedClock == null) {
       final clock = Stopwatch()..start();
@@ -2050,6 +2270,15 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     _activeIndex = _activeTimelineEntryIndex(
       _entries,
       initialPosition + widget.offset,
+    );
+    _wordPlayback = ValueNotifier(
+      LyricsWordPlaybackSample(
+        position: initialPosition + widget.offset,
+        sampledAt: _monotonicNow(),
+        isPlaying:
+            _presentationActive &&
+            initialSnapshot?.status == PlayerStatus.playing,
+      ),
     );
     _playbackSubscription = ref.listenManual<_LyricsPlaybackClockSample?>(
       playerControllerProvider.select((player) {
@@ -2076,6 +2305,16 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
   @override
   void didUpdateWidget(covariant _SyncedLyricsTimeline oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectingLines != widget.selectingLines) {
+      _resumeAutoScrollTimer?.cancel();
+      if (widget.selectingLines && _scrollController.hasClients) {
+        // Stop an in-flight follow animation at its current position.
+        _scrollController.jumpTo(_scrollController.offset);
+      } else if (!widget.selectingLines) {
+        _autoScrollSuspended = false;
+        _scheduleAutoScroll();
+      }
+    }
     final linesChanged = !identical(oldWidget.lines, widget.lines);
     final offsetChanged = oldWidget.offset != widget.offset;
     if (linesChanged || offsetChanged) {
@@ -2084,6 +2323,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     if (linesChanged || offsetChanged) {
       _updateActiveLine(_estimatedPlaybackPosition(), notify: false);
       _scheduleNextLineBoundary();
+      _publishWordPlayback();
     }
     if (linesChanged ||
         offsetChanged ||
@@ -2099,6 +2339,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     final tickerModeEnabled = TickerMode.valuesOf(context).enabled;
     if (_tickerModeEnabled != tickerModeEnabled) {
       _tickerModeEnabled = tickerModeEnabled;
+      _publishWordPlayback();
       if (tickerModeEnabled) {
         _updateActiveLine(_estimatedPlaybackPosition(), notify: false);
         _scheduleNextLineBoundary();
@@ -2120,7 +2361,9 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _playbackSubscription?.close();
+    _wordPlayback.dispose();
     _cancelLineBoundaryTimer();
     _resumeAutoScrollTimer?.cancel();
     _ownedMonotonicClock?.stop();
@@ -2128,11 +2371,37 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     super.dispose();
   }
 
+  bool get _presentationActive => _tickerModeEnabled && _appActive;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final active = state == AppLifecycleState.resumed;
+    if (_appActive == active) return;
+    _appActive = active;
+    _publishWordPlayback();
+    if (active) {
+      _updateActiveLine(_estimatedPlaybackPosition());
+      _scheduleNextLineBoundary();
+      _scheduleAutoScroll();
+    } else {
+      _cancelLineBoundaryTimer();
+      _resumeAutoScrollTimer?.cancel();
+      _resumeAutoScrollTimer = null;
+      _autoScrollSuspended = false;
+      // Stop an outstanding scroll rather than carrying its ticker into the
+      // background. Returning to Lyrics recenters from the current clock.
+      if (_scrollController.hasClients) {
+        _scrollController.jumpTo(_scrollController.offset);
+      }
+    }
+  }
+
   void _acceptPlaybackSample(_LyricsPlaybackClockSample sample) {
     _playbackSample = sample;
     _playbackAnchor = sample.position;
     _monotonicAnchor = _monotonicNow();
-    _updateActiveLine(sample.position, notify: _tickerModeEnabled);
+    if (!_presentationActive) return;
+    _publishWordPlayback();
     _scheduleNextLineBoundary();
   }
 
@@ -2143,6 +2412,16 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     }
     final elapsed = _monotonicNow() - _monotonicAnchor;
     return elapsed.isNegative ? _playbackAnchor : _playbackAnchor + elapsed;
+  }
+
+  void _publishWordPlayback() {
+    _wordPlayback.value = LyricsWordPlaybackSample(
+      position: _estimatedPlaybackPosition() + widget.offset,
+      sampledAt: _monotonicNow(),
+      isPlaying:
+          _presentationActive &&
+          _playbackSample?.status == PlayerStatus.playing,
+    );
   }
 
   bool _updateActiveLine(Duration position, {bool notify = true}) {
@@ -2157,7 +2436,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     } else {
       _activeIndex = next;
     }
-    if (_tickerModeEnabled) {
+    if (_presentationActive) {
       _scheduleAutoScroll();
     }
     return true;
@@ -2173,15 +2452,15 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     _cancelLineBoundaryTimer();
     final sample = _playbackSample;
     if (!mounted ||
-        !_tickerModeEnabled ||
+        !_presentationActive ||
         sample == null ||
-        sample.status != PlayerStatus.playing ||
         _entries.isEmpty) {
       return;
     }
 
     final position = _estimatedPlaybackPosition();
     _updateActiveLine(position);
+    if (sample.status != PlayerStatus.playing) return;
     final nextIndex = _activeIndex + 1;
     if (nextIndex < 0 || nextIndex >= _entries.length) {
       return;
@@ -2193,7 +2472,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
       () {
         if (!mounted ||
             generation != _lineBoundaryGeneration ||
-            !_tickerModeEnabled ||
+            !_presentationActive ||
             _playbackSample?.status != PlayerStatus.playing) {
           return;
         }
@@ -2201,19 +2480,25 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
         // The monotonic sample decides whether the boundary was truly
         // reached. This protects against an early platform timer and keeps
         // fake-time pumpAndSettle calls from advancing real playback.
-        _updateActiveLine(_estimatedPlaybackPosition());
         _scheduleNextLineBoundary();
       },
     );
   }
 
   void _scheduleAutoScroll() {
-    if (_activeIndex < 0 || _autoScrollSuspended) {
+    if (!_presentationActive ||
+        _activeIndex < 0 ||
+        _autoScrollSuspended ||
+        widget.selectingLines) {
       return;
     }
     final targetIndex = _activeIndex;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _autoScrollSuspended || targetIndex != _activeIndex) {
+      if (!mounted ||
+          !_presentationActive ||
+          widget.selectingLines ||
+          _autoScrollSuspended ||
+          targetIndex != _activeIndex) {
         return;
       }
       if (!_scrollController.hasClients ||
@@ -2286,6 +2571,11 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     _measuredRomanizedLines = null;
     _measuredContentWidth = null;
     _measuredActiveFontSize = null;
+    _measuredInactiveFontSize = null;
+    _measuredInheritedStyle = null;
+    _measuredTextHeightBehavior = null;
+    _measuredTextWidthBasis = null;
+    _measuredAccessibility = null;
     _measuredTextScaler = null;
     _measuredTextDirection = null;
     _measuredLocale = null;
@@ -2294,6 +2584,11 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
   bool _ensureLineMetrics({
     required double contentWidth,
     required double activeFontSize,
+    required double inactiveFontSize,
+    required TextStyle inheritedStyle,
+    required TextHeightBehavior? textHeightBehavior,
+    required TextWidthBasis textWidthBasis,
+    required LyricsTextAccessibilityOverrides accessibility,
     required TextScaler textScaler,
     required TextDirection textDirection,
     required Locale? locale,
@@ -2301,9 +2596,13 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     final metricsAreCurrent =
         identical(_measuredEntries, _entries) &&
         identical(_measuredRomanizedLines, widget.romanizedLines) &&
-        _measuredContentWidth != null &&
-        (_measuredContentWidth! - contentWidth).abs() < 0.5 &&
+        _measuredContentWidth == contentWidth &&
         _measuredActiveFontSize == activeFontSize &&
+        _measuredInactiveFontSize == inactiveFontSize &&
+        _measuredInheritedStyle == inheritedStyle &&
+        _measuredTextHeightBehavior == textHeightBehavior &&
+        _measuredTextWidthBasis == textWidthBasis &&
+        _measuredAccessibility == accessibility &&
         _measuredTextScaler == textScaler &&
         _measuredTextDirection == textDirection &&
         _measuredLocale == locale;
@@ -2311,22 +2610,37 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
       return false;
     }
 
+    final activeStyle = resolveLyricsOriginalStyle(
+      inheritedStyle,
+      fontSize: activeFontSize,
+    );
+    final inactiveStyle = resolveLyricsOriginalStyle(
+      inheritedStyle,
+      fontSize: inactiveFontSize,
+    );
     final extents = <double>[
       for (final entry in _entries)
         entry.isInstrumental
             ? _instrumentalLyricsLineExtent
-            : _measureLyricLineExtent(
+            : measureLyricsLineExtent(
                 originalText: entry.line!.text,
-                romanizedText:
-                    widget.romanizedLines != null &&
-                        entry.sourceIndex < widget.romanizedLines!.length
-                    ? widget.romanizedLines![entry.sourceIndex]
-                    : null,
+                secondaryText: _displayedRomanization(
+                  entry.line!.text,
+                  widget.romanizedLines != null &&
+                          entry.sourceIndex < widget.romanizedLines!.length
+                      ? widget.romanizedLines![entry.sourceIndex]
+                      : null,
+                ),
                 contentWidth: contentWidth,
-                activeFontSize: activeFontSize,
+                activeStyle: activeStyle,
+                inactiveStyle: inactiveStyle,
+                secondaryFontSize: romanizedLyricsFontSize(activeFontSize),
                 textScaler: textScaler,
                 textDirection: textDirection,
                 locale: locale,
+                textHeightBehavior: textHeightBehavior,
+                textWidthBasis: textWidthBasis,
+                accessibility: accessibility,
               ),
     ];
     final offsets = List<double>.filled(extents.length + 1, 0);
@@ -2340,6 +2654,11 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     _measuredRomanizedLines = widget.romanizedLines;
     _measuredContentWidth = contentWidth;
     _measuredActiveFontSize = activeFontSize;
+    _measuredInactiveFontSize = inactiveFontSize;
+    _measuredInheritedStyle = inheritedStyle;
+    _measuredTextHeightBehavior = textHeightBehavior;
+    _measuredTextWidthBasis = textWidthBasis;
+    _measuredAccessibility = accessibility;
     _measuredTextScaler = textScaler;
     _measuredTextDirection = textDirection;
     _measuredLocale = locale;
@@ -2348,6 +2667,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
 
   void _suspendAutoScroll() {
     _resumeAutoScrollTimer?.cancel();
+    if (widget.selectingLines) return;
     _autoScrollSuspended = true;
     _resumeAutoScrollTimer = Timer(const Duration(seconds: 4), () {
       if (!mounted) {
@@ -2371,6 +2691,12 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
     final textScaler = MediaQuery.textScalerOf(context);
     final textDirection = Directionality.of(context);
     final locale = Localizations.maybeLocaleOf(context);
+    final defaultTextStyle = DefaultTextStyle.of(context);
+    final fontFamily = defaultTextStyle.style.fontFamily;
+    final textHeightBehavior =
+        defaultTextStyle.textHeightBehavior ??
+        DefaultTextHeightBehavior.maybeOf(context);
+    final accessibility = lyricsTextAccessibilityOverridesOf(context);
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2381,6 +2707,11 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
         final metricsChanged = _ensureLineMetrics(
           contentWidth: contentWidth,
           activeFontSize: typography.active,
+          inactiveFontSize: typography.inactive,
+          inheritedStyle: defaultTextStyle.style,
+          textHeightBehavior: textHeightBehavior,
+          textWidthBasis: defaultTextStyle.textWidthBasis,
+          accessibility: accessibility,
           textScaler: textScaler,
           textDirection: textDirection,
           locale: locale,
@@ -2389,6 +2720,7 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
           source: widget.sourceFooter,
           seekHint: strings.tapLyricsToSeek,
           contentWidth: contentWidth,
+          fontFamily: fontFamily,
           textScaler: textScaler,
           textDirection: textDirection,
           locale: locale,
@@ -2477,21 +2809,29 @@ class _SyncedLyricsTimelineState extends ConsumerState<_SyncedLyricsTimeline> {
                           ? const ValueKey('active-lyric-line')
                           : ValueKey('lyric-line-$sourceIndex'),
                       originalText: line.text,
+                      words: line.hasWordTiming ? line.words : const [],
+                      wordPlayback: _wordPlayback,
+                      monotonicClock: _monotonicNow,
                       romanizedText:
                           widget.romanizedLines != null &&
                               sourceIndex < widget.romanizedLines!.length
                           ? widget.romanizedLines![sourceIndex]
                           : null,
                       romanizationKey: ValueKey(
-                        'lyrics-line-romanization-$sourceIndex',
+                        'lyrics-line-${widget.isTranslation ? 'translation' : 'romanization'}-$sourceIndex',
                       ),
                       active: active,
                       passed: passed,
+                      selecting: widget.selectingLines,
+                      selected: widget.selectedLines.contains(sourceIndex),
                       lyricsCentered: widget.lyricsCentered,
                       animationStyle: widget.animationStyle,
                       activeFontSize: typography.active,
                       inactiveFontSize: typography.inactive,
-                      onTap: () => _seekToTimestamp(line.timestamp),
+                      onTap: widget.selectingLines
+                          ? () => widget.onSelectLine(sourceIndex)
+                          : () => _seekToTimestamp(line.timestamp),
+                      onLongPress: () => widget.onSelectLine(sourceIndex),
                     );
                   },
                 ),
@@ -2555,29 +2895,45 @@ class _InstrumentalLyricsTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final playback = ref.watch(
-      playerControllerProvider.select((player) {
-        final snapshot = player.value;
-        return (
-          position: snapshot?.position ?? Duration.zero,
-          duration: snapshot?.duration,
-          isPlaying: snapshot?.status == PlayerStatus.playing,
-        );
-      }),
-    );
-    final effectivePosition = playback.position + offset;
-    final effectiveEnd =
-        end ?? (playback.duration == null ? null : playback.duration! + offset);
+    final visible = TickerMode.valuesOf(context).enabled;
+    final playback = active && visible
+        ? ref.watch(
+            playerControllerProvider.select((player) {
+              final snapshot = player.value;
+              return (
+                position: snapshot?.position ?? Duration.zero,
+                isPlaying: snapshot?.status == PlayerStatus.playing,
+              );
+            }),
+          )
+        : null;
+    // Neighboring breaks remain mounted by the sliver. Their progress is
+    // constant, so they only need another update when their active state changes.
+    final duration = end == null
+        ? ref.watch(
+            playerControllerProvider.select((player) => player.value?.duration),
+          )
+        : null;
+    final effectiveEnd = end ?? (duration == null ? null : duration + offset);
     final totalMilliseconds = effectiveEnd == null
         ? 0
         : (effectiveEnd - start).inMilliseconds;
-    final elapsedMilliseconds = (effectivePosition - start).inMilliseconds;
+    final elapsedMilliseconds = playback == null
+        ? (passed ? totalMilliseconds : 0)
+        : (playback.position + offset - start).inMilliseconds;
     final enabled = totalMilliseconds > 0;
     final progress = enabled
         ? (elapsedMilliseconds / totalMilliseconds).clamp(0.0, 1.0).toDouble()
         : 0.0;
     final reduceMotion = MediaQuery.disableAnimationsOf(context);
-    final accent = AppColors.downloadAccentFor(context);
+    final artworkColor = visible
+        ? ref.watch(playbackArtworkColorProvider)
+        : null;
+    final waveColor = playbackWaveColorFor(
+      context,
+      artworkColor,
+      surfaceBrightness: Brightness.dark,
+    );
     final strings = ref.watch(appStringsProvider);
     final opacity = active ? 1.0 : (passed ? 0.48 : 0.28);
     final alignment = lyricsCentered
@@ -2614,17 +2970,16 @@ class _InstrumentalLyricsTile extends ConsumerWidget {
                   opacity: opacity,
                   child: SizedBox(
                     width: width,
-                    child: TweenAnimationBuilder<double>(
-                      tween: Tween(end: progress),
-                      duration: reduceMotion || !active
-                          ? Duration.zero
-                          : const Duration(milliseconds: 540),
+                    child: DecorativeProgressTransition(
+                      value: progress,
+                      animateProgress: playback?.isPlaying ?? false,
+                      duration: const Duration(milliseconds: 540),
                       curve: Curves.linear,
                       builder: (context, value, _) => WavyPlaybackProgressLine(
                         key: progressKey,
                         value: value,
-                        isPlaying: active && playback.isPlaying && progress < 1,
-                        waveColor: accent,
+                        isPlaying: playback?.isPlaying == true && progress < 1,
+                        waveColor: waveColor,
                         surfaceBrightness: Brightness.dark,
                         height: 48,
                         waveAmplitude: 12,
@@ -2646,6 +3001,9 @@ class _LyricLineTile extends StatelessWidget {
   const _LyricLineTile({
     required this.contentKey,
     required this.originalText,
+    required this.words,
+    required this.wordPlayback,
+    required this.monotonicClock,
     required this.romanizedText,
     required this.romanizationKey,
     required this.active,
@@ -2655,11 +3013,17 @@ class _LyricLineTile extends StatelessWidget {
     required this.activeFontSize,
     required this.inactiveFontSize,
     required this.onTap,
+    required this.onLongPress,
+    required this.selecting,
+    required this.selected,
     super.key,
   });
 
   final Key contentKey;
   final String originalText;
+  final List<LyricWord> words;
+  final ValueListenable<LyricsWordPlaybackSample> wordPlayback;
+  final Duration Function() monotonicClock;
   final String? romanizedText;
   final Key romanizationKey;
   final bool active;
@@ -2669,108 +3033,359 @@ class _LyricLineTile extends StatelessWidget {
   final double activeFontSize;
   final double inactiveFontSize;
   final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final bool selecting;
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
     final accent = AppColors.downloadAccentFor(context);
     final mobileLayout = _usesMobileLyricsLayout(context);
     final halo = _lyricsHaloFor(context, accent);
-    final color = active
-        ? mobileLayout
+    final activeStyle =
+        resolveLyricsOriginalStyle(
+          DefaultTextStyle.of(context).style,
+          fontSize: activeFontSize,
+        ).copyWith(
+          color: mobileLayout
               ? Colors.white
-              : Color.alphaBlend(accent.withValues(alpha: 0.08), Colors.white)
-        : Colors.white.withValues(alpha: passed ? 0.62 : 0.38);
-    final textStyle = TextStyle(
-      color: color,
-      fontSize: active ? activeFontSize : inactiveFontSize,
-      height: 1.16,
-      fontWeight: FontWeight.w900,
-      letterSpacing: -0.45,
-      shadows: active
-          ? [
-              Shadow(
-                color: halo.color.withValues(alpha: halo.innerAlpha),
-                blurRadius: halo.innerBlur,
-              ),
-              Shadow(
-                color: halo.color.withValues(alpha: halo.outerAlpha),
-                blurRadius: halo.outerBlur,
-              ),
-              const Shadow(
-                color: Color(0x7A000000),
-                blurRadius: 10,
-                offset: Offset(0, 2),
-              ),
-            ]
-          : null,
-    );
+              : Color.alphaBlend(accent.withValues(alpha: 0.08), Colors.white),
+          shadows: [
+            Shadow(
+              color: halo.color.withValues(alpha: halo.innerAlpha),
+              blurRadius: halo.innerBlur,
+            ),
+            Shadow(
+              color: halo.color.withValues(alpha: halo.outerAlpha),
+              blurRadius: halo.outerBlur,
+            ),
+            const Shadow(
+              color: Color(0x7A000000),
+              blurRadius: 10,
+              offset: Offset(0, 2),
+            ),
+          ],
+        );
     final trimmedRomanization = _displayedRomanization(
       originalText,
       romanizedText,
     );
     final showRomanization = trimmedRomanization != null;
-    final animationDuration = MediaQuery.disableAnimationsOf(context)
-        ? Duration.zero
-        : const Duration(milliseconds: 520);
-    final lineText = Padding(
-      key: contentKey,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            originalText,
-            textAlign: lyricsCentered ? TextAlign.center : TextAlign.start,
-          ),
-          if (showRomanization) ...[
-            SizedBox(height: active ? 5 : 4),
-            AnimatedDefaultTextStyle(
-              duration: animationDuration,
-              curve: Curves.easeInOutCubic,
-              style: TextStyle(
-                color: Colors.white.withValues(
-                  alpha: active ? 0.72 : (passed ? 0.55 : 0.48),
-                ),
-                fontSize: ((active ? activeFontSize : inactiveFontSize) * 0.62)
-                    .clamp(15.0, 22.0)
-                    .toDouble(),
-                height: 1.25,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0,
-              ),
-              child: Text(
-                trimmedRomanization,
-                key: romanizationKey,
-                textAlign: lyricsCentered ? TextAlign.center : TextAlign.start,
-              ),
-            ),
-          ],
-        ],
+    final styledLine = LyricsTextStyleTransition(
+      contentKey: contentKey,
+      active: active,
+      originalText: originalText,
+      words: words,
+      wordPlayback: wordPlayback,
+      monotonicClock: monotonicClock,
+      secondaryText: trimmedRomanization,
+      secondaryKey: romanizationKey,
+      activeStyle: activeStyle,
+      inactiveStyle: activeStyle.copyWith(
+        color: Colors.white.withValues(alpha: passed ? 0.62 : 0.38),
+        fontSize: inactiveFontSize,
+        shadows: const [],
       ),
-    );
-    final styledLine = AnimatedDefaultTextStyle(
-      duration: animationDuration,
-      curve: Curves.easeInOutCubic,
-      style: textStyle,
-      child: lineText,
+      secondaryFontSize: romanizedLyricsFontSize(activeFontSize),
+      textAlign: lyricsCentered ? TextAlign.center : TextAlign.start,
     );
     return Semantics(
       label: showRomanization
           ? '$originalText\n$trimmedRomanization'
           : originalText,
       excludeSemantics: true,
-      selected: active,
+      selected: selecting ? selected : active,
       button: true,
       onTap: onTap,
+      onLongPress: onLongPress,
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
         onTap: onTap,
-        child: LyricsAnimationTransition(
-          style: animationStyle,
-          active: active,
-          accent: accent,
-          alignment: lyricsCentered ? Alignment.center : Alignment.centerLeft,
-          child: styledLine,
+        onLongPress: onLongPress,
+        child: _LyricsLineSelectionDecoration(
+          selecting: selecting,
+          selected: selected,
+          child: LyricsAnimationTransition(
+            style: animationStyle,
+            active: active,
+            accent: accent,
+            alignment: lyricsCentered ? Alignment.center : Alignment.centerLeft,
+            child: styledLine,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LyricsSettingsMenu extends ConsumerWidget {
+  const _LyricsSettingsMenu({required this.onSelectLines});
+
+  final VoidCallback onSelectLines;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final strings = ref.watch(appStringsProvider);
+    final settings = ref.watch(settingsControllerProvider).value;
+    final lyrics = ref.watch(currentLyricsDocumentProvider);
+    final offset = ref.watch(lyricsOffsetControllerProvider);
+    final offsetController = ref.read(lyricsOffsetControllerProvider.notifier);
+    final settingsController = ref.read(settingsControllerProvider.notifier);
+    final translationEnabled = settings?.lyricsTranslationEnabled == true;
+    final translation = translationEnabled
+        ? ref.watch(currentLyricsTranslationProvider)
+        : null;
+    final foreground = AppColors.menuForegroundFor(context);
+    final canTranslate =
+        lyrics != null && lyrics.hasContent && !lyrics.instrumental;
+    return SafeArea(
+      top: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * .86,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      strings.lyricsSettings,
+                      style: Theme.of(
+                        context,
+                      ).textTheme.titleLarge?.copyWith(color: foreground),
+                    ),
+                  ),
+                  IconButton(
+                    key: const ValueKey('lyrics-settings-close'),
+                    tooltip: strings.close,
+                    color: foreground,
+                    icon: const Icon(Icons.close_rounded),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: SingleChildScrollView(
+                key: const ValueKey('lyrics-settings-menu'),
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const SizedBox(height: 12),
+                    Text(
+                      strings.lyricsOffset,
+                      style: TextStyle(
+                        color: foreground,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      lyrics?.hasSyncedLyrics == true
+                          ? strings.lyricsOffsetHint
+                          : strings.lyricsOffsetUnavailable,
+                      style: TextStyle(color: foreground.withValues(alpha: .7)),
+                    ),
+                    if (lyrics?.hasSyncedLyrics == true) ...[
+                      const SizedBox(height: 12),
+                      Center(
+                        child: _LyricsOffsetControls(
+                          offset: offset,
+                          onDecrease: offset > LyricsOffsetController.minimum
+                              ? offsetController.decrease
+                              : null,
+                          onIncrease: offset < LyricsOffsetController.maximum
+                              ? offsetController.increase
+                              : null,
+                          onReset: offsetController.reset,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    const Divider(),
+                    Text(
+                      strings.lyricsAlignment,
+                      style: TextStyle(
+                        color: foreground,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: SegmentedButton<LyricsTextAlignment>(
+                        key: const ValueKey('lyrics-menu-alignment-options'),
+                        selected: {
+                          settings?.lyricsTextAlignment ??
+                              LyricsTextAlignment.normal,
+                        },
+                        segments: [
+                          ButtonSegment(
+                            value: LyricsTextAlignment.normal,
+                            icon: const Icon(Icons.format_align_left_rounded),
+                            label: Text(strings.normalLyricsAlignment),
+                          ),
+                          ButtonSegment(
+                            value: LyricsTextAlignment.centered,
+                            icon: const Icon(Icons.format_align_center_rounded),
+                            label: Text(strings.centeredLyricsAlignment),
+                          ),
+                        ],
+                        onSelectionChanged: settings == null
+                            ? null
+                            : (selection) => unawaited(
+                                settingsController.setLyricsTextAlignment(
+                                  selection.first,
+                                ),
+                              ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      strings.lyricsBackground,
+                      style: TextStyle(
+                        color: foreground,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    LyricsBackgroundSelector(
+                      keyPrefix: 'lyrics-menu-background',
+                      value:
+                          settings?.lyricsBackgroundStyle ??
+                          defaultLyricsBackgroundStyle,
+                      strings: strings,
+                      onChanged: settings == null
+                          ? null
+                          : (style) => unawaited(
+                              settingsController.setLyricsBackgroundStyle(
+                                style,
+                              ),
+                            ),
+                    ),
+                    const SizedBox(height: 12),
+                    const Divider(),
+                    SwitchListTile(
+                      key: const ValueKey('lyrics-menu-romanization-toggle'),
+                      contentPadding: EdgeInsets.zero,
+                      value: settings?.lyricsRomanizationEnabled == true,
+                      title: Text(
+                        strings.romanizeLyrics,
+                        style: TextStyle(color: foreground),
+                      ),
+                      subtitle: Text(
+                        strings.romanizeLyricsSummary,
+                        style: TextStyle(
+                          color: foreground.withValues(alpha: .7),
+                        ),
+                      ),
+                      onChanged: settings == null
+                          ? null
+                          : (enabled) => unawaited(
+                              settingsController.setLyricsRomanizationEnabled(
+                                enabled,
+                              ),
+                            ),
+                    ),
+                    SwitchListTile(
+                      key: const ValueKey('lyrics-menu-translation-toggle'),
+                      contentPadding: EdgeInsets.zero,
+                      value: translationEnabled,
+                      title: Text(
+                        strings.translateLyrics,
+                        style: TextStyle(color: foreground),
+                      ),
+                      subtitle: Text(
+                        strings.translateLyricsSummary,
+                        style: TextStyle(
+                          color: foreground.withValues(alpha: .7),
+                        ),
+                      ),
+                      onChanged:
+                          settings == null ||
+                              (!canTranslate && !translationEnabled)
+                          ? null
+                          : (enabled) => unawaited(
+                              settingsController.setLyricsTranslationEnabled(
+                                enabled,
+                              ),
+                            ),
+                    ),
+                    if (canTranslate && translation != null)
+                      translation.when(
+                        skipLoadingOnRefresh: false,
+                        loading: () => Row(
+                          children: [
+                            const SizedBox.square(
+                              dimension: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                strings.lyricsTranslationLoading,
+                                style: TextStyle(color: foreground),
+                              ),
+                            ),
+                          ],
+                        ),
+                        error: (_, _) => Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              strings.lyricsTranslationError,
+                              style: TextStyle(
+                                color: foreground.withValues(alpha: .7),
+                              ),
+                            ),
+                            TextButton(
+                              key: const ValueKey('lyrics-translation-retry'),
+                              onPressed: () => ref.invalidate(
+                                currentLyricsTranslationProvider,
+                              ),
+                              child: Text(strings.retry),
+                            ),
+                          ],
+                        ),
+                        data: (view) => view?.alreadyInTargetLanguage == true
+                            ? Text(
+                                strings.lyricsAlreadyInAppLanguage,
+                                style: TextStyle(
+                                  color: foreground.withValues(alpha: .7),
+                                ),
+                              )
+                            : const SizedBox.shrink(),
+                      ),
+                    const Divider(),
+                    ListTile(
+                      key: const ValueKey('lyrics-menu-share-lines'),
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(Icons.ios_share_rounded, color: foreground),
+                      title: Text(
+                        strings.lyricsShareTitle,
+                        style: TextStyle(color: foreground),
+                      ),
+                      subtitle: Text(
+                        strings.lyricsShareSelectHint,
+                        style: TextStyle(
+                          color: foreground.withValues(alpha: .7),
+                        ),
+                      ),
+                      enabled: canTranslate,
+                      onTap: canTranslate ? onSelectLines : null,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -2793,7 +3408,7 @@ class _LyricsOffsetControls extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final strings = ref.watch(appStringsProvider);
-    final accent = AppColors.downloadAccentFor(context);
+    final accent = Theme.of(context).colorScheme.primary;
     final opaqueSurface = AppColors.menuBackgroundFor(context);
     final border = AppColors.menuBorderFor(context);
     final subtleTextAccent = Color.alphaBlend(
@@ -2921,18 +3536,27 @@ class _PlainLyricsView extends ConsumerWidget {
     required this.romanizedLyrics,
     required this.sourceFooter,
     required this.lyricsCentered,
+    required this.selectingLines,
+    required this.selectedLines,
+    required this.onSelectLine,
+    this.isTranslation = false,
   });
 
   final String lyrics;
   final String? romanizedLyrics;
+  final bool isTranslation;
   final String sourceFooter;
   final bool lyricsCentered;
+  final bool selectingLines;
+  final Set<int> selectedLines;
+  final ValueChanged<int> onSelectLine;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final strings = ref.watch(appStringsProvider);
     final typography = _lyricsTypographyFor(context);
     final accent = AppColors.downloadAccentFor(context);
+    final fontFamily = DefaultTextStyle.of(context).style.fontFamily;
     final displayedLyrics = lyricsCentered
         ? lyrics.split('\n').map((line) => line.trim()).join('\n')
         : lyrics;
@@ -2954,6 +3578,7 @@ class _PlainLyricsView extends ConsumerWidget {
     final canPairLines =
         romanizedLines != null && romanizedLines.length == originalLines.length;
     final originalStyle = TextStyle(
+      fontFamily: fontFamily,
       color: Colors.white.withValues(alpha: 0.9),
       fontSize: typography.plain,
       height: 1.38,
@@ -2964,6 +3589,7 @@ class _PlainLyricsView extends ConsumerWidget {
       ],
     );
     final romanizedStyle = TextStyle(
+      fontFamily: fontFamily,
       color: Colors.white.withValues(alpha: 0.62),
       fontSize: typography.plain * 0.62,
       height: 1.36,
@@ -2979,7 +3605,7 @@ class _PlainLyricsView extends ConsumerWidget {
         horizontalPadding,
         26,
         horizontalPadding,
-        48,
+        selectingLines ? 132 : 48,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3012,36 +3638,106 @@ class _PlainLyricsView extends ConsumerWidget {
             children: canPairLines
                 ? [
                     for (var index = 0; index < originalLines.length; index++)
-                      _PlainLyricLine(
-                        key: ValueKey('plain-lyrics-pair-$index'),
-                        originalKey: ValueKey('plain-lyrics-original-$index'),
-                        romanizationKey: ValueKey(
-                          'plain-lyrics-romanization-$index',
+                      _LyricsPlainSelectionTarget(
+                        key: ValueKey('plain-lyrics-line-$index'),
+                        selecting: selectingLines,
+                        selected: selectedLines.contains(index),
+                        onSelect: () => onSelectLine(index),
+                        child: _PlainLyricLine(
+                          key: ValueKey('plain-lyrics-pair-$index'),
+                          originalKey: ValueKey('plain-lyrics-original-$index'),
+                          romanizationKey: ValueKey(
+                            'plain-lyrics-${isTranslation ? 'translation' : 'romanization'}-$index',
+                          ),
+                          original: originalLines[index],
+                          romanized: romanizedLines[index],
+                          textAlign: lyricsCentered
+                              ? TextAlign.center
+                              : TextAlign.start,
+                          originalStyle: originalStyle,
+                          romanizedStyle: romanizedStyle,
                         ),
-                        original: originalLines[index],
-                        romanized: romanizedLines[index],
-                        textAlign: lyricsCentered
-                            ? TextAlign.center
-                            : TextAlign.start,
-                        originalStyle: originalStyle,
-                        romanizedStyle: romanizedStyle,
+                      ),
+                  ]
+                : selectingLines
+                ? [
+                    for (var index = 0; index < originalLines.length; index++)
+                      _LyricsPlainSelectionTarget(
+                        key: ValueKey('plain-lyrics-line-$index'),
+                        selecting: true,
+                        selected: selectedLines.contains(index),
+                        onSelect: () => onSelectLine(index),
+                        child: Text(
+                          originalLines[index],
+                          key: ValueKey('plain-lyrics-original-$index'),
+                          textAlign: lyricsCentered
+                              ? TextAlign.center
+                              : TextAlign.start,
+                          style: originalStyle,
+                        ),
                       ),
                   ]
                 : [
-                    Text(
-                      key: const ValueKey('plain-lyrics-original'),
-                      displayedLyrics,
-                      textAlign: lyricsCentered
-                          ? TextAlign.center
-                          : TextAlign.start,
-                      style: originalStyle,
+                    LayoutBuilder(
+                      builder: (context, constraints) => GestureDetector(
+                        onLongPressStart: (details) {
+                          // Keep the existing paragraph layout until selection
+                          // starts. Hit testing runs only for this gesture and
+                          // also handles a source line wrapping on screen.
+                          final painter = TextPainter(
+                            text: TextSpan(
+                              text: displayedLyrics,
+                              style: DefaultTextStyle.of(
+                                context,
+                              ).style.merge(originalStyle),
+                            ),
+                            textDirection: Directionality.of(context),
+                            textAlign: lyricsCentered
+                                ? TextAlign.center
+                                : TextAlign.start,
+                            textScaler: MediaQuery.textScalerOf(context),
+                            locale: Localizations.maybeLocaleOf(context),
+                          );
+                          try {
+                            painter.layout(maxWidth: constraints.maxWidth);
+                            final position = painter.getPositionForOffset(
+                              details.localPosition,
+                            );
+                            final index =
+                                displayedLyrics
+                                    .substring(
+                                      0,
+                                      position.offset.clamp(
+                                        0,
+                                        displayedLyrics.length,
+                                      ),
+                                    )
+                                    .split('\n')
+                                    .length -
+                                1;
+                            onSelectLine(index);
+                          } finally {
+                            painter.dispose();
+                          }
+                        },
+                        child: Text(
+                          key: const ValueKey('plain-lyrics-original'),
+                          displayedLyrics,
+                          textAlign: lyricsCentered
+                              ? TextAlign.center
+                              : TextAlign.start,
+                          style: originalStyle,
+                        ),
+                      ),
                     ),
                   ],
           ),
           if (displayedRomanization != null && !canPairLines) ...[
             const SizedBox(height: 12),
             Text(
-              key: const ValueKey('plain-lyrics-romanization'),
+              key: ValueKey(
+                'plain-lyrics-${isTranslation ? 'translation' : 'romanization'}',
+              ),
               displayedRomanization,
               textAlign: lyricsCentered ? TextAlign.center : TextAlign.start,
               style: romanizedStyle,
@@ -3051,6 +3747,72 @@ class _PlainLyricsView extends ConsumerWidget {
           _LyricsSourceAttribution(source: sourceFooter, placement: 'bottom'),
         ],
       ),
+    );
+  }
+}
+
+class _LyricsPlainSelectionTarget extends StatelessWidget {
+  const _LyricsPlainSelectionTarget({
+    super.key,
+    required this.selecting,
+    required this.selected,
+    required this.onSelect,
+    required this.child,
+  });
+
+  final bool selecting;
+  final bool selected;
+  final VoidCallback onSelect;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    selected: selecting && selected,
+    button: true,
+    onLongPress: onSelect,
+    onTap: selecting ? onSelect : null,
+    child: InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onLongPress: onSelect,
+      onTap: selecting ? onSelect : null,
+      child: _LyricsLineSelectionDecoration(
+        selecting: selecting,
+        selected: selected,
+        child: child,
+      ),
+    ),
+  );
+}
+
+/// Paint-only selection state preserves the cached lyric row measurements.
+class _LyricsLineSelectionDecoration extends StatelessWidget {
+  const _LyricsLineSelectionDecoration({
+    required this.selecting,
+    required this.selected,
+    required this.child,
+  });
+
+  final bool selecting;
+  final bool selected;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!selecting) return child;
+    final accent = AppColors.downloadAccentFor(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: selected
+            ? accent.withValues(alpha: 0.22)
+            : const Color(0x08FFFFFF),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: selected
+              ? accent.withValues(alpha: 0.85)
+              : const Color(0x14FFFFFF),
+        ),
+      ),
+      child: child,
     );
   }
 }
@@ -3206,7 +3968,19 @@ class _LyricsMessage extends StatelessWidget {
                 child: CircularProgressIndicator(strokeWidth: 4),
               )
             else
-              Icon(icon, size: 52, color: AppColors.downloadAccentFor(context)),
+              icon == Icons.lyrics_outlined
+                  ? IconTheme(
+                      data: IconThemeData(
+                        size: 52,
+                        color: AppColors.downloadAccentFor(context),
+                      ),
+                      child: const PlayerLyricsIcon(),
+                    )
+                  : Icon(
+                      icon,
+                      size: 52,
+                      color: AppColors.downloadAccentFor(context),
+                    ),
             const SizedBox(height: 18),
             Text(
               message,
@@ -3264,64 +4038,19 @@ String _formatLyricsDuration(Duration duration) {
   return '$minutes:${seconds.toString().padLeft(2, '0')}';
 }
 
-double _measureLyricLineExtent({
-  required String originalText,
-  required String? romanizedText,
-  required double contentWidth,
-  required double activeFontSize,
-  required TextScaler textScaler,
-  required TextDirection textDirection,
-  required Locale? locale,
-}) {
-  final textWidth = math.max(1.0, contentWidth - 16);
-  final originalHeight = _measureTextHeight(
-    text: originalText,
-    style: TextStyle(
-      fontSize: activeFontSize,
-      height: 1.16,
-      fontWeight: FontWeight.w900,
-      letterSpacing: -0.45,
-    ),
-    maxWidth: textWidth,
-    textScaler: textScaler,
-    textDirection: textDirection,
-    locale: locale,
-  );
-  final displayedRomanization = _displayedRomanization(
-    originalText,
-    romanizedText,
-  );
-  final romanizationHeight = displayedRomanization == null
-      ? 0.0
-      : 5 +
-            _measureTextHeight(
-              text: displayedRomanization,
-              style: TextStyle(
-                fontSize: (activeFontSize * 0.62).clamp(15.0, 22.0).toDouble(),
-                height: 1.25,
-                fontWeight: FontWeight.w700,
-              ),
-              maxWidth: textWidth,
-              textScaler: textScaler,
-              textDirection: textDirection,
-              locale: locale,
-            );
-  // Every row reserves its active-state height. The text can animate without
-  // moving every following lyric or invalidating the sliver's scroll geometry.
-  return (24 + originalHeight + romanizationHeight).ceilToDouble();
-}
-
 double _measureSyncedLyricsGuidanceExtent({
   required String source,
   required String seekHint,
   required double contentWidth,
+  required String? fontFamily,
   required TextScaler textScaler,
   required TextDirection textDirection,
   required Locale? locale,
 }) {
   final sourceHeight = _measureTextHeight(
     text: source,
-    style: const TextStyle(
+    style: TextStyle(
+      fontFamily: fontFamily,
       fontSize: 11,
       height: 1.25,
       fontWeight: FontWeight.w700,
@@ -3333,7 +4062,8 @@ double _measureSyncedLyricsGuidanceExtent({
   );
   final hintHeight = _measureTextHeight(
     text: seekHint,
-    style: const TextStyle(
+    style: TextStyle(
+      fontFamily: fontFamily,
       fontSize: 12,
       height: 1.25,
       fontWeight: FontWeight.w700,
@@ -3353,17 +4083,14 @@ double _measureTextHeight({
   required TextScaler textScaler,
   required TextDirection textDirection,
   required Locale? locale,
-}) {
-  final painter = TextPainter(
-    text: TextSpan(text: text, style: style),
-    textDirection: textDirection,
-    textScaler: textScaler,
-    locale: locale,
-  )..layout(maxWidth: maxWidth);
-  final height = painter.height;
-  painter.dispose();
-  return height;
-}
+}) => measureLyricsParagraphHeight(
+  text: text,
+  style: style,
+  maxWidth: maxWidth,
+  textDirection: textDirection,
+  textScaler: textScaler,
+  locale: locale,
+);
 
 String? _displayedRomanization(String originalText, String? romanizedText) {
   final trimmed = romanizedText?.trim();

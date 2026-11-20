@@ -15,6 +15,74 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  for (final platform in [TargetPlatform.android, TargetPlatform.windows]) {
+    testWidgets(
+      'mini-player on $platform shows loading until playback changes',
+      (tester) async {
+        _configureView(
+          tester,
+          platform == TargetPlatform.android
+              ? const Size(390, 200)
+              : const Size(1000, 200),
+        );
+        const snapshot = PlayerSnapshot(
+          status: PlayerStatus.loading,
+          title: 'Pending song',
+          artist: 'BStream Music',
+          trackId: 'pending-song',
+          duration: Duration(minutes: 3),
+        );
+        final controller = _TestPlayerController(snapshot: snapshot);
+        await tester.pumpWidget(
+          _miniPlayerHarness(platform: platform, playerController: controller),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 180));
+        final control = find.byKey(
+          const ValueKey('mini-player-primary-control'),
+        );
+        final spinner = find.descendant(
+          of: control,
+          matching: find.byKey(const ValueKey('playback-loading-indicator')),
+        );
+        expect(spinner, findsOneWidget);
+        expect(tester.widget<IconButton>(control).onPressed, isNotNull);
+        final bounds = tester.getRect(control);
+        await tester.tap(control);
+        await tester.pump();
+        expect(controller.toggleCalls, 1);
+
+        for (final status in [
+          PlayerStatus.playing,
+          PlayerStatus.loading,
+          PlayerStatus.paused,
+          PlayerStatus.loading,
+          PlayerStatus.failed,
+        ]) {
+          controller.emit(
+            snapshot.copyWith(
+              status: status,
+              errorMessage: status == PlayerStatus.failed
+                  ? 'Test source unavailable'
+                  : null,
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 180));
+          expect(
+            spinner,
+            status == PlayerStatus.loading ? findsOneWidget : findsNothing,
+            reason: status.name,
+          );
+          expect(tester.getRect(control), bounds);
+        }
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
   test('tiny artwork ring ignores imperceptible sub-second ticks', () {
     const duration = Duration(minutes: 3);
     expect(
@@ -517,7 +585,7 @@ void main() {
 
         expect(liquidGlass, findsOneWidget);
         expect(tester.widget<LiquidGlassSurface>(liquidGlass).blurSigma, 8);
-        expect(tester.widget<LiquidGlassSurface>(liquidGlass).intensity, 1);
+        expect(tester.widget<LiquidGlassSurface>(liquidGlass).intensity, 1.16);
         expect(
           tester.widget<LiquidGlassSurface>(liquidGlass).adaptiveEdgeEnabled,
           isTrue,
@@ -811,6 +879,57 @@ void main() {
         find.byKey(const ValueKey('mini-player-artwork-progress-ring')),
       );
       expect(ring.value, closeTo(0.5, 0.001));
+    },
+  );
+
+  testWidgets(
+    'hidden mini stops position rebuilds and resumes at latest time',
+    (tester) async {
+      _configureView(tester, const Size(360, 200));
+      const initial = PlayerSnapshot(
+        status: PlayerStatus.playing,
+        title: 'Progreso retenido',
+        artist: 'BStream Music',
+        trackId: 'hidden-mini-progress',
+        position: Duration(seconds: 45),
+        duration: Duration(minutes: 3),
+      );
+      final controller = _TestPlayerController(snapshot: initial);
+      Widget harness(bool enabled) => _miniPlayerHarness(
+        mode: MiniPlayerMode.capsule,
+        backgroundMode: MiniPlayerBackgroundMode.liquidGlass,
+        playerController: controller,
+        tickersEnabled: enabled,
+      );
+      final ringFinder = find.byKey(
+        const ValueKey('mini-player-artwork-progress-ring'),
+      );
+      await tester.pumpWidget(harness(true));
+      await tester.pump();
+      expect(
+        tester.widget<CircularProgressIndicator>(ringFinder).value,
+        closeTo(0.25, 0.001),
+      );
+      await tester.pumpWidget(harness(false));
+      await tester.pumpAndSettle();
+      final hiddenRing = tester.widget<CircularProgressIndicator>(ringFinder);
+      controller.emit(initial.copyWith(position: const Duration(seconds: 90)));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      expect(
+        tester.widget<CircularProgressIndicator>(ringFinder),
+        same(hiddenRing),
+        reason:
+            'Position notifications must not rebuild a completely hidden mini.',
+      );
+      await tester.pumpWidget(harness(true));
+      await tester.pump();
+      expect(
+        tester.widget<CircularProgressIndicator>(ringFinder).value,
+        closeTo(0.5, 0.001),
+        reason: 'Showing the mini must use the current playback position.',
+      );
+      expect(tester.takeException(), isNull);
     },
   );
 
@@ -1183,7 +1302,7 @@ void main() {
             find.descendant(of: volume, matching: find.byType(Icon)),
           )
           .size,
-      22,
+      closeTo(25.3, 0.001),
     );
     await tester.tap(find.byKey(const ValueKey('mini-player-primary-control')));
     await tester.pump();
@@ -1432,6 +1551,7 @@ Widget _miniPlayerHarness({
   VoidCallback? onOpenPlayer,
   List<LocalTrack> localTracks = const <LocalTrack>[],
   bool disableAnimations = false,
+  bool tickersEnabled = true,
 }) {
   final controller = playerController ?? _TestPlayerController();
   return ProviderScope(
@@ -1460,10 +1580,13 @@ Widget _miniPlayerHarness({
           alignment: Alignment.topCenter,
           child: SizedBox(
             height: constrainedHeight,
-            child: MiniPlayer(
-              mode: mode,
-              backgroundMode: backgroundMode,
-              onOpenPlayer: onOpenPlayer,
+            child: TickerMode(
+              enabled: tickersEnabled,
+              child: MiniPlayer(
+                mode: mode,
+                backgroundMode: backgroundMode,
+                onOpenPlayer: onOpenPlayer,
+              ),
             ),
           ),
         ),

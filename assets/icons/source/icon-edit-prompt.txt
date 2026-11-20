@@ -1,0 +1,8 @@
+Tool: built-in imagegen (edit mode)
+Input: previous BStream Music icon master (assets/icons/source/ico.png)
+Project master: assets/icons/source/ico.png
+Exports: scripts/generate_app_icons.ps1 (Flutter, Android, iOS, macOS/Linux, Windows)
+Transparent background: false
+
+Final prompt:
+Use case: precise-object-edit. Image 1 is the exact edit target and approved BStream Music icon. Make an extremely subtle hue correction across the colored B face, highlights and thin outer rim: shift the entire colored palette about 4 degrees toward green uniformly, keeping its brightness and softness nearly identical. Retain the exact upper-left-to-lower-right diagonal and the same barely perceptible difference between the two slightly cooler corners and the greener center. The source diffuse colors are about #0EB5A0 in the upper-left, #0BB177 at the center, and #0BB0A0 in the lower-right. The intended adjustment is only one small step to approximately #0EB595, #0BB16C, and #0BB095 respectively. Keep the opposite corners recognizable as green turquoise. Preserve the 3D bevel and shadow, B silhouette and exact music-note cutout, framing, deep blue-black background, and opaque square proportions. No changes to gradient width, layout, contrast, or shape. Output just the icon.

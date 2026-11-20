@@ -15,6 +15,9 @@ class TrackInfo {
     this.streamSource,
     this.streamFormatId,
     this.streamCodec,
+    this.streamBitrate,
+    this.streamSampleRate,
+    this.streamChannels,
     this.streamClientProfileKey,
     this.extractor,
     this.album,
@@ -43,6 +46,15 @@ class TrackInfo {
   final String? streamFormatId;
   final String? streamCodec;
 
+  /// Bitrate in bits per second, when reported for the selected audio stream.
+  final int? streamBitrate;
+
+  /// Sample rate in hertz, when reported for the selected audio stream.
+  final int? streamSampleRate;
+
+  /// Number of channels reported for the selected audio stream.
+  final int? streamChannels;
+
   /// Exact InnerTube client profile that produced [streamUrl].
   final String? streamClientProfileKey;
   final String? extractor;
@@ -60,6 +72,25 @@ class TrackInfo {
   final List<String?> artistBrowseIds;
   final TrackMetadataSource metadataSource;
 
+  /// Retains catalog identity while discarding a previously selected transport.
+  /// Optional providers must be reconsidered under the current network policy.
+  TrackInfo withoutAudioTransport() => TrackInfo(
+    id: id,
+    title: title,
+    artist: artist,
+    url: url,
+    thumbnailUrl: thumbnailUrl,
+    catalogThumbnailUrl: catalogThumbnailUrl,
+    duration: duration,
+    extractor: extractor,
+    album: album,
+    albumBrowseId: albumBrowseId,
+    viewCount: viewCount,
+    artists: artists,
+    artistBrowseIds: artistBrowseIds,
+    metadataSource: metadataSource,
+  );
+
   TrackInfo copyWith({
     String? id,
     String? title,
@@ -74,6 +105,9 @@ class TrackInfo {
     String? streamSource,
     String? streamFormatId,
     String? streamCodec,
+    int? streamBitrate,
+    int? streamSampleRate,
+    int? streamChannels,
     String? streamClientProfileKey,
     String? extractor,
     String? album,
@@ -98,6 +132,9 @@ class TrackInfo {
       streamSource: streamSource ?? this.streamSource,
       streamFormatId: streamFormatId ?? this.streamFormatId,
       streamCodec: streamCodec ?? this.streamCodec,
+      streamBitrate: streamBitrate ?? this.streamBitrate,
+      streamSampleRate: streamSampleRate ?? this.streamSampleRate,
+      streamChannels: streamChannels ?? this.streamChannels,
       streamClientProfileKey:
           streamClientProfileKey ?? this.streamClientProfileKey,
       extractor: extractor ?? this.extractor,

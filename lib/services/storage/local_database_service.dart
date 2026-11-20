@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import '../../core/constants/app_constants.dart';
+import '../../core/utils/background_work.dart';
 import '../../features/music/data/models/local_track_model.dart';
 import '../../features/music/data/models/playlist_model.dart';
 import '../../features/music/domain/entities/catalog_playlist.dart';
@@ -17,6 +18,7 @@ import '../../features/music/domain/repositories/catalog_playlist_repository.dar
 import '../recommendations/recommendation_storage_models.dart';
 import '../sharing/bstream_track_link.dart';
 import 'portable_sqlite_upsert.dart';
+import 'backup_audio_layout.dart';
 
 class PlaybackEventRetentionPolicy {
   const PlaybackEventRetentionPolicy({
@@ -116,6 +118,12 @@ const _requiredDatabaseIndexes = <_DatabaseIndexDefinition>[
     name: 'idx_local_tracks_catalog_key',
     table: 'local_tracks',
     columns: <String>['catalog_key'],
+    descending: <bool>[false],
+  ),
+  _DatabaseIndexDefinition(
+    name: 'idx_library_track_order_position',
+    table: 'library_track_order',
+    columns: <String>['position'],
     descending: <bool>[false],
   ),
   _DatabaseIndexDefinition(
@@ -253,6 +261,48 @@ class LocalDatabaseService {
     return operation(db);
   }
 
+  /// Capture canonical membership and downloaded-file metadata in one read
+  /// transaction. ZIP layout planning only receives these plain records, never
+  /// the live database or one query per playlist.
+  Future<BackupAudioMetadata> getBackupAudioMetadata() async {
+    final db = await database;
+    return db.transaction((transaction) async {
+      final tracks = await transaction.query(
+        'local_tracks',
+        columns: [
+          'id',
+          'file_path',
+          'title',
+          'artist',
+          'duration_seconds',
+          'catalog_key',
+        ],
+        orderBy: 'id ASC',
+      );
+      final playlists = await transaction.query(
+        'playlists',
+        columns: ['id', 'name', 'track_ids', 'entries_migrated'],
+        where: 'deleted_at IS NULL',
+        orderBy: 'updated_at DESC, id ASC',
+      );
+      final entries = await transaction.rawQuery('''
+        SELECT pi.item_id, pi.playlist_id, pi.local_track_id,
+               pi.catalog_key, pi.position, pi.deleted_at
+        FROM playlist_items AS pi
+        INNER JOIN playlists AS p ON p.id = pi.playlist_id
+        WHERE p.deleted_at IS NULL
+        ORDER BY pi.playlist_id ASC, pi.position ASC, pi.item_id ASC
+      ''');
+      List<Map<String, Object?>> portable(List<Map<String, Object?>> rows) =>
+          rows.map((row) => Map<String, Object?>.from(row)).toList();
+      return (
+        tracks: portable(tracks),
+        playlists: portable(playlists),
+        entries: portable(entries),
+      );
+    });
+  }
+
   Future<String> databasePath() async {
     final supportDirectory = await getApplicationSupportDirectory();
     await supportDirectory.create(recursive: true);
@@ -335,6 +385,34 @@ class LocalDatabaseService {
     }
   }
 
+  /// Keeps restored playlist identities, but discards the old synchronization
+  /// history. A backup is a local snapshot, not a fresh request to replay an
+  /// earlier remote removal, deletion, or partially completed mutation.
+  /// The next sync therefore unions current local and remote membership.
+  Future<void> rebasePlaylistSyncAfterRestore() async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      await transaction.delete('ytm_playlist_base_items');
+      await transaction.delete('playlist_sync_intents');
+      await transaction.delete('playlist_sync_conflicts');
+      await transaction.update('ytm_playlist_bindings', <String, Object?>{
+        'base_title': null,
+        'base_snapshot_hash': null,
+        'remote_revision': null,
+        'local_revision_at_base': 0,
+        'last_synced_at': null,
+        'last_remote_seen_at': null,
+        'remote_delete_requested_at': null,
+        'updated_at': _clock().toIso8601String(),
+      });
+      // Occurrence tokens may have been recycled since the backup. Video IDs,
+      // local UUIDs, downloaded files, and playlist membership remain intact.
+      await transaction.update('playlist_items', <String, Object?>{
+        'remote_set_video_id': null,
+      });
+    });
+  }
+
   Future<void> close() async {
     var current = _database;
     final opening = _databaseFuture;
@@ -368,8 +446,72 @@ class LocalDatabaseService {
 
   Future<List<LocalTrack>> getLocalTracks() async {
     final db = await database;
-    final rows = await db.query('local_tracks', orderBy: 'added_at DESC');
+    final rows = await db.rawQuery('''
+      SELECT local_tracks.*
+      FROM local_tracks
+      LEFT JOIN library_track_order
+        ON library_track_order.track_id = local_tracks.id
+      ORDER BY
+        CASE WHEN library_track_order.position IS NULL THEN 1 ELSE 0 END,
+        library_track_order.position ASC,
+        local_tracks.added_at DESC,
+        local_tracks.id ASC
+    ''');
     return rows.map(LocalTrackModel.fromMap).toList(growable: false);
+  }
+
+  /// Identities needed to exclude library tracks from recommendations. Avoid
+  /// sorting the library or decoding artwork, artists and every track model.
+  Future<Set<String>> getLocalTrackIdentityKeys() async {
+    final db = await database;
+    final rows = await db.query(
+      'local_tracks',
+      columns: const <String>['id', 'source_id'],
+    );
+    final keys = <String>{};
+    for (final row in rows) {
+      for (final column in const <String>['id', 'source_id']) {
+        final key = row[column]?.toString().trim();
+        if (key != null && key.isNotEmpty) keys.add(key);
+      }
+    }
+    return Set<String>.unmodifiable(keys);
+  }
+
+  /// Persists the complete visible library order. Unordered/new downloads are
+  /// left at the end until the user explicitly reorders the list again.
+  Future<void> reorderLocalTracks(List<String> orderedTrackIds) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      final rows = await transaction.query(
+        'local_tracks',
+        columns: const <String>['id'],
+      );
+      final existingIds = rows
+          .map((row) => row['id']?.toString())
+          .whereType<String>()
+          .toSet();
+      final requestedIds = orderedTrackIds.toSet();
+      if (requestedIds.length != orderedTrackIds.length ||
+          requestedIds.length != existingIds.length ||
+          !requestedIds.containsAll(existingIds)) {
+        throw ArgumentError.value(
+          orderedTrackIds,
+          'orderedTrackIds',
+          'Must contain every local track exactly once.',
+        );
+      }
+
+      await transaction.delete('library_track_order');
+      final batch = transaction.batch();
+      for (var position = 0; position < orderedTrackIds.length; position++) {
+        batch.insert('library_track_order', <String, Object?>{
+          'track_id': orderedTrackIds[position],
+          'position': position,
+        });
+      }
+      await batch.commit(noResult: true);
+    });
   }
 
   Future<void> saveLocalTrack(LocalTrack track) async {
@@ -927,7 +1069,7 @@ class LocalDatabaseService {
 
     // Encoding here validates that the payload is composed only of durable
     // JSON values before the previous cache entry is replaced.
-    final payloadJson = jsonEncode(feed.payload);
+    final payloadJson = await _encodeRecommendationPayload(feed.payload);
     final db = await database;
     return db.transaction((transaction) async {
       if (expectedGeneration != null &&
@@ -963,15 +1105,14 @@ class LocalDatabaseService {
     }
     final row = rows.single;
     try {
-      final decoded = jsonDecode(row['payload_json']! as String);
-      if (decoded is! Map) {
-        return null;
-      }
+      final decoded = await parseJsonInBackground(
+        row['payload_json']! as String,
+        _recommendationPayload,
+      );
+      if (decoded == null) return null;
       return RecommendationFeedCache(
         feedKey: row['feed_key']! as String,
-        payload: decoded.map<String, Object?>(
-          (key, value) => MapEntry(key.toString(), value),
-        ),
+        payload: decoded,
         generatedAt: DateTime.parse(row['generated_at']! as String),
         expiresAt: DateTime.parse(row['expires_at']! as String),
       );
@@ -1566,6 +1707,11 @@ class LocalDatabaseService {
   }
 
   Future<void> savePlaylist(Playlist playlist) async {
+    final artworkFileName = playlist.customArtworkFileName;
+    if (artworkFileName != null &&
+        !Playlist.isValidCustomArtworkFileName(artworkFileName)) {
+      throw ArgumentError.value(artworkFileName, 'customArtworkFileName');
+    }
     final db = await database;
     final values = PlaylistModel.fromEntity(playlist).toMap();
     await db.transaction(
@@ -1585,10 +1731,39 @@ class LocalDatabaseService {
                 ? requestedRevision
                 : currentRevision + 1,
             'deleted_at': values['deleted_at'],
+            'custom_artwork_file_name': values['custom_artwork_file_name'],
           };
         },
       ),
     );
+  }
+
+  /// Artwork is local presentation, so changing it must not reorder playlists,
+  /// restart queues or invalidate in-flight remote synchronization revisions.
+  Future<Playlist?> setPlaylistArtworkFileName(
+    String playlistId,
+    String? fileName,
+  ) async {
+    if (fileName != null && !Playlist.isValidCustomArtworkFileName(fileName)) {
+      throw ArgumentError.value(fileName, 'fileName');
+    }
+    final db = await database;
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'playlists',
+        <String, Object?>{'custom_artwork_file_name': fileName},
+        where: 'id = ? AND deleted_at IS NULL',
+        whereArgs: <Object?>[playlistId],
+      );
+      if (changed == 0) return null;
+      final rows = await transaction.query(
+        'playlists',
+        where: 'id = ? AND deleted_at IS NULL',
+        whereArgs: <Object?>[playlistId],
+        limit: 1,
+      );
+      return PlaylistModel.fromMap(rows.single);
+    });
   }
 
   Future<void> deletePlaylist(String playlistId) async {
@@ -1947,7 +2122,8 @@ class LocalDatabaseService {
             catalog_key TEXT,
             added_at TEXT NOT NULL,
             last_played_at TEXT,
-            last_played_playlist_id TEXT
+            last_played_playlist_id TEXT,
+            audio_format_json TEXT
           )
         ''');
         await db.execute('''
@@ -1959,11 +2135,13 @@ class LocalDatabaseService {
             updated_at TEXT NOT NULL,
             local_revision INTEGER NOT NULL DEFAULT 0,
             deleted_at TEXT,
+            custom_artwork_file_name TEXT,
             entries_migrated INTEGER NOT NULL DEFAULT 1
           )
         ''');
         await _createRecommendationTables(db);
         await _createPlaylistSyncTables(db);
+        await _createLibraryTrackOrderTable(db);
         await _createIndexes(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
@@ -2069,6 +2247,25 @@ class LocalDatabaseService {
           await _backfillCatalogPlaylistData(db);
           await _createIndexes(db);
         }
+        if (oldVersion < 9) {
+          await _createLibraryTrackOrderTable(db);
+        }
+        if (oldVersion < 10) {
+          await _addColumnIfMissing(
+            db,
+            table: 'playlists',
+            column: 'custom_artwork_file_name',
+            definition: 'TEXT',
+          );
+        }
+        if (oldVersion < 11) {
+          await _addColumnIfMissing(
+            db,
+            table: 'local_tracks',
+            column: 'audio_format_json',
+            definition: 'TEXT',
+          );
+        }
       },
       onOpen: _repairAndValidateCurrentSchema,
     );
@@ -2100,6 +2297,7 @@ class LocalDatabaseService {
       'catalog_thumbnail_url': 'TEXT',
       'artist_browse_ids_json': "TEXT NOT NULL DEFAULT '[]'",
       'catalog_key': 'TEXT',
+      'audio_format_json': 'TEXT',
     };
     for (final column in additiveColumns.entries) {
       if (localColumns.add(column.key)) {
@@ -2116,6 +2314,7 @@ class LocalDatabaseService {
       'local_revision': 'INTEGER NOT NULL DEFAULT 0',
       'deleted_at': 'TEXT',
       'entries_migrated': 'INTEGER NOT NULL DEFAULT 0',
+      'custom_artwork_file_name': 'TEXT',
     };
     for (final column in additivePlaylistColumns.entries) {
       if (playlistColumns.add(column.key)) {
@@ -2146,6 +2345,7 @@ class LocalDatabaseService {
       }
     }
     await _backfillCatalogPlaylistData(db);
+    await _createLibraryTrackOrderTable(db);
     await _validateSchemaForVersion(db, AppConstants.databaseVersion);
     await _repairIndexes(db);
   }
@@ -2158,6 +2358,11 @@ class LocalDatabaseService {
     if (!tables.containsAll(const <String>{'local_tracks', 'playlists'})) {
       throw const FormatException(
         'La base de datos no contiene las tablas de biblioteca requeridas.',
+      );
+    }
+    if (version >= 9 && !tables.contains('library_track_order')) {
+      throw const FormatException(
+        'La base de datos no contiene el orden de la biblioteca requerido.',
       );
     }
 
@@ -2182,6 +2387,7 @@ class LocalDatabaseService {
       },
       if (version >= 6) 'artist_browse_ids_json',
       if (version >= 8) 'catalog_key',
+      if (version >= 11) 'audio_format_json',
     };
     await _requireTableColumns(
       db,
@@ -2203,6 +2409,7 @@ class LocalDatabaseService {
           'deleted_at',
           'entries_migrated',
         },
+        if (version >= 10) 'custom_artwork_file_name',
       },
     );
     await _requirePrimaryKey(db, table: 'playlists', columns: const ['id']);
@@ -2632,6 +2839,20 @@ class LocalDatabaseService {
           ON DELETE CASCADE
       )
     ''');
+  }
+
+  Future<void> _createLibraryTrackOrderTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS library_track_order (
+        track_id TEXT PRIMARY KEY,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        FOREIGN KEY (track_id) REFERENCES local_tracks(id) ON DELETE CASCADE
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_library_track_order_position '
+      'ON library_track_order(position)',
+    );
   }
 
   /// Converts the legacy JSON memberships exactly once. Item identifiers are
@@ -3236,6 +3457,15 @@ Future<void> _upsertWithoutDelete(
     },
   );
 }
+
+// Feeds contain whole shelves; encoding them is infrequent but can be large.
+// Keep database handles and generation checks in the original isolate.
+Future<String> _encodeRecommendationPayload(Map<String, Object?> payload) =>
+    runBackgroundWork(() => jsonEncode(payload));
+
+Map<String, Object?>? _recommendationPayload(Object? decoded) => decoded is Map
+    ? decoded.map((key, value) => MapEntry(key.toString(), value))
+    : null;
 
 int? _nullableBoolToInt(bool? value) {
   return value == null ? null : (value ? 1 : 0);

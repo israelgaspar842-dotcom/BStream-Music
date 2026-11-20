@@ -2,21 +2,30 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_ui.dart';
 import '../../../../core/widgets/app_shared_widgets.dart';
+import '../../../../core/widgets/horizontal_shelf_scroll_behavior.dart';
 import '../../../../core/widgets/marquee_text.dart';
+import '../../../../services/sharing/bstream_track_link.dart';
+import '../../../../services/youtube_music/innertube_search_service.dart';
 import '../../domain/entities/search_result.dart';
+import '../../domain/entities/track_info.dart';
 import '../providers/music_providers.dart';
+import '../providers/track_selection_controller.dart';
+import '../providers/player/related_radio_queue_extender.dart';
 import '../widgets/search_input.dart';
 import '../widgets/scrolled_under_tab_frame.dart';
 import '../widgets/now_playing_equalizer.dart';
 import '../widgets/source_image.dart';
 import '../widgets/track_result_tile.dart';
+import '../widgets/track_selection_toolbar.dart';
 import 'artist_profile_page.dart';
 import 'remote_collection_detail_page.dart';
+import 'search_browse_category_page.dart';
 
 class SearchView extends ConsumerStatefulWidget {
   const SearchView({
@@ -43,10 +52,134 @@ class SearchView extends ConsumerStatefulWidget {
 }
 
 class _SearchViewState extends ConsumerState<SearchView> {
+  static const _suggestionDebounce = Duration(milliseconds: 300);
+  static const _suggestionCacheCapacity = 24;
+
   bool _focusInputAfterClear = false;
+  bool _searchInputFocused = false;
+  String _draftQuery = '';
+  int _selectedSuggestionIndex = 0;
+  List<String> _suggestions = const <String>[];
+  final Map<String, List<String>> _suggestionCache = <String, List<String>>{};
+  Timer? _suggestionTimer;
+  int _suggestionGeneration = 0;
+  String? _browseCatalogLanguageCode;
+  SearchBrowseCatalog? _retainedBrowseCatalog;
+
+  @override
+  void didUpdateWidget(covariant SearchView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.active && !widget.active) {
+      _cancelPendingSuggestions();
+      _searchInputFocused = false;
+      _suggestions = const <String>[];
+      _selectedSuggestionIndex = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _cancelPendingSuggestions();
+    super.dispose();
+  }
+
+  void _cancelPendingSuggestions() {
+    _suggestionTimer?.cancel();
+    _suggestionTimer = null;
+    _suggestionGeneration++;
+  }
+
+  void _handleInputFocusChanged(bool hasFocus, String text) {
+    if (hasFocus) {
+      _searchInputFocused = true;
+      _handleDraftChanged(text);
+      return;
+    }
+    _cancelPendingSuggestions();
+    if (mounted) {
+      setState(() {
+        _searchInputFocused = false;
+        _suggestions = const <String>[];
+        _selectedSuggestionIndex = 0;
+      });
+    }
+  }
+
+  void _handleDraftChanged(String text) {
+    _cancelPendingSuggestions();
+    final query = text.trim();
+    final cacheKey = query.toLowerCase();
+    final cached = _suggestionCache[cacheKey];
+    setState(() {
+      _draftQuery = text;
+      _suggestions = cached ?? const <String>[];
+      _selectedSuggestionIndex = 0;
+    });
+    if (!widget.active ||
+        !_searchInputFocused ||
+        query.isEmpty ||
+        cached != null) {
+      return;
+    }
+
+    final generation = _suggestionGeneration;
+    _suggestionTimer = Timer(_suggestionDebounce, () {
+      unawaited(_loadSuggestions(query, cacheKey, generation));
+    });
+  }
+
+  Future<void> _loadSuggestions(
+    String query,
+    String cacheKey,
+    int generation,
+  ) async {
+    final suggestionsService = ref.read(youtubeMusicSearchSuggestionsProvider);
+    if (suggestionsService == null) {
+      return;
+    }
+    try {
+      final suggestions = await suggestionsService.getSearchSuggestions(query);
+      if (!mounted ||
+          !widget.active ||
+          !_searchInputFocused ||
+          generation != _suggestionGeneration ||
+          _draftQuery.trim().toLowerCase() != cacheKey) {
+        return;
+      }
+      _suggestionCache.remove(cacheKey);
+      _suggestionCache[cacheKey] = suggestions;
+      while (_suggestionCache.length > _suggestionCacheCapacity) {
+        _suggestionCache.remove(_suggestionCache.keys.first);
+      }
+      setState(() {
+        _suggestions = suggestions;
+        _selectedSuggestionIndex = 0;
+      });
+    } on Object {
+      // The typed query remains selectable when suggestions are unavailable.
+    }
+  }
+
+  void _submitSearch(String query) {
+    _cancelPendingSuggestions();
+    setState(() {
+      _searchInputFocused = false;
+      _draftQuery = query;
+      _suggestions = const <String>[];
+      _selectedSuggestionIndex = 0;
+    });
+    FocusManager.instance.primaryFocus?.unfocus();
+    unawaited(ref.read(searchControllerProvider.notifier).submit(query));
+  }
 
   void _clearSearch() {
-    setState(() => _focusInputAfterClear = true);
+    _cancelPendingSuggestions();
+    setState(() {
+      _focusInputAfterClear = true;
+      _draftQuery = '';
+      _suggestions = const <String>[];
+      _selectedSuggestionIndex = 0;
+    });
     ref.read(searchControllerProvider.notifier).clear();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _focusInputAfterClear) {
@@ -55,10 +188,7 @@ class _SearchViewState extends ConsumerState<SearchView> {
     });
   }
 
-  void _selectBrowseCategory(
-    SearchBrowseCategory category,
-    AppStrings strings,
-  ) {
+  void _selectBrowseCategory(SearchBrowseCategory category) {
     FocusManager.instance.primaryFocus?.unfocus();
     final callback = widget.onBrowseCategorySelected;
     if (callback != null) {
@@ -68,15 +198,8 @@ class _SearchViewState extends ConsumerState<SearchView> {
 
     Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
-        builder: (_) => RemoteCollectionDetailPage(
-          title: category.title,
-          subtitle: strings.youtubeMusic,
-          artworkSource: null,
-          queueSourceId: 'search-browse:${category.id}',
-          tracksProvider: searchBrowseCategoryTracksProvider(category),
-          emptyMessage: strings.searchBrowseEmpty,
-          errorMessage: strings.searchBrowseError,
-          fallbackIcon: _SearchBrowseVisual.forCategory(category).icon,
+        builder: (_) => SearchBrowseCategoryPage(
+          category: category,
           onOpenPlayer: widget.onOpenPlayer,
           onAddToPlaylist: widget.onAddToPlaylist,
         ),
@@ -84,25 +207,115 @@ class _SearchViewState extends ConsumerState<SearchView> {
     );
   }
 
+  List<String> _visibleSuggestionsForDraft() {
+    final query = _draftQuery.trim();
+    if (query.isEmpty) return const <String>[];
+    final visible = <String>[query];
+    final seen = <String>{query.toLowerCase()};
+    for (final suggestion in _suggestions) {
+      final normalized = suggestion.trim();
+      if (normalized.isEmpty || !seen.add(normalized.toLowerCase())) continue;
+      visible.add(normalized);
+      if (visible.length == 8) break;
+    }
+    return visible;
+  }
+
+  KeyEventResult _handleSuggestionKeyEvent(FocusNode node, KeyEvent event) {
+    if (!_searchInputFocused || _draftQuery.trim().isEmpty) {
+      return KeyEventResult.ignored;
+    }
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final visible = _visibleSuggestionsForDraft();
+    if (visible.isEmpty) return KeyEventResult.ignored;
+
+    if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+      setState(() {
+        _selectedSuggestionIndex = (_selectedSuggestionIndex + 1).clamp(
+          0,
+          visible.length - 1,
+        );
+      });
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+      setState(() {
+        _selectedSuggestionIndex = (_selectedSuggestionIndex - 1).clamp(
+          0,
+          visible.length - 1,
+        );
+      });
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+      final index = _selectedSuggestionIndex.clamp(0, visible.length - 1);
+      _submitSearch(visible[index]);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   @override
   Widget build(BuildContext context) {
     final results = ref.watch(searchControllerProvider);
     final searchState = results.value ?? SearchState();
+    final selection = ref.watch(
+      trackSelectionProvider(searchTrackSelectionScope),
+    );
+    ref.listen(searchControllerProvider, (previous, next) {
+      final before = previous?.value;
+      final after = next.value;
+      if (next.hasError ||
+          before?.query != after?.query ||
+          before?.selectedCategory != after?.selectedCategory) {
+        selection.clear();
+      } else if (after != null &&
+          !after.isSelectedCategoryLoading &&
+          after.hasSelectedPage) {
+        selection.retainTracks(after.selectedTracks);
+      }
+    });
+    final showSuggestions =
+        !selection.active &&
+        widget.active &&
+        _searchInputFocused &&
+        _draftQuery.trim().isNotEmpty;
+    final visibleSuggestions = showSuggestions
+        ? _visibleSuggestionsForDraft()
+        : const <String>[];
     final strings = ref.watch(appStringsProvider);
-    final fallbackBrowseCategories = fallbackSearchBrowseCategories(strings);
+    final languageCode = strings.appLanguage.code;
+    if (_browseCatalogLanguageCode != languageCode) {
+      _browseCatalogLanguageCode = languageCode;
+      _retainedBrowseCatalog = null;
+    }
     // Persistent tab slots remain mounted after their first visit. Avoid
     // starting discovery merely because an offstage Search widget exists;
     // the local cards are already enough until the tab is actually visible.
-    final browseCatalog = widget.active && !searchState.hasQuery
+    final browseCatalog =
+        widget.active && !searchState.hasQuery && !showSuggestions
         ? ref.watch(searchBrowseCatalogProvider)
         : null;
+    final cachedBrowseCatalog =
+        widget.active && !searchState.hasQuery && !showSuggestions
+        ? ref.watch(searchBrowseCachedCatalogProvider)
+        : null;
+    // Losing the active subscription must not replace live cards with local
+    // fallbacks during the outgoing fade. Keep their IDs, State and decoded
+    // artwork until fresh data arrives; a locale change explicitly clears it.
+    final freshBrowseCatalog = browseCatalog?.asData?.value;
+    if (freshBrowseCatalog != null) {
+      _retainedBrowseCatalog = freshBrowseCatalog;
+    } else {
+      _retainedBrowseCatalog ??= cachedBrowseCatalog?.asData?.value;
+    }
+    final activeBrowseCatalog = _retainedBrowseCatalog;
     final browseCategories =
-        browseCatalog?.when(
-          data: (catalog) => catalog.categories,
-          loading: () => fallbackBrowseCategories,
-          error: (_, _) => fallbackBrowseCategories,
-        ) ??
-        fallbackBrowseCategories;
+        activeBrowseCatalog?.categories ??
+        fallbackSearchBrowseCategories(strings);
     final isMobile = switch (Theme.of(context).platform) {
       TargetPlatform.android || TargetPlatform.iOS => true,
       _ => false,
@@ -124,7 +337,14 @@ class _SearchViewState extends ConsumerState<SearchView> {
           alignment: Alignment.centerLeft,
           children: <Widget>[...previousChildren, ?currentChild],
         ),
-        child: showHeading
+        child: selection.active
+            ? TrackSelectionToolbar(
+                key: const ValueKey('search-selection-header'),
+                scope: searchTrackSelectionScope,
+                tracks: searchState.selectedTracks,
+                keyPrefix: 'search-selection',
+              )
+            : showHeading
             ? Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
@@ -146,8 +366,10 @@ class _SearchViewState extends ConsumerState<SearchView> {
                 hintText: strings.searchHint,
                 tooltip: strings.search,
                 clearTooltip: strings.clearSearch,
-                onSubmitted: (query) =>
-                    ref.read(searchControllerProvider.notifier).submit(query),
+                onChanged: _handleDraftChanged,
+                onFocusChanged: _handleInputFocusChanged,
+                onKeyEvent: _handleSuggestionKeyEvent,
+                onSubmitted: _submitSearch,
                 onCleared: _clearSearch,
               ),
       ),
@@ -161,14 +383,14 @@ class _SearchViewState extends ConsumerState<SearchView> {
             curve: Curves.easeOutCubic,
             padding: EdgeInsets.fromLTRB(
               0,
-              showHeading ? appTabFirstSectionTopGap : 10,
+              showHeading ? appTabFirstSectionTopGap : 4,
               0,
-              14,
+              10,
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (showHeading)
+                if (showHeading && !selection.active)
                   Padding(
                     key: const ValueKey('search-input-container'),
                     padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -178,14 +400,17 @@ class _SearchViewState extends ConsumerState<SearchView> {
                       hintText: strings.searchHint,
                       tooltip: strings.search,
                       clearTooltip: strings.clearSearch,
-                      onSubmitted: (query) => ref
-                          .read(searchControllerProvider.notifier)
-                          .submit(query),
+                      onChanged: _handleDraftChanged,
+                      onFocusChanged: _handleInputFocusChanged,
+                      onKeyEvent: _handleSuggestionKeyEvent,
+                      onSubmitted: _submitSearch,
                       onCleared: _clearSearch,
                     ),
                   ),
-                if (searchState.hasQuery) ...[
-                  const SizedBox(height: 10),
+                if (searchState.hasQuery &&
+                    !showSuggestions &&
+                    !selection.active) ...[
+                  const SizedBox(height: 6),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 6),
                     child: _SearchCategoryTabs(
@@ -198,7 +423,9 @@ class _SearchViewState extends ConsumerState<SearchView> {
                     ),
                   ),
                 ],
-                if (searchState.fallbackOnly) ...[
+                if (searchState.fallbackOnly &&
+                    !showSuggestions &&
+                    !selection.active) ...[
                   const SizedBox(height: 10),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -213,7 +440,7 @@ class _SearchViewState extends ConsumerState<SearchView> {
             ),
           ),
         ),
-        if (!searchState.hasQuery && !results.hasError)
+        if (!showSuggestions && !searchState.hasQuery && !results.hasError)
           SliverToBoxAdapter(
             child: Padding(
               key: const ValueKey('search-browse-heading'),
@@ -227,15 +454,24 @@ class _SearchViewState extends ConsumerState<SearchView> {
               ),
             ),
           ),
-        _SearchResultsSliver(
-          results: results,
-          strings: strings,
-          browseCategories: browseCategories,
-          onBrowseCategorySelected: (category) =>
-              _selectBrowseCategory(category, strings),
-          onOpenPlayer: widget.onOpenPlayer,
-          onAddToPlaylist: widget.onAddToPlaylist,
-        ),
+        if (showSuggestions)
+          _SearchSuggestionsSliver(
+            visible: visibleSuggestions,
+            selectedIndex: _selectedSuggestionIndex,
+            onSelected: _submitSearch,
+          )
+        else
+          _SearchResultsSliver(
+            results: results,
+            strings: strings,
+            browseCategories: browseCategories,
+            loadBrowseArtwork:
+                widget.active &&
+                activeBrowseCatalog?.usesLiveYouTubeMusicCategories == true,
+            onBrowseCategorySelected: _selectBrowseCategory,
+            onOpenPlayer: widget.onOpenPlayer,
+            onAddToPlaylist: widget.onAddToPlaylist,
+          ),
         SliverToBoxAdapter(
           child: SizedBox(
             key: const ValueKey('search-scroll-bottom-reserve'),
@@ -247,11 +483,63 @@ class _SearchViewState extends ConsumerState<SearchView> {
   }
 }
 
+class _SearchSuggestionsSliver extends StatelessWidget {
+  const _SearchSuggestionsSliver({
+    required this.visible,
+    required this.selectedIndex,
+    required this.onSelected,
+  });
+
+  final List<String> visible;
+  final int selectedIndex;
+  final ValueChanged<String> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return SliverList(
+      delegate: SliverChildBuilderDelegate(
+        // A desktop pointer-down outside the field normally dismisses focus.
+        // Keep suggestions in its tap region until the row's click completes.
+        (context, index) => TextFieldTapRegion(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            child: Material(
+              type: MaterialType.transparency,
+              child: ListTile(
+                key: ValueKey('search-suggestion-$index'),
+                selected: index == selectedIndex,
+                selectedTileColor: Theme.of(
+                  context,
+                ).colorScheme.primary.withValues(alpha: 0.14),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+                leading: const Icon(Icons.search_rounded, size: 22),
+                title: Text(
+                  visible[index],
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: AppColors.contentTitleFor(context),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                trailing: const Icon(Icons.arrow_forward_rounded, size: 20),
+                onTap: () => onSelected(visible[index]),
+              ),
+            ),
+          ),
+        ),
+        childCount: visible.length,
+      ),
+    );
+  }
+}
+
 class _SearchResultsSliver extends StatelessWidget {
   const _SearchResultsSliver({
     required this.results,
     required this.strings,
     required this.browseCategories,
+    required this.loadBrowseArtwork,
     required this.onBrowseCategorySelected,
     required this.onOpenPlayer,
     required this.onAddToPlaylist,
@@ -260,6 +548,7 @@ class _SearchResultsSliver extends StatelessWidget {
   final AsyncValue<SearchState> results;
   final AppStrings strings;
   final List<SearchBrowseCategory> browseCategories;
+  final bool loadBrowseArtwork;
   final ValueChanged<SearchBrowseCategory> onBrowseCategorySelected;
   final VoidCallback onOpenPlayer;
   final AddRemoteTracksToPlaylist? onAddToPlaylist;
@@ -271,6 +560,7 @@ class _SearchResultsSliver extends StatelessWidget {
         if (!state.hasQuery) {
           return _SearchBrowseCategoriesSliver(
             categories: browseCategories,
+            loadArtwork: loadBrowseArtwork,
             onSelected: onBrowseCategorySelected,
           );
         }
@@ -283,6 +573,7 @@ class _SearchResultsSliver extends StatelessWidget {
       },
       loading: () => _SearchBrowseCategoriesSliver(
         categories: browseCategories,
+        loadArtwork: loadBrowseArtwork,
         onSelected: onBrowseCategorySelected,
       ),
       error: (error, _) => SliverFillRemaining(
@@ -855,10 +1146,12 @@ final class _SearchBrowseVisual {
 class _SearchBrowseCategoriesSliver extends StatelessWidget {
   const _SearchBrowseCategoriesSliver({
     required this.categories,
+    required this.loadArtwork,
     required this.onSelected,
   });
 
   final List<SearchBrowseCategory> categories;
+  final bool loadArtwork;
   final ValueChanged<SearchBrowseCategory> onSelected;
 
   @override
@@ -884,6 +1177,7 @@ class _SearchBrowseCategoriesSliver extends StatelessWidget {
           return _SearchBrowseCategoryCard(
             key: ValueKey('search-browse-card-${category.id}'),
             category: category,
+            loadArtwork: loadArtwork,
             visual: visuals[index],
             onTap: () => onSelected(category),
           );
@@ -893,20 +1187,117 @@ class _SearchBrowseCategoriesSliver extends StatelessWidget {
   }
 }
 
-class _SearchBrowseCategoryCard extends StatelessWidget {
+class _SearchBrowseCategoryCard extends ConsumerStatefulWidget {
   const _SearchBrowseCategoryCard({
     required this.category,
+    required this.loadArtwork,
     required this.visual,
     required this.onTap,
     super.key,
   });
 
   final SearchBrowseCategory category;
+  final bool loadArtwork;
   final _SearchBrowseVisual visual;
   final VoidCallback onTap;
 
   @override
+  ConsumerState<_SearchBrowseCategoryCard> createState() =>
+      _SearchBrowseCategoryCardState();
+}
+
+class _SearchBrowseCategoryCardState
+    extends ConsumerState<_SearchBrowseCategoryCard> {
+  ScrollPosition? _scrollPosition;
+  bool _visible = false;
+  bool _visibilityCheckPending = false;
+  bool _cacheLookupStarted = false;
+  String? _artwork;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final position = Scrollable.maybeOf(context)?.position;
+    if (position != _scrollPosition) {
+      _scrollPosition?.removeListener(_checkVisibilityAfterLayout);
+      _scrollPosition = position;
+      position?.addListener(_checkVisibilityAfterLayout);
+    }
+    _checkVisibilityAfterLayout();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SearchBrowseCategoryCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.category != widget.category) {
+      _artwork = null;
+      _cacheLookupStarted = false;
+    }
+    _checkVisibilityAfterLayout();
+  }
+
+  @override
+  void dispose() {
+    _scrollPosition?.removeListener(_checkVisibilityAfterLayout);
+    super.dispose();
+  }
+
+  void _checkVisibilityAfterLayout() {
+    if (_visibilityCheckPending) return;
+    _visibilityCheckPending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _visibilityCheckPending = false;
+      if (!mounted) return;
+      final box = context.findRenderObject();
+      if (box is! RenderBox || !box.hasSize) return;
+      final bounds = MatrixUtils.transformRect(
+        box.getTransformTo(null),
+        Offset.zero & box.size,
+      );
+      final visible = bounds.overlaps(Offset.zero & MediaQuery.sizeOf(context));
+      if (_visible != visible) setState(() => _visible = visible);
+    });
+  }
+
+  void _scheduleCachedArtworkRestore() {
+    if (_cacheLookupStarted) return;
+    _cacheLookupStarted = true;
+    final categoryId = widget.category.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_restoreCachedArtwork(categoryId));
+    });
+  }
+
+  Future<void> _restoreCachedArtwork(String categoryId) async {
+    final cached = await ref
+        .read(searchBrowseCategoryArtworkCacheProvider)
+        .read(categoryId);
+    if (!mounted || cached == null || _artwork != null) return;
+    setState(() => _artwork = cached);
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final category = widget.category;
+    final visual = widget.visual;
+    final canLoad =
+        widget.loadArtwork &&
+        category.target != null &&
+        _visible &&
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    if (canLoad) {
+      _artwork =
+          ref
+              .watch(searchBrowseCategoryArtworkProvider(category))
+              .asData
+              ?.value ??
+          _artwork;
+      if (_artwork == null) _scheduleCachedArtworkRestore();
+    }
+    final showPlaceholderIcon =
+        _artwork == null && MediaQuery.textScalerOf(context).scale(20) <= 30;
     const radius = BorderRadius.all(Radius.circular(12));
     return Semantics(
       button: true,
@@ -929,77 +1320,110 @@ class _SearchBrowseCategoryCard extends StatelessWidget {
           child: InkWell(
             key: ValueKey('search-browse-action-${category.id}'),
             borderRadius: radius,
-            onTap: onTap,
+            onTap: widget.onTap,
             child: Stack(
               clipBehavior: Clip.hardEdge,
               children: [
+                if (_artwork != null) ...[
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: SourceImage(
+                        key: ValueKey('search-browse-cover-${category.id}'),
+                        source: _artwork,
+                        opacity: 0.72,
+                        cacheWidth: 384,
+                        fallback: const SizedBox.shrink(),
+                      ),
+                    ),
+                  ),
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: AlignmentDirectional.centerStart,
+                            end: AlignmentDirectional.centerEnd,
+                            colors: [
+                              visual.startColor.withValues(alpha: 0.8),
+                              visual.endColor.withValues(alpha: 0.32),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
                 Positioned.fill(
                   child: IgnorePointer(
-                    child: RepaintBoundary(
-                      child: CustomPaint(
-                        key: ValueKey('search-browse-pattern-${category.id}'),
-                        painter: _SearchBrowsePatternPainter(
-                          pattern: visual.pattern,
-                          color: visual.highlightColor,
-                        ),
+                    // SliverGrid already isolates the complete card. The
+                    // pattern is static, so a second nested retained layer
+                    // would not avoid any animation or scroll repaint work.
+                    child: CustomPaint(
+                      key: ValueKey('search-browse-pattern-${category.id}'),
+                      painter: _SearchBrowsePatternPainter(
+                        pattern: visual.pattern,
+                        color: visual.highlightColor,
                       ),
                     ),
                   ),
                 ),
-                PositionedDirectional(
-                  end: -7,
-                  bottom: -9,
-                  child: Transform.rotate(
-                    angle: -0.13,
-                    child: Container(
-                      key: ValueKey('search-browse-art-${category.id}'),
-                      width: 64,
-                      height: 64,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.24),
-                        ),
-                        gradient: LinearGradient(
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                          colors: [
-                            Colors.white.withValues(alpha: 0.28),
-                            visual.highlightColor.withValues(alpha: 0.20),
-                            Colors.black.withValues(alpha: 0.08),
+                if (showPlaceholderIcon)
+                  PositionedDirectional(
+                    end: -7,
+                    bottom: -9,
+                    child: Transform.rotate(
+                      angle: -0.13,
+                      child: Container(
+                        key: ValueKey('search-browse-art-${category.id}'),
+                        width: 64,
+                        height: 64,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.24),
+                          ),
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [
+                              Colors.white.withValues(alpha: 0.28),
+                              visual.highlightColor.withValues(alpha: 0.20),
+                              Colors.black.withValues(alpha: 0.08),
+                            ],
+                          ),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x32000000),
+                              blurRadius: 12,
+                              offset: Offset(-2, 4),
+                            ),
                           ],
                         ),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Color(0x32000000),
-                            blurRadius: 12,
-                            offset: Offset(-2, 4),
-                          ),
-                        ],
-                      ),
-                      child: Icon(
-                        visual.icon,
-                        key: ValueKey('search-browse-icon-${category.id}'),
-                        size: 34,
-                        color: Colors.white.withValues(alpha: 0.94),
-                        shadows: const [
-                          Shadow(color: Color(0x3D000000), blurRadius: 4),
-                        ],
+                        child: Icon(
+                          visual.icon,
+                          key: ValueKey('search-browse-icon-${category.id}'),
+                          size: 34,
+                          color: Colors.white.withValues(alpha: 0.94),
+                          shadows: const [
+                            Shadow(color: Color(0x3D000000), blurRadius: 4),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
                 Positioned.fill(
                   child: Padding(
+                    key: ValueKey('search-browse-title-padding-${category.id}'),
                     padding: const EdgeInsetsDirectional.fromSTEB(
                       14,
                       13,
-                      64,
+                      14,
                       13,
                     ),
                     child: Align(
                       alignment: AlignmentDirectional.topStart,
                       child: Text(
+                        key: ValueKey('search-browse-title-${category.id}'),
                         category.title,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
@@ -1255,7 +1679,7 @@ class _SearchCategoryResultsSliverState
   }
 }
 
-class _SearchCategoryResultsBody extends StatelessWidget {
+class _SearchCategoryResultsBody extends ConsumerWidget {
   const _SearchCategoryResultsBody({
     required this.state,
     required this.strings,
@@ -1269,7 +1693,7 @@ class _SearchCategoryResultsBody extends StatelessWidget {
   final AddRemoteTracksToPlaylist? onAddToPlaylist;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     if (state.isSelectedCategoryLoading || !state.hasSelectedPage) {
       return SizedBox(
         height: _minimumBodyHeight(context),
@@ -1303,7 +1727,8 @@ class _SearchCategoryResultsBody extends StatelessWidget {
               onOpenPlayer: onOpenPlayer,
               onAddToPlaylist: onAddToPlaylist,
             ),
-            if (index < page.albums.length - 1) const SizedBox(height: 6),
+            if (index < page.albums.length - 1)
+              const SizedBox(height: appTrackRowGap),
           ],
         ],
       );
@@ -1328,14 +1753,37 @@ class _SearchCategoryResultsBody extends StatelessWidget {
               'search-result-${tracks[index].id.isNotEmpty ? tracks[index].id : tracks[index].url}',
             ),
             track: tracks[index],
-            queue: tracks,
+            selectionScope: searchTrackSelectionScope,
+            onPlayTrack: (track) => _playSearchResult(ref, track),
             preferCatalogArtwork:
                 state.selectedCategory != SearchCategory.videos,
             onOpenPlayer: onOpenPlayer,
           ),
-          if (index < tracks.length - 1) const SizedBox(height: 6),
+          if (index < tracks.length - 1) const SizedBox(height: appTrackRowGap),
         ],
       ],
+    );
+  }
+
+  Future<void> _playSearchResult(WidgetRef ref, TrackInfo track) {
+    final player = ref.read(playerControllerProvider.notifier);
+    final service = ref.read(youtubeMusicSearchProvider);
+    final link = const BStreamTrackLinkCodec().tryFromTrack(track);
+    if (service is! YouTubeMusicRelated || link == null) {
+      // A provider without watch-next support must never fall back to the
+      // unrelated list of search hits.
+      return player.playRemote(track, queue: [track]);
+    }
+    final selected = RecommendationPlaybackItem(track: track);
+    return player.playRecommendation(
+      selected,
+      queue: [selected],
+      queueSourceId: 'search-radio:${link.videoId}',
+      queueExtender: buildRelatedRadioQueueExtender(
+        related: service as YouTubeMusicRelated,
+        seedVideoId: link.videoId,
+        initialQueue: [selected],
+      ),
     );
   }
 
@@ -1358,81 +1806,52 @@ class _SearchCategoryTabs extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
     final textScaler = MediaQuery.textScalerOf(context);
-    final textDirection = Directionality.of(context);
-    final labelStyle =
-        (Theme.of(context).textTheme.labelLarge ?? const TextStyle()).copyWith(
-          fontWeight: FontWeight.w800,
-        );
-    final tabWidths = <double>[
-      for (final category in categories)
-        _naturalTabWidth(
-          label: _categoryLabel(strings, category),
-          style: labelStyle,
-          textScaler: textScaler,
-          textDirection: textDirection,
-        ),
-    ];
+    final scaledLabelHeight = textScaler.scale(13);
+    final cardHeight = (scaledLabelHeight + 46).clamp(60.0, 84.0).toDouble();
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        const spacing = 6.0;
-        final spacingWidth = categories.length > 1
-            ? spacing * (categories.length - 1)
-            : 0.0;
-        final naturalWidth = tabWidths.fold<double>(
-          spacingWidth,
-          (total, width) => total + width,
-        );
-        final extraWidthPerTab =
-            categories.isNotEmpty && constraints.maxWidth > naturalWidth
-            ? (constraints.maxWidth - naturalWidth) / categories.length
-            : 0.0;
+        const spacing = 7.0;
+        // The horizontal rail keeps every label readable at phone widths;
+        // extra-long text scales can still scroll without squeezing the cards.
+        const minimumCardWidth = 126.0;
+        const maximumCardWidth = 168.0;
+        final availableCardWidth = categories.isEmpty
+            ? maximumCardWidth
+            : (constraints.maxWidth - spacing * (categories.length - 1)) /
+                  categories.length;
+        final cardWidth = availableCardWidth
+            .clamp(minimumCardWidth, maximumCardWidth)
+            .toDouble();
 
-        return SingleChildScrollView(
-          key: const ValueKey('search-category-horizontal-scroll'),
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (var index = 0; index < categories.length; index++) ...[
-                if (index > 0) const SizedBox(width: spacing),
-                SizedBox(
-                  width: tabWidths[index] + extraWidthPerTab,
-                  child: _SearchCategoryTab(
-                    category: categories[index],
-                    icon: _categoryIcon(categories[index]),
-                    label: _categoryLabel(strings, categories[index]),
-                    selected: categories[index] == selectedCategory,
-                    selectedColor: colors.primaryContainer,
-                    onSelected: onSelected,
+        return HorizontalShelfScroll(
+          child: SingleChildScrollView(
+            key: const ValueKey('search-category-horizontal-scroll'),
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (var index = 0; index < categories.length; index++) ...[
+                  if (index > 0) const SizedBox(width: spacing),
+                  SizedBox(
+                    width: cardWidth,
+                    height: cardHeight,
+                    child: _SearchCategoryTab(
+                      category: categories[index],
+                      icon: _categoryIcon(categories[index]),
+                      label: _categoryLabel(strings, categories[index]),
+                      selected: categories[index] == selectedCategory,
+                      onSelected: onSelected,
+                    ),
                   ),
-                ),
+                ],
               ],
-            ],
+            ),
           ),
         );
       },
     );
-  }
-
-  double _naturalTabWidth({
-    required String label,
-    required TextStyle style,
-    required TextScaler textScaler,
-    required TextDirection textDirection,
-  }) {
-    final painter = TextPainter(
-      text: TextSpan(text: label, style: style),
-      maxLines: 1,
-      textDirection: textDirection,
-      textScaler: textScaler,
-    )..layout();
-
-    // Icon (18), separation (4) and the horizontal breathing room (24).
-    final width = painter.width + 46;
-    return width < 92 ? 92 : width;
   }
 }
 
@@ -1442,7 +1861,6 @@ class _SearchCategoryTab extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.selected,
-    required this.selectedColor,
     required this.onSelected,
   });
 
@@ -1450,31 +1868,28 @@ class _SearchCategoryTab extends StatelessWidget {
   final IconData icon;
   final String label;
   final bool selected;
-  final Color selectedColor;
   final ValueChanged<SearchCategory> onSelected;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final radius = BorderRadius.circular(appNavItemRadius);
+    final radius = BorderRadius.circular(15);
     final disableAnimations = MediaQuery.disableAnimationsOf(context);
     final motionDuration = disableAnimations
         ? Duration.zero
         : const Duration(milliseconds: 200);
-    final scaledLabelHeight = MediaQuery.textScalerOf(context).scale(14);
-    final tapTargetHeight = (scaledLabelHeight + 20)
-        .clamp(48.0, 80.0)
-        .toDouble();
-    final surfaceHeight = (scaledLabelHeight + 14).clamp(44.0, 74.0).toDouble();
     final contentColor = selected
         ? colors.onPrimaryContainer
         : AppColors.contentTitleFor(context);
+    final surfaceColor = AppColors.cardSurfaceFor(context);
+    final borderColor = AppColors.cardBorderFor(context);
+    final selectedGradient = AppColors.selectedCardGradientFor(context);
+    final selectedBorderColor = Color.lerp(borderColor, colors.primary, 0.52)!;
 
     return Semantics(
       selected: selected,
       button: true,
       child: SizedBox(
-        height: tapTargetHeight,
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -1482,18 +1897,15 @@ class _SearchCategoryTab extends StatelessWidget {
               child: AnimatedContainer(
                 key: ValueKey('search-category-surface-${category.name}'),
                 width: double.infinity,
-                height: surfaceHeight,
+                height: double.infinity,
                 duration: motionDuration,
                 curve: Curves.easeOutCubic,
                 decoration: BoxDecoration(
-                  color: selected
-                      ? selectedColor
-                      : AppColors.cardSurfaceFor(context),
+                  color: selected ? null : surfaceColor,
+                  gradient: selected ? selectedGradient : null,
                   borderRadius: radius,
                   border: Border.all(
-                    color: selected
-                        ? colors.primary
-                        : AppColors.cardBorderFor(context),
+                    color: selected ? selectedBorderColor : borderColor,
                   ),
                 ),
               ),
@@ -1506,9 +1918,13 @@ class _SearchCategoryTab extends StatelessWidget {
                 onTap: selected ? null : () => onSelected(category),
                 child: Center(
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Row(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 1,
+                      vertical: 3,
+                    ),
+                    child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
                         TweenAnimationBuilder<Color?>(
                           duration: motionDuration,
@@ -1519,29 +1935,29 @@ class _SearchCategoryTab extends StatelessWidget {
                             key: ValueKey(
                               'search-category-icon-${category.name}',
                             ),
-                            size: 18,
+                            size: 20,
                             color: color ?? contentColor,
                           ),
                         ),
-                        const SizedBox(width: 4),
-                        Flexible(
-                          child: AnimatedDefaultTextStyle(
-                            duration: motionDuration,
-                            curve: Curves.easeOutCubic,
-                            style:
-                                (Theme.of(context).textTheme.labelLarge ??
-                                        const TextStyle())
-                                    .copyWith(
-                                      color: contentColor,
-                                      fontWeight: selected
-                                          ? FontWeight.w800
-                                          : FontWeight.w600,
-                                    ),
-                            child: Text(
-                              label,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
+                        const SizedBox(height: 3),
+                        AnimatedDefaultTextStyle(
+                          duration: motionDuration,
+                          curve: Curves.easeOutCubic,
+                          style:
+                              (Theme.of(context).textTheme.labelMedium ??
+                                      const TextStyle())
+                                  .copyWith(
+                                    color: contentColor,
+                                    fontSize: 13,
+                                    fontWeight: selected
+                                        ? FontWeight.w800
+                                        : FontWeight.w600,
+                                  ),
+                          child: Text(
+                            label,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
                           ),
                         ),
                       ],
@@ -1922,7 +2338,7 @@ class _AlbumResultTileState extends State<_AlbumResultTile> {
           artworkSource: album.thumbnailUrl,
           metadata: metadata,
           fallbackIcon: Icons.album_rounded,
-          useCollectionArtworkForTrackFallback: true,
+          preferCollectionArtworkForTracks: true,
           queueSourceId: 'album:${album.browseId}',
           tracksProvider: searchAlbumTracksProvider(album.browseId),
           emptyMessage: widget.strings.albumWithoutSongs,

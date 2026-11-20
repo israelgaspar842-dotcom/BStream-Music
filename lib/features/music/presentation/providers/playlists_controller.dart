@@ -46,6 +46,7 @@ class PlaylistDeleteOptions {
 
 class PlaylistsController extends AsyncNotifier<List<Playlist>> {
   final _uuid = const Uuid();
+  final _artworkChanges = <String, Future<void>>{};
 
   @override
   Future<List<Playlist>> build() async {
@@ -70,6 +71,100 @@ class PlaylistsController extends AsyncNotifier<List<Playlist>> {
     _invalidateCatalogProviders();
     _requestYouTubeMusicSync();
     return playlist;
+  }
+
+  Future<void> setCustomArtwork(String playlistId, ui.Image image, Rect crop) =>
+      _changeArtwork(playlistId, image: image, crop: crop);
+
+  Future<void> resetArtwork(String playlistId) => _changeArtwork(playlistId);
+
+  Future<void> _changeArtwork(
+    String playlistId, {
+    ui.Image? image,
+    Rect? crop,
+  }) => _serializeArtworkChange(playlistId, () async {
+    await future;
+    // Finish startup/migration before holding a gate that it must drain.
+    await ref.read(settingsControllerProvider.future);
+    if (!ref.mounted) return;
+    final coordinator = ref.read(libraryOperationCoordinatorProvider);
+    final database = ref.read(databaseServiceProvider);
+    final service = ref.read(playlistArtworkServiceProvider);
+    await coordinator.runWithGate(() async {
+      // A queued directory move may have completed while waiting for the
+      // gate. Both the new file and the database change use its current root.
+      if (!ref.mounted) return;
+      final mediaRoot = ref
+          .read(settingsControllerProvider)
+          .requireValue
+          .downloadDirectory;
+      final current = await database.getCatalogPlaylist(playlistId);
+      if (current == null || current.playlist.deletedAt != null) {
+        throw StateError('The playlist is no longer available.');
+      }
+      final oldName = current.playlist.customArtworkFileName;
+      if (image == null && oldName == null) return;
+      String? newName;
+      try {
+        if (image != null) {
+          newName = await service.save(
+            mediaRoot: mediaRoot,
+            image: image,
+            crop: crop!,
+          );
+        }
+        final updated = await database.setPlaylistArtworkFileName(
+          playlistId,
+          newName,
+        );
+        if (updated == null) {
+          throw StateError('The playlist is no longer available.');
+        }
+      } catch (error, stack) {
+        try {
+          await service.delete(mediaRoot: mediaRoot, fileName: newName);
+        } on FileSystemException {
+          // Preserve the database failure if best-effort rollback is locked.
+        }
+        Error.throwWithStackTrace(error, stack);
+      }
+      if (ref.mounted) {
+        // Cover edits must not reorder playlists, replace concurrent track
+        // edits, restart the playing queue or request account sync.
+        state = AsyncData([
+          for (final playlist in state.requireValue)
+            if (playlist.id == playlistId)
+              playlist.copyWith(customArtworkFileName: newName)
+            else
+              playlist,
+        ]);
+        ref.invalidate(catalogPlaylistProvider(playlistId));
+      }
+      try {
+        await service.delete(mediaRoot: mediaRoot, fileName: oldName);
+      } on FileSystemException {
+        // The committed selection still succeeds if an outgoing image has
+        // a short-lived file handle. Never delete before metadata commits.
+      }
+    });
+  });
+
+  Future<void> _serializeArtworkChange(
+    String playlistId,
+    Future<void> Function() operation,
+  ) async {
+    final previous = _artworkChanges[playlistId];
+    final turn = Completer<void>();
+    _artworkChanges[playlistId] = turn.future;
+    try {
+      await previous;
+      await operation();
+    } finally {
+      if (identical(_artworkChanges[playlistId], turn.future)) {
+        _artworkChanges.remove(playlistId);
+      }
+      turn.complete();
+    }
   }
 
   CatalogTrack _catalogTrackForLocal(LocalTrack track) {
@@ -257,6 +352,76 @@ class PlaylistsController extends AsyncNotifier<List<Playlist>> {
     _requestYouTubeMusicSync();
   }
 
+  /// Removes occurrences from this playlist without deleting their audio or
+  /// library records. Entry identity preserves duplicate remote occurrences.
+  Future<int> removeCatalogEntries(
+    String playlistId,
+    Iterable<String> entryIds,
+  ) async {
+    final requested = entryIds
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    if (requested.isEmpty) return 0;
+    final database = ref.read(databaseServiceProvider);
+    final catalog = await database.getCatalogPlaylist(playlistId);
+    if (catalog == null) return 0;
+    final matches = catalog.entries
+        .where((entry) => !entry.isDeleted && requested.contains(entry.id))
+        .toList(growable: false);
+    if (matches.isEmpty) return 0;
+    final now = DateTime.now();
+    for (final entry in matches) {
+      await database.tombstoneCatalogEntry(
+        playlistId: playlistId,
+        entryId: entry.id,
+        now: now,
+      );
+    }
+    await _reloadCatalogState();
+    await _syncActivePlaybackQueueById(playlistId);
+    _requestYouTubeMusicSync();
+    return matches.length;
+  }
+
+  Future<void> reorderCatalogPlaylist(
+    String playlistId,
+    List<String> orderedEntryIds,
+  ) async {
+    final database = ref.read(databaseServiceProvider);
+    final catalog = await database.getCatalogPlaylist(playlistId);
+    if (catalog == null) {
+      throw StateError('La playlist ya no está disponible.');
+    }
+    final activeEntries = catalog.entries
+        .where((entry) => !entry.isDeleted)
+        .toList(growable: false);
+    final entriesById = <String, PlaylistEntry>{
+      for (final entry in activeEntries) entry.id: entry,
+    };
+    if (orderedEntryIds.length != activeEntries.length ||
+        orderedEntryIds.toSet().length != orderedEntryIds.length ||
+        !orderedEntryIds.toSet().containsAll(entriesById.keys)) {
+      throw ArgumentError.value(
+        orderedEntryIds,
+        'orderedEntryIds',
+        'Must contain every active playlist entry exactly once.',
+      );
+    }
+
+    await database.replaceCatalogEntries(
+      playlistId: playlistId,
+      entries: <PlaylistEntry>[
+        for (final entryId in orderedEntryIds) entriesById[entryId]!,
+      ],
+      expectedRevision: catalog.playlist.localRevision,
+      now: DateTime.now(),
+    );
+    await _reloadCatalogState();
+    await _syncActivePlaybackQueueById(playlistId);
+    _requestYouTubeMusicSync();
+  }
+
   Future<void> renamePlaylist(String playlistId, String name) async {
     if (playlistId == Playlist.favoritesId) {
       return;
@@ -328,19 +493,57 @@ class PlaylistsController extends AsyncNotifier<List<Playlist>> {
       deleteRemote = true;
       remoteAccountKey = options.remoteAccountKey;
     }
-    await ref
-        .read(databaseServiceProvider)
-        .tombstoneCatalogPlaylist(
-          playlistId: playlistId,
-          now: DateTime.now(),
-          deleteRemote: deleteRemote,
-          remoteAccountKey: remoteAccountKey,
-        );
-    await _reloadCatalogState();
-    await ref
-        .read(playerControllerProvider.notifier)
-        .clearQueueSource(PlayerController.playlistQueueSourceId(playlistId));
-    _requestYouTubeMusicSync();
+    await _serializeArtworkChange(playlistId, () async {
+      await future;
+      await ref
+          .read(databaseServiceProvider)
+          .tombstoneCatalogPlaylist(
+            playlistId: playlistId,
+            now: DateTime.now(),
+            deleteRemote: deleteRemote,
+            remoteAccountKey: remoteAccountKey,
+          );
+      // Only cover-bearing playlists need the file-storage dependencies. Read
+      // the actual owned name again under the gate after tombstoning commits.
+      final hadCustomArtwork =
+          state.value?.any(
+            (playlist) =>
+                playlist.id == playlistId &&
+                playlist.customArtworkFileName != null,
+          ) ??
+          false;
+      if (hadCustomArtwork) {
+        try {
+          await ref.read(settingsControllerProvider.future);
+          if (ref.mounted) {
+            final coordinator = ref.read(libraryOperationCoordinatorProvider);
+            final database = ref.read(databaseServiceProvider);
+            final service = ref.read(playlistArtworkServiceProvider);
+            await coordinator.runWithGate(() async {
+              if (!ref.mounted) return;
+              final deleted = await database.getCatalogPlaylist(playlistId);
+              if (deleted?.playlist.deletedAt == null) return;
+              final mediaRoot = ref
+                  .read(settingsControllerProvider)
+                  .requireValue
+                  .downloadDirectory;
+              await service.delete(
+                mediaRoot: mediaRoot,
+                fileName: deleted!.playlist.customArtworkFileName,
+              );
+            });
+          }
+        } catch (_) {
+          // Deletion is already committed. A locked image or unavailable
+          // media directory must not keep the deleted playlist in the UI.
+        }
+      }
+      await _reloadCatalogState();
+      await ref
+          .read(playerControllerProvider.notifier)
+          .clearQueueSource(PlayerController.playlistQueueSourceId(playlistId));
+      _requestYouTubeMusicSync();
+    });
   }
 
   Future<void> addTrackToPlaylist(String playlistId, String trackId) async {

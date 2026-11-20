@@ -5,8 +5,11 @@ import 'dart:io';
 import 'package:bstream_music/core/errors/app_exception.dart';
 import 'package:bstream_music/features/music/domain/entities/download_options.dart';
 import 'package:bstream_music/features/music/domain/entities/download_result.dart';
+import 'package:bstream_music/services/audio_sources/audio_format_details.dart';
 import 'package:bstream_music/services/downloader/http_audio_transfer.dart';
 import 'package:bstream_music/services/downloader/innertube_download_service.dart';
+import 'package:bstream_music/services/downloader/audio_stream_resolver.dart';
+import 'package:bstream_music/features/music/domain/entities/track_info.dart';
 import 'package:bstream_music/services/youtube_music/innertube_search_service.dart';
 import 'package:bstream_music/services/youtube_music/playback/innertube_client_profile.dart';
 import 'package:bstream_music/services/youtube_music/playback/innertube_client_router.dart';
@@ -16,6 +19,144 @@ import 'package:bstream_music/services/youtube_music/playback/innertube_stream_v
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'downloads the verified upgrade and reuses supplied catalog metadata',
+    () async {
+      final transfer = _UpgradeRecordingTransfer();
+      const track = TrackInfo(
+        id: 'dQw4w9WgXcQ',
+        title: 'Canonical title',
+        artist: 'Artist',
+        url: 'dQw4w9WgXcQ',
+      );
+      final fixture = await _upgradeFixture(transfer, (
+        url,
+        metadata,
+        baseline,
+        current,
+      ) async {
+        expect(identical(metadata, track), isTrue);
+        expect(baseline.source, AudioStreamSource.innerTube);
+        expect(baseline.bitrate, 129000);
+        expect(current(), isTrue);
+        return _upgrade();
+      });
+      final result = await fixture.downloader.downloadAudio(
+        track.url,
+        DownloadOptions(
+          outputDirectory: fixture.directory.path,
+          fileName: 'Song',
+          track: track,
+        ),
+      );
+      expect(transfer.requests, ['https://jio.example/audio_320.mp4']);
+      expect(result.fileName, 'Song-jiosaavn-320.m4a');
+      expect(result.sourceUrl, track.url);
+      expect(fixture.catalog.songLookups, 0);
+      expect(File(result.filePath).readAsBytesSync(), [3, 2, 0]);
+      expect(
+        result.audioFormat,
+        const AudioFormatDetails(
+          codec: 'aac',
+          mimeType: 'audio/mp4',
+          bitrate: 320000,
+          sampleRate: 44100,
+          channels: 2,
+        ),
+      );
+    },
+  );
+
+  for (final mode in [
+    'unavailable',
+    'lower',
+    'lookup-error',
+    'cdn-error',
+    'local-uri',
+  ]) {
+    test('retains the YouTube download on $mode', () async {
+      final transfer = _UpgradeRecordingTransfer(
+        failUpgrade: mode == 'cdn-error',
+      );
+      final fixture = await _upgradeFixture(transfer, (
+        url,
+        metadata,
+        baseline,
+        current,
+      ) async {
+        if (mode == 'lookup-error') {
+          throw StateError('Optional provider offline');
+        }
+        if (mode == 'local-uri') {
+          return const AudioStreamResolution(
+            source: AudioStreamSource.jioSaavn,
+            streamUrl: 'file:///tmp/audio.m4a',
+            bitrate: 320000,
+          );
+        }
+        return mode == 'unavailable'
+            ? null
+            : _upgrade(bitrate: mode == 'lower' ? 96000 : 320000);
+      });
+      final result = await fixture.downloader.downloadAudio(
+        'dQw4w9WgXcQ',
+        DownloadOptions(
+          outputDirectory: fixture.directory.path,
+          fileName: 'Song',
+        ),
+      );
+      expect(transfer.requests.last, 'https://yt.example/audio.m4a');
+      expect(File(result.filePath).readAsBytesSync(), [1, 2, 8]);
+      expect(result.audioFormat?.codec, 'mp4a.40.2');
+      expect(result.audioFormat?.bitrate, 129000);
+      expect(result.audioFormat?.sampleRate, 44100);
+      expect(result.audioFormat?.channels, 2);
+      expect(
+        fixture.directory.listSync().whereType<File>().map((file) => file.path),
+        [result.filePath],
+      );
+    });
+  }
+
+  test('cancelled quality lookup cannot start either transfer', () async {
+    final entered = Completer<void>();
+    final lookup = Completer<AudioStreamResolution?>();
+    final transfer = _UpgradeRecordingTransfer();
+    final fixture = await _upgradeFixture(transfer, (
+      url,
+      metadata,
+      baseline,
+      current,
+    ) {
+      entered.complete();
+      return lookup.future;
+    });
+    final downloading = fixture.downloader.downloadAudio(
+      'dQw4w9WgXcQ',
+      DownloadOptions(
+        outputDirectory: fixture.directory.path,
+        fileName: 'Song',
+        taskId: 'cancel-upgrade',
+      ),
+    );
+    final rejected = expectLater(
+      downloading,
+      throwsA(
+        isA<DownloaderException>().having(
+          (error) => error.code,
+          'code',
+          'download_cancelled',
+        ),
+      ),
+    );
+    await entered.future;
+    await fixture.downloader.cancelDownload('cancel-upgrade');
+    lookup.complete(_upgrade());
+    await rejected;
+    expect(transfer.requests, isEmpty);
+    expect(fixture.directory.listSync(), isEmpty);
+  });
+
   test(
     'downloads a resolved InnerTube stream without an external tool',
     () async {
@@ -359,6 +500,9 @@ void main() {
     expect(info.title, 'Test Song');
     expect(info.artist, 'BStream');
     expect(playbackInfo.streamClientProfileKey, 'androidSdkless');
+    expect(playbackInfo.streamBitrate, 129000);
+    expect(playbackInfo.streamSampleRate, 44100);
+    expect(playbackInfo.streamChannels, 2);
     expect(results.single.id, 'dQw4w9WgXcQ');
   });
 
@@ -532,6 +676,85 @@ void main() {
   );
 }
 
+AudioStreamResolution _upgrade({int bitrate = 320000}) => AudioStreamResolution(
+  source: AudioStreamSource.jioSaavn,
+  streamUrl: 'https://jio.example/audio_320.mp4',
+  streamExtension: 'm4a',
+  streamMimeType: 'audio/mp4',
+  codec: 'aac',
+  bitrate: bitrate,
+  sampleRate: 44100,
+  channels: 2,
+);
+
+Future<
+  ({InnerTubeDownloadService downloader, Directory directory, _Catalog catalog})
+>
+_upgradeFixture(
+  _UpgradeRecordingTransfer transfer,
+  DownloadAudioUpgrade callback,
+) async {
+  final directory = await Directory.systemTemp.createTemp(
+    'bstream-provider-download-',
+  );
+  final playback = InnerTubePlaybackService(
+    transport: _PlayerTransport('https://yt.example/audio.m4a'),
+    validator: _AlwaysValidStream(),
+    router: InnerTubeClientRouter(
+      profiles: const [InnerTubeClientRegistry.androidSdkless],
+    ),
+    maxRequestAttempts: 1,
+  );
+  final catalog = _Catalog();
+  final downloader = InnerTubeDownloadService(
+    playback: playback,
+    catalog: catalog,
+    transfer: transfer,
+    audioUpgrade: callback,
+  );
+  addTearDown(() async {
+    await downloader.dispose();
+    await playback.dispose();
+    await directory.delete(recursive: true);
+  });
+  return (downloader: downloader, directory: directory, catalog: catalog);
+}
+
+class _UpgradeRecordingTransfer extends HttpAudioTransfer {
+  _UpgradeRecordingTransfer({this.failUpgrade = false}) : super(maxRetries: 0);
+  final bool failUpgrade;
+  final requests = <String>[];
+
+  @override
+  Future<HttpAudioTransferResult> download({
+    required Uri uri,
+    required File destination,
+    Map<String, String> headers = const {},
+    HttpAudioRangePlan? rangePlan,
+    HttpAudioTransferProgressCallback? onProgress,
+    HttpAudioTransferCancellationCallback? isCancelled,
+    Stream<void>? cancellationEvents,
+  }) async {
+    requests.add(uri.toString());
+    if (uri.host == 'jio.example' && failUpgrade) {
+      await File('${destination.path}.part').writeAsBytes([9]);
+      throw const HttpAudioTransferException(
+        'CDN unavailable',
+        kind: HttpAudioTransferFailureKind.httpStatus,
+        statusCode: 403,
+      );
+    }
+    final bytes = uri.host == 'jio.example' ? [3, 2, 0] : [1, 2, 8];
+    await destination.writeAsBytes(bytes);
+    return HttpAudioTransferResult(
+      file: destination,
+      length: bytes.length,
+      attempts: 1,
+      resumed: false,
+    );
+  }
+}
+
 final class _Catalog implements YouTubeMusicSearch, YouTubeMusicTrackLookup {
   static final song = InnerTubeSong(
     videoId: 'dQw4w9WgXcQ',
@@ -570,6 +793,7 @@ final class _RecordingAudioTransfer extends HttpAudioTransfer {
     HttpAudioRangePlan? rangePlan,
     HttpAudioTransferProgressCallback? onProgress,
     HttpAudioTransferCancellationCallback? isCancelled,
+    Stream<void>? cancellationEvents,
   }) async {
     this.rangePlan = rangePlan;
     await destination.parent.create(recursive: true);
@@ -596,6 +820,7 @@ final class _CancellableAudioTransfer extends HttpAudioTransfer {
     HttpAudioRangePlan? rangePlan,
     HttpAudioTransferProgressCallback? onProgress,
     HttpAudioTransferCancellationCallback? isCancelled,
+    Stream<void>? cancellationEvents,
   }) async {
     await destination.parent.create(recursive: true);
     await HttpAudioTransfer.partialFileFor(
@@ -604,10 +829,10 @@ final class _CancellableAudioTransfer extends HttpAudioTransfer {
     await File(
       '${destination.path}.part.if-range',
     ).writeAsString('etag\n"cancel-test"', flush: true);
+    final cancellation = cancellationEvents!.first;
     if (!started.isCompleted) started.complete();
-    while (isCancelled?.call() != true) {
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-    }
+    await cancellation;
+    expect(isCancelled?.call(), isTrue);
     throw const HttpAudioTransferException(
       'cancelled by test',
       kind: HttpAudioTransferFailureKind.cancelled,
@@ -659,6 +884,8 @@ final class _PlayerTransport implements InnerTubeTransport {
                   ? 'video/mp4; codecs="avc1.42001E, mp4a.40.2"'
                   : audioMimeType,
               'bitrate': 129000,
+              'audioSampleRate': '44100',
+              'audioChannels': 2,
               'contentLength': '4096',
             },
             ...additionalAudioFormats,

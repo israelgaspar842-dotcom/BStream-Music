@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:bstream_music/core/constants/app_constants.dart';
@@ -27,7 +28,7 @@ void main() {
       r'#define MyAppVersion "([0-9]+\.[0-9]+\.[0-9]+)"',
     ).firstMatch(windowsInstaller)?.group(1);
 
-    expect(pubspecVersion, '1.2.8+128');
+    expect(pubspecVersion, '1.3.1+131');
     expect(readmeVersion, pubspecVersion);
     expect(changelogVersion, pubspecVersion);
     expect(runtimeVersion, AppConstants.appVersion);
@@ -75,6 +76,59 @@ void main() {
       isNot(contains('youtube_explode_playback_test.dart')),
     );
   });
+
+  test('Android emulator runner receives complete single-line commands', () {
+    final workflow = File(
+      '.github/workflows/nightly-smoke.yml',
+    ).readAsStringSync();
+    // android-emulator-runner executes each script line in its own shell;
+    // backslash continuations would invoke flutter with a target named "\\".
+    final commands = const LineSplitter()
+        .convert(workflow)
+        .skipWhile((line) => line.trim() != 'android-native:')
+        .skipWhile((line) => line.trim() != 'script: |')
+        .skip(1)
+        .takeWhile((line) => line.startsWith('            ') || line.isEmpty)
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+
+    expect(commands, hasLength(3));
+    for (final (index, target) in [
+      'crossfade_native_test.dart',
+      'skip_silence_native_test.dart',
+      'equalizer_android_native_test.dart',
+    ].indexed) {
+      expect(
+        commands[index],
+        'flutter drive --driver=test_driver/integration_test.dart '
+        '--target=integration_test/$target -d emulator-5554 --no-dds',
+      );
+    }
+  });
+
+  test(
+    'iOS smoke selects an available simulator and runs the shared scenarios',
+    () {
+      final workflow = File(
+        '.github/workflows/nightly-smoke.yml',
+      ).readAsStringSync();
+      final ios = workflow.split('  ios-native:').last;
+      expect(ios, contains('runs-on: macos-26'));
+      expect(ios, contains('xcrun simctl list runtimes --json'));
+      expect(ios, contains('xcrun simctl list devices available --json'));
+      expect(ios, contains('xcrun simctl bootstatus "\$simulator_id" -b'));
+      expect(ios, contains('-d "\$BSTREAM_IOS_SIMULATOR_ID" --no-dds'));
+      expect(ios, isNot(matches(r'-d [0-9A-Fa-f]{8}-[0-9A-Fa-f-]{27,}')));
+      for (final target in [
+        'equalizer_ios_native_test.dart',
+        'skip_silence_native_test.dart',
+        'crossfade_native_test.dart',
+      ]) {
+        expect(ios, contains('--target=integration_test/$target'));
+      }
+    },
+  );
 
   test('release packaging is hermetic and declares Linux secure storage', () {
     final workflow = File(

@@ -29,6 +29,12 @@ flutter_ios_podfile_setup
 target 'Runner' do
   use_frameworks!
 
+  # Keep iOS 13 support while using the official XCFramework, which includes
+  # the arm64 simulator slice needed by current Apple Silicon runners.
+  # Bluetooth guest discovery is disabled; Wi-Fi discovery starts only in the
+  # Cast menu.
+  pod 'google-cast-sdk-no-bluetooth-xcframework', '4.8.0'
+
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
     inherit! :search_paths

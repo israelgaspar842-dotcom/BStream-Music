@@ -138,7 +138,7 @@ class YouTubeMusicAccountParser {
     final containers = _savedPlaylistContainers(root);
     final collections = containers.isNotEmpty
         ? containers.expand(_savedPlaylistCollections).toList(growable: false)
-        : _uniqueLegacyRendererCollection(
+        : _legacyCollectionForResponse(
             root,
             _savedPlaylistRendererNames,
             _isVerifiablePlaylistSummary,
@@ -229,7 +229,7 @@ class YouTubeMusicAccountParser {
     final containers = _playlistEntryContainers(root);
     final collections = containers.isNotEmpty
         ? containers.expand(_playlistEntryCollections).toList(growable: false)
-        : _uniqueLegacyRendererCollection(
+        : _legacyCollectionForResponse(
             root,
             _playlistEntryRendererNames,
             _isVerifiablePlaylistEntry,
@@ -268,6 +268,30 @@ class YouTubeMusicAccountParser {
     return entries;
   }
 
+  /// Distinguishes an actual (possibly empty) playlist page from an unknown
+  /// response. Missing pagination must never turn a rejected page into an
+  /// apparently complete snapshot used for synchronization.
+  bool isPlaylistEntryPage(Object? root) => _isCollectionPage(
+    root,
+    _playlistEntryContainers(root),
+    _playlistEntryRendererNames,
+    _isVerifiablePlaylistEntry,
+  );
+
+  bool isSavedPlaylistPage(Object? root) => _isCollectionPage(
+    root,
+    _savedPlaylistContainers(root),
+    _savedPlaylistRendererNames,
+    _isVerifiablePlaylistSummary,
+  );
+
+  bool isSubscribedArtistPage(Object? root) => _isCollectionPage(
+    root,
+    _subscribedArtistContainers(root),
+    _subscribedArtistRendererNames,
+    _isVerifiableSubscribedArtist,
+  );
+
   /// Continuations for `FEmusic_liked_playlists` are accepted only from the
   /// grid/music shelf that owns the parsed playlist cards.
   List<String> parseSavedPlaylistContinuationTokens(Object? root) {
@@ -275,7 +299,7 @@ class YouTubeMusicAccountParser {
     if (containers.isNotEmpty) {
       return _continuationTokensFromContainers(containers);
     }
-    final legacy = _uniqueLegacyRendererCollection(
+    final legacy = _legacyCollectionForResponse(
       root,
       _savedPlaylistRendererNames,
       _isVerifiablePlaylistSummary,
@@ -293,7 +317,7 @@ class YouTubeMusicAccountParser {
         ? containers
               .expand(_subscribedArtistCollections)
               .toList(growable: false)
-        : _uniqueLegacyRendererCollection(
+        : _legacyCollectionForResponse(
             root,
             _subscribedArtistRendererNames,
             _isVerifiableSubscribedArtist,
@@ -324,7 +348,7 @@ class YouTubeMusicAccountParser {
     if (containers.isNotEmpty) {
       return _continuationTokensFromContainers(containers);
     }
-    final legacy = _uniqueLegacyRendererCollection(
+    final legacy = _legacyCollectionForResponse(
       root,
       _subscribedArtistRendererNames,
       _isVerifiableSubscribedArtist,
@@ -339,7 +363,7 @@ class YouTubeMusicAccountParser {
     if (containers.isNotEmpty) {
       return _continuationTokensFromContainers(containers);
     }
-    final legacy = _uniqueLegacyRendererCollection(
+    final legacy = _legacyCollectionForResponse(
       root,
       _playlistEntryRendererNames,
       _isVerifiablePlaylistEntry,
@@ -358,6 +382,8 @@ class YouTubeMusicAccountParser {
     if (savedContainers.isNotEmpty) {
       return _continuationTokensFromContainers(savedContainers);
     }
+
+    if (_hasContinuationActionResponse(root)) return const <String>[];
 
     final legacy = <_RendererCollection>[
       ..._legacyRendererCollections(
@@ -414,13 +440,29 @@ const List<String> _subscribedArtistRendererNames = <String>[
 List<Map<String, Object?>> _playlistEntryContainers(Object? root) {
   final rootMap = _asMap(root);
   final continuationContents = _asMap(rootMap?['continuationContents']);
-  final continuation = _asMap(
-    continuationContents?['musicPlaylistShelfContinuation'],
-  );
-  if (continuation != null) {
-    return <Map<String, Object?>>[continuation];
+  final legacy = <Map<String, Object?>>[
+    for (final key in const [
+      'musicPlaylistShelfContinuation',
+      'musicShelfContinuation',
+    ])
+      ?_asMap(continuationContents?[key]),
+  ];
+  if (legacy.isNotEmpty) {
+    return _selectCollectionContainers(
+      legacy,
+      _playlistEntryRendererNames,
+      _isVerifiablePlaylistEntry,
+    );
   }
-  return _renderers(root, 'musicPlaylistShelfRenderer').toList(growable: false);
+  final shelves = _renderers(
+    root,
+    'musicPlaylistShelfRenderer',
+  ).toList(growable: false);
+  return _selectCollectionContainers(
+    shelves.isNotEmpty ? shelves : _continuationActionContainers(root),
+    _playlistEntryRendererNames,
+    _isVerifiablePlaylistEntry,
+  );
 }
 
 List<Map<String, Object?>> _savedPlaylistContainers(Object? root) {
@@ -459,7 +501,13 @@ List<Map<String, Object?>> _savedPlaylistContainers(Object? root) {
     'musicCarouselShelfRenderer',
   ).where(_savedPlaylistContainerHasVerifiableCard).toList(growable: false);
   containers.addAll(carousels);
-  return containers;
+  return containers.isNotEmpty
+      ? containers
+      : _selectCollectionContainers(
+          _continuationActionContainers(root),
+          _savedPlaylistRendererNames,
+          _isVerifiablePlaylistSummary,
+        );
 }
 
 List<Map<String, Object?>> _subscribedArtistContainers(Object? root) {
@@ -481,12 +529,120 @@ List<Map<String, Object?>> _subscribedArtistContainers(Object? root) {
     return artistBranches.isNotEmpty ? artistBranches : candidates;
   }
 
-  return <Map<String, Object?>>[
+  final candidates = <Map<String, Object?>>[
     ..._renderers(root, 'gridRenderer'),
     ..._renderers(root, 'musicShelfRenderer'),
     ..._renderers(root, 'musicCarouselShelfRenderer'),
-  ].where(_subscribedArtistContainerHasVerifiableCard).toList(growable: false);
+  ];
+  final matching = candidates
+      .where(_subscribedArtistContainerHasVerifiableCard)
+      .toList(growable: false);
+  final containers = matching.isNotEmpty
+      ? matching
+      : _selectCollectionContainers(
+          candidates,
+          _subscribedArtistRendererNames,
+          _isVerifiableSubscribedArtist,
+        );
+  return containers.isNotEmpty
+      ? containers
+      : _selectCollectionContainers(
+          _continuationActionContainers(root),
+          _subscribedArtistRendererNames,
+          _isVerifiableSubscribedArtist,
+        );
 }
+
+const _continuationResponseKeys = <String>[
+  'onResponseReceivedActions',
+  'onResponseReceivedEndpoints',
+  'onResponseReceivedCommands',
+];
+
+bool _hasContinuationActionResponse(Object? root) {
+  final map = _asMap(root);
+  return map != null && _continuationResponseKeys.any(map.containsKey);
+}
+
+/// Read only top-level content operations. Menus, voting popups and other
+/// nested commands can contain unrelated songs and pagination tokens.
+List<Map<String, Object?>> _continuationActionContainers(Object? root) {
+  final rootMap = _asMap(root);
+  final containers = <Map<String, Object?>>[];
+  for (final responseKey in _continuationResponseKeys) {
+    final operations = rootMap?[responseKey];
+    if (operations is! List) continue;
+    for (final value in operations) {
+      final operation = _asMap(value);
+      for (final key in const [
+        'appendContinuationItemsAction',
+        'reloadContinuationItemsCommand',
+      ]) {
+        final payload = _asMap(operation?[key]);
+        if (payload == null) continue;
+        containers.add(<String, Object?>{
+          'contents': payload['continuationItems'],
+        });
+      }
+    }
+  }
+  return containers;
+}
+
+List<Map<String, Object?>> _selectCollectionContainers(
+  List<Map<String, Object?>> candidates,
+  List<String> rendererNames,
+  _RendererVerifier verifier,
+) {
+  if (candidates.length <= 1) return candidates;
+  final matching = candidates
+      .where((container) {
+        final collections = _savedPlaylistCollections(container);
+        return _directRenderers(collections, rendererNames).any(verifier);
+      })
+      .toList(growable: false);
+  // Two plausible song collections cannot safely be merged: one may be a
+  // related/recommended shelf. Report an unrecognized page instead.
+  return matching.length == 1 ? matching : const <Map<String, Object?>>[];
+}
+
+bool _isCollectionPage(
+  Object? root,
+  List<Map<String, Object?>> containers,
+  List<String> rendererNames,
+  _RendererVerifier verifier,
+) {
+  final collections = containers.isNotEmpty
+      ? containers.expand(_savedPlaylistCollections).toList(growable: false)
+      : _legacyCollectionForResponse(root, rendererNames, verifier);
+  if (collections.isEmpty) return false;
+  for (final collection in collections) {
+    for (final value in collection) {
+      final item = _asMap(value);
+      if (item == null) return false;
+      final continuation = _asMap(item['continuationItemRenderer']);
+      if (continuation != null) {
+        final tokens = <String>{};
+        _addContinuationTokens(tokens, continuation);
+        if (tokens.isEmpty) return false;
+        continue;
+      }
+      final renderers = _directRenderers(<_RendererCollection>[
+        <Object?>[value],
+      ], rendererNames).toList(growable: false);
+      if (renderers.isEmpty || !renderers.every(verifier)) return false;
+    }
+  }
+  return true;
+}
+
+List<_RendererCollection> _legacyCollectionForResponse(
+  Object? root,
+  List<String> rendererNames,
+  _RendererVerifier verifier,
+) => _hasContinuationActionResponse(root)
+    ? const <_RendererCollection>[]
+    : _uniqueLegacyRendererCollection(root, rendererNames, verifier);
 
 bool _subscribedArtistContainerHasVerifiableCard(
   Map<String, Object?> container,
@@ -650,7 +806,9 @@ void _addContinuationTokens(Set<String> tokens, Object? metadata) {
   for (final map in _walkMaps(metadata)) {
     final continuationCommand = _asMap(map['continuationCommand']);
     final commandToken = _nonEmptyString(continuationCommand?['token']);
-    if (commandToken != null) {
+    final request = _nonEmptyString(continuationCommand?['request']);
+    if (commandToken != null &&
+        (request == null || request == 'CONTINUATION_REQUEST_TYPE_BROWSE')) {
       tokens.add(commandToken);
     }
     for (final key in const <String>[
@@ -917,6 +1075,10 @@ String? _artistTitle(Map<String, Object?> renderer) {
 List<String> _metadataTexts(Object? renderer) {
   final values = <String>[];
   for (final map in _walkMaps(renderer)) {
+    final simpleText = _nonEmptyString(map['simpleText']);
+    if (simpleText != null && !values.contains(simpleText)) {
+      values.add(simpleText);
+    }
     final runs = map['runs'];
     if (runs is! List) {
       continue;
@@ -934,7 +1096,7 @@ List<String> _metadataTexts(Object? renderer) {
 
 int? _itemCount(List<String> metadata) {
   final pattern = RegExp(
-    r'([0-9][0-9., ]*)\s*(?:songs?|canciones?|videos?)',
+    r'([0-9][0-9.,\s\u00a0\u202f]*)\s*(?:songs?|tracks?|canci(?:ón|ones)|videos?|faixas?|músicas?|titres?|morceaux|곡|首|曲)',
     caseSensitive: false,
   );
   for (final value in metadata) {

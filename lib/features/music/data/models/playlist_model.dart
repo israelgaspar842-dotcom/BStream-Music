@@ -11,6 +11,7 @@ class PlaylistModel extends Playlist {
     required super.updatedAt,
     super.localRevision,
     super.deletedAt,
+    super.customArtworkFileName,
   });
 
   factory PlaylistModel.fromMap(Map<String, Object?> map) {
@@ -24,6 +25,7 @@ class PlaylistModel extends Playlist {
       updatedAt: DateTime.parse(map['updated_at']! as String),
       localRevision: _integer(map['local_revision']),
       deletedAt: _date(map['deleted_at']),
+      customArtworkFileName: map['custom_artwork_file_name'] as String?,
     );
   }
 
@@ -36,6 +38,7 @@ class PlaylistModel extends Playlist {
       updatedAt: playlist.updatedAt,
       localRevision: playlist.localRevision,
       deletedAt: playlist.deletedAt,
+      customArtworkFileName: playlist.customArtworkFileName,
     );
   }
 
@@ -48,6 +51,7 @@ class PlaylistModel extends Playlist {
       'updated_at': updatedAt.toIso8601String(),
       'local_revision': localRevision,
       'deleted_at': deletedAt?.toIso8601String(),
+      'custom_artwork_file_name': customArtworkFileName,
     };
   }
 

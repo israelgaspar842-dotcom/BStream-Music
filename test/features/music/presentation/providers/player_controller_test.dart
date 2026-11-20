@@ -19,6 +19,7 @@ import 'package:bstream_music/services/downloader/audio_stream_resolver.dart';
 import 'package:bstream_music/services/downloader/fallback_audio_resolver.dart';
 import 'package:bstream_music/services/media_session/desktop_media_session.dart';
 import 'package:bstream_music/services/player/player_service.dart';
+import 'package:bstream_music/services/player/playback_session_store.dart';
 import 'package:bstream_music/services/storage/local_database_service.dart';
 import 'package:bstream_music/services/storage/local_library_reconciler.dart';
 import 'package:flutter/material.dart';
@@ -30,6 +31,1460 @@ import 'package:shared_preferences/shared_preferences.dart';
 void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  group('persisted playback session', () {
+    testWidgets('backend-only clock updates create no empty-session timer', (
+      tester,
+    ) async {
+      const initial = PlayerSnapshot(
+        status: PlayerStatus.playing,
+        trackId: 'backend-only',
+        title: 'Backend metadata without a logical queue',
+      );
+      final player = _FakePlayerService()..emit(initial);
+      final store = _MemoryPlaybackSessionStore();
+      final container = _container(
+        player,
+        sessionStore: store,
+        settingsController: _CrossfadeSettingsController(
+          const SettingsState(
+            downloadDirectory: '/tmp/bstream-no-session-test',
+            language: AppLanguage.spanish,
+            recommendationHistoryEnabled: false,
+          ),
+        ),
+      );
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      await tester.pump();
+      player.emit(initial.copyWith(position: const Duration(seconds: 1)));
+      await tester.pump();
+      expect(container.read(playbackQueueProvider).entries, isEmpty);
+      expect(store.saved, isNull);
+      // The widget-test invariant also requires no pending five-second timer,
+      // before addTearDown disposes this external provider container.
+    });
+
+    test(
+      'removing a previously saved queue still clears its session',
+      () async {
+        final store = _MemoryPlaybackSessionStore();
+        final player = _FakePlayerService();
+        final container = _container(player, sessionStore: store);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        await controller.playLocal(
+          _track(1),
+          queueSourceId: 'folder:clear-persisted-session',
+        );
+        await controller.flushPlaybackSession();
+        expect(store.saved, isNotNull);
+        expect(
+          await controller.clearQueueSource('folder:clear-persisted-session'),
+          isTrue,
+        );
+        await controller.flushPlaybackSession();
+        expect(store.saved, isNull);
+      },
+    );
+
+    test(
+      'restores local queue paused and loads its saved cursor before audio',
+      () async {
+        final store = _MemoryPlaybackSessionStore();
+        final firstPlayer = _FakePlayerService();
+        final first = _container(firstPlayer, sessionStore: store);
+        await first.read(playerControllerProvider.future);
+        final controller = first.read(playerControllerProvider.notifier);
+        final tracks = [
+          for (var index = 1; index <= 3; index++)
+            _track(index).copyWith(duration: const Duration(minutes: 3)),
+        ];
+        await controller.playLocal(
+          tracks[1],
+          queue: tracks,
+          queueSourceId: 'folder:music',
+        );
+        await _flushCompletion();
+        await controller.seek(const Duration(seconds: 37));
+        controller.setShuffleEnabled(true);
+        controller.setRepeatMode(PlaybackRepeatMode.all);
+        await controller.flushPlaybackSession();
+        expect(store.saved?.position, const Duration(seconds: 37));
+        first.dispose();
+
+        final player = _FakePlayerService();
+        final second = _container(player, sessionStore: store);
+        addTearDown(second.dispose);
+        final restored = await second.read(playerControllerProvider.future);
+        expect(restored.trackId, tracks[1].id);
+        expect(restored.status, PlayerStatus.paused);
+        expect(restored.wantsToPlay, isFalse);
+        expect(restored.position, const Duration(seconds: 37));
+        expect(restored.shuffleEnabled, isTrue);
+        expect(restored.repeatMode, PlaybackRepeatMode.all);
+        expect(player.playedLocalIds, isEmpty);
+        expect(player.playedRemote, isEmpty);
+        final queue = second.read(playbackQueueProvider);
+        expect(
+          queue.entries.map((entry) => entry.id),
+          tracks.map((track) => track.id),
+        );
+        expect(queue.currentIndex, 1);
+
+        final reopened = second.read(playerControllerProvider.notifier);
+        await reopened.seek(const Duration(seconds: 44));
+        expect(player.lastSeekPosition, isNull);
+        await reopened.playQueueIndex(1);
+        await _flushCompletion();
+        expect(player.lastLocalQueueIndex, 1);
+        expect(player.initialPositions, [const Duration(seconds: 44)]);
+        expect(player.lastSeekPosition, isNull);
+        expect(
+          second.read(playerControllerProvider).value?.position,
+          const Duration(seconds: 44),
+        );
+        await reopened.playQueueIndex(1);
+        expect(player.playLocalQueueCalls, 1);
+        await reopened.playQueueIndex(0);
+        expect(player.initialPositions.last, Duration.zero);
+      },
+    );
+
+    test(
+      'restores remote duplicates without resolving until explicit play',
+      () async {
+        final remote = _queuedRemoteTrack('persisted-remote');
+        final store = _MemoryPlaybackSessionStore()
+          ..saved = PlaybackSession(
+            entries: [
+              PlaybackSessionEntry(
+                remote: remote,
+                logicalEntryId: 'first-copy',
+              ),
+              PlaybackSessionEntry(
+                remote: remote,
+                logicalEntryId: 'second-copy',
+              ),
+            ],
+            currentIndex: 1,
+            position: const Duration(seconds: 18),
+            activePlaybackIsRemote: true,
+            remoteSourceId: 'playlist:test',
+          );
+        final player = _FakePlayerService();
+        final container = _container(
+          player,
+          sessionStore: store,
+          audioResolver: _FakeAudioResolverFromRepository(
+            _FakeMusicRepository([remote]),
+          ),
+        );
+        addTearDown(container.dispose);
+        final restored = await container.read(playerControllerProvider.future);
+        expect(restored.title, remote.title);
+        expect(restored.status, PlayerStatus.paused);
+        expect(restored.position, const Duration(seconds: 18));
+        expect(player.playedRemote, isEmpty);
+        final queue = container.read(playbackQueueProvider);
+        expect(queue.currentIndex, 1);
+        expect(queue.entries.map((entry) => entry.logicalEntryId), [
+          'first-copy',
+          'second-copy',
+        ]);
+        await container.read(playerControllerProvider.notifier).resume();
+        await _flushCompletion();
+        expect(player.playedRemote.single.streamUrl, isNotNull);
+        expect(player.initialPositions, [const Duration(seconds: 18)]);
+        expect(player.lastSeekPosition, isNull);
+        expect(container.read(playbackQueueProvider).currentIndex, 1);
+      },
+    );
+
+    for (final nativeQueue in const <bool>[false, true]) {
+      test(
+        'restored fallback loads its cursor before audio (native=$nativeQueue)',
+        () async {
+          final remote = _queuedRemoteTrack(
+            'restored-fallback',
+          ).copyWith(duration: const Duration(minutes: 3));
+          final store = _MemoryPlaybackSessionStore()
+            ..saved = PlaybackSession(
+              entries: <PlaybackSessionEntry>[
+                PlaybackSessionEntry(remote: remote),
+              ],
+              currentIndex: 0,
+              position: const Duration(seconds: 18),
+              activePlaybackIsRemote: true,
+            );
+          final _FakePlayerService player = nativeQueue
+              ? _RejectPrimaryNativeQueuePlayerService()
+              : _RejectPrimaryInnerTubePlayerService();
+          final resolver = _ModeAwareFallbackAudioResolver();
+          final container = _container(
+            player,
+            sessionStore: store,
+            audioResolver: resolver,
+            retryDelay: (_) async {},
+          );
+          addTearDown(container.dispose);
+          final restored = await container.read(
+            playerControllerProvider.future,
+          );
+          expect(restored.status, PlayerStatus.paused);
+          final observed = <PlayerSnapshot>[];
+          final listener = container.listen<AsyncValue<PlayerSnapshot>>(
+            playerControllerProvider,
+            (_, next) {
+              final snapshot = next.value;
+              if (snapshot != null) observed.add(snapshot);
+            },
+          );
+          addTearDown(listener.close);
+          await container.read(playerControllerProvider.notifier).resume();
+          await _flushCompletion();
+          expect(resolver.modes, const <AudioResolutionMode>[
+            AudioResolutionMode.primaryThenFallback,
+            AudioResolutionMode.fallbackOnly,
+          ]);
+          expect(
+            player.playedRemote.single.streamSource,
+            AudioStreamSource.innerTubeFallback.name,
+          );
+          expect(player.initialPositions, const <Duration>[
+            Duration(seconds: 18),
+          ]);
+          expect(player.lastSeekPosition, isNull);
+          expect(
+            container.read(playerControllerProvider).value?.position,
+            const Duration(seconds: 18),
+          );
+          expect(
+            observed.where(
+              (snapshot) =>
+                  snapshot.status == PlayerStatus.playing &&
+                  snapshot.position == Duration.zero,
+            ),
+            isEmpty,
+            reason: 'The alternate source must never play its intro first.',
+          );
+        },
+      );
+    }
+
+    test(
+      'a restored local queue defers crossfade preload until explicit play',
+      () async {
+        final tracks = <LocalTrack>[
+          _track(1).copyWith(duration: const Duration(minutes: 3)),
+          _track(2).copyWith(duration: const Duration(minutes: 3)),
+        ];
+        final store = _MemoryPlaybackSessionStore()
+          ..saved = PlaybackSession(
+            entries: tracks
+                .map((track) => PlaybackSessionEntry(local: track))
+                .toList(growable: false),
+            currentIndex: 0,
+            position: const Duration(seconds: 18),
+          );
+        final player = _CrossfadePlayerService();
+        final container = _container(
+          player,
+          sessionStore: store,
+          settingsController: _enabledCrossfadeSettings(),
+        );
+        addTearDown(container.dispose);
+        final restored = await container.read(playerControllerProvider.future);
+        await _flushCompletion();
+        expect(restored.status, PlayerStatus.paused);
+        expect(player.crossfadeEnabled, isTrue);
+        expect(player.playedLocalIds, isEmpty);
+        expect(player.preparedCrossfadeSource, isNull);
+        expect(
+          player.crossfadePreparations
+              .whereType<LocalCrossfadePlaybackSource>(),
+          isEmpty,
+        );
+
+        final controller = container.read(playerControllerProvider.notifier);
+        controller.setShuffleEnabled(true);
+        controller.setRepeatMode(PlaybackRepeatMode.all);
+        await _flushCompletion();
+        expect(player.playedLocalIds, isEmpty);
+        expect(player.preparedCrossfadeSource, isNull);
+        expect(
+          player.crossfadePreparations
+              .whereType<LocalCrossfadePlaybackSource>(),
+          isEmpty,
+        );
+
+        await controller.resume();
+        await _waitUntil(
+          () => player.preparedCrossfadeSource is LocalCrossfadePlaybackSource,
+        );
+        final prepared =
+            player.preparedCrossfadeSource! as LocalCrossfadePlaybackSource;
+        expect(prepared.track.id, tracks[1].id);
+        expect(player.playedLocalIds, <String>[tracks[0].id]);
+        expect(player.initialPositions, <Duration>[
+          const Duration(seconds: 18),
+        ]);
+      },
+    );
+
+    test('a new selection wins over a delayed restoration', () async {
+      final gate = Completer<PlaybackSession?>();
+      final store = _MemoryPlaybackSessionStore()..readGate = gate;
+      final player = _FakePlayerService();
+      final container = _container(player, sessionStore: store);
+      addTearDown(container.dispose);
+      final startup = container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      await controller.playLocal(_track(2));
+      gate.complete(
+        PlaybackSession(
+          entries: [PlaybackSessionEntry(local: _track(1))],
+          currentIndex: 0,
+          position: const Duration(seconds: 25),
+        ),
+      );
+      await startup;
+      await _flushCompletion();
+      expect(
+        container.read(playerControllerProvider).value?.trackId,
+        'track-2',
+      );
+      expect(
+        container.read(playbackQueueProvider).entries.single.id,
+        'track-2',
+      );
+      expect(player.playedLocalIds, ['track-2']);
+    });
+
+    test('does not replace a backend that is already playing', () async {
+      final store = _MemoryPlaybackSessionStore()
+        ..saved = PlaybackSession(
+          entries: [PlaybackSessionEntry(local: _track(1))],
+          currentIndex: 0,
+          position: Duration.zero,
+        );
+      final player = _FakePlayerService()
+        ..emit(
+          const PlayerSnapshot(
+            status: PlayerStatus.playing,
+            trackId: 'active-track',
+            title: 'Already active',
+          ),
+        );
+      final container = _container(player, sessionStore: store);
+      await container.read(playerControllerProvider.future);
+      expect(
+        container.read(playerControllerProvider).value?.trackId,
+        'active-track',
+      );
+      expect(container.read(playbackQueueProvider).entries, isEmpty);
+      container.dispose();
+      await _flushCompletion();
+      expect(store.saved?.entries.single.local?.id, 'track-1');
+      expect(player.playedLocalIds, isEmpty);
+    });
+  });
+
+  group('LIVE temporary queue', () {
+    test(
+      'Pause during slow restoration retains the saved position for the next resume',
+      () async {
+        final player = _BlockingRemotePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = _queuedRemoteTrack('slow-return-normal');
+        await controller.playRemote(normal);
+        await _flushCompletion();
+        await controller.seek(const Duration(seconds: 42));
+        player.block(normal.id);
+        await controller.playRemote(
+          _queuedRemoteTrack('slow-return-live'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(
+          () =>
+              player.startedRemoteIds.where((id) => id == normal.id).length ==
+              2,
+        );
+        await controller.pause();
+        expect(
+          container.read(playerControllerProvider).value?.position,
+          const Duration(seconds: 42),
+        );
+        player.release(normal.id);
+        await controller.waitForLiveQueueRestoration();
+        await _flushCompletion();
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+        await controller.resume();
+        await _flushCompletion();
+        expect(player.lastSeekPosition, const Duration(seconds: 42));
+      },
+    );
+
+    test(
+      'a downloaded LIVE request that cannot open still returns to the normal queue',
+      () async {
+        final player = _FailingLiveRequestPlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = _queuedRemoteTrack('local-error-normal');
+        await controller.playRemote(normal);
+        await controller.playLocal(
+          _track(99),
+          queueSourceId: PlayerController.liveQueueSourceId,
+          useNativeQueue: false,
+        );
+        await _waitUntil(
+          () =>
+              !controller.isLiveQueueActive && player.playedRemote.length == 2,
+        );
+        await controller.waitForLiveQueueRestoration();
+        expect(player.playedRemote.last.id, normal.id);
+      },
+    );
+
+    test(
+      'a missing downloaded LIVE file cannot leave the temporary queue stuck',
+      () async {
+        final player = _FakePlayerService();
+        final missing = _track(99);
+        final repository = _FakeLibraryRepository()..localTracks.add(missing);
+        final container = _container(
+          player,
+          repository: repository,
+          fileProbe: (path) async => path == missing.filePath
+              ? LocalTrackFileAvailability.missing
+              : LocalTrackFileAvailability.present,
+        );
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = _queuedRemoteTrack('missing-live-normal');
+        await controller.playRemote(normal);
+        await controller.playLocal(
+          missing,
+          queueSourceId: PlayerController.liveQueueSourceId,
+          useNativeQueue: false,
+        );
+        await _waitUntil(
+          () =>
+              !controller.isLiveQueueActive && player.playedRemote.length == 2,
+        );
+        await controller.waitForLiveQueueRestoration();
+        expect(player.playedRemote.last.id, normal.id);
+        expect(player.playedLocalIds, isEmpty);
+      },
+    );
+
+    test(
+      'restores the remote queue, selected song and position after its last request',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = List.generate(3, (i) => _queuedRemoteTrack('normal-$i'));
+        await controller.playRemote(
+          normal[1],
+          queue: normal,
+          queueSourceId: 'normal-radio',
+        );
+        await _flushCompletion();
+        await controller.seek(const Duration(seconds: 41));
+        final live = [
+          _queuedRemoteTrack('request-a'),
+          _queuedRemoteTrack('request-b'),
+        ];
+        var completions = 0;
+        controller.addLiveQueueCompletionListener(() => completions++);
+        await controller.playRemote(
+          live.first,
+          queue: live,
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(() => player.playedRemote.last.id == live.last.id);
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(
+          () =>
+              !controller.isLiveQueueActive &&
+              player.playedRemote.last.id == normal[1].id,
+        );
+        await controller.waitForLiveQueueRestoration();
+        await _flushCompletion();
+        expect(completions, 1);
+        expect(
+          container.read(playbackQueueProvider).entries.map((e) => e.id),
+          normal.map((e) => e.id),
+        );
+        expect(container.read(playbackQueueProvider).currentIndex, 1);
+        expect(player.lastSeekPosition, const Duration(seconds: 41));
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isTrue,
+        );
+        await controller.playNext();
+        expect(player.playedRemote.last.id, normal.last.id);
+      },
+    );
+
+    test(
+      'restores a downloaded playlist and its original native queue mode',
+      () async {
+        final player = _FakePlayerService(supportsLocalQueueReplacement: true);
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = [_track(1), _track(2), _track(3)];
+        final sourceId = PlayerController.playlistQueueSourceId('before-live');
+        await controller.playLocal(
+          normal[1],
+          queue: normal,
+          queueSourceId: sourceId,
+        );
+        await _flushCompletion();
+        await controller.seek(const Duration(seconds: 28));
+        final live = [_track(11), _track(12)];
+        await controller.playLocal(
+          live.first,
+          queue: live,
+          useNativeQueue: false,
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(() => player.playedLocalIds.last == live.last.id);
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(
+          () =>
+              !controller.isLiveQueueActive &&
+              player.playedLocalIds.last == normal[1].id,
+        );
+        await controller.waitForLiveQueueRestoration();
+        expect(controller.isLocalQueueSourceActive(sourceId), isTrue);
+        expect(
+          player.lastLocalQueue?.map((e) => e.id),
+          normal.map((e) => e.id),
+        );
+        expect(player.lastLocalQueueIndex, 1);
+        expect(player.lastSeekPosition, const Duration(seconds: 28));
+      },
+    );
+
+    test(
+      'LIVE stays FIFO and restores shuffle and repeat of the normal queue',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = [
+          _queuedRemoteTrack('shuffle-a'),
+          _queuedRemoteTrack('shuffle-b'),
+        ];
+        await controller.playRemote(normal.first, queue: normal);
+        controller.setShuffleEnabled(true);
+        controller.setRepeatMode(PlaybackRepeatMode.one);
+        await _flushCompletion();
+        final live = [
+          _queuedRemoteTrack('fifo-a'),
+          _queuedRemoteTrack('fifo-b'),
+        ];
+        await controller.playRemote(
+          live.first,
+          queue: live,
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        controller.setShuffleEnabled(true);
+        controller.setRepeatMode(PlaybackRepeatMode.all);
+        await _flushCompletion();
+        expect(
+          container.read(playerControllerProvider).value?.shuffleEnabled,
+          isFalse,
+        );
+        expect(
+          container.read(playerControllerProvider).value?.repeatMode,
+          PlaybackRepeatMode.off,
+        );
+        await controller.playNext();
+        expect(player.playedRemote.last.id, live.last.id);
+        await controller.playNext();
+        await _flushCompletion();
+        expect(player.playedRemote.last.id, normal.first.id);
+        expect(
+          container.read(playerControllerProvider).value?.shuffleEnabled,
+          isTrue,
+        );
+        expect(
+          container.read(playerControllerProvider).value?.repeatMode,
+          PlaybackRepeatMode.one,
+        );
+      },
+    );
+
+    for (final downloaded in [false, true]) {
+      test(
+        'LIVE resumes the same duplicate occurrence (downloaded=$downloaded)',
+        () async {
+          final player = _FakePlayerService();
+          final container = _container(player);
+          addTearDown(container.dispose);
+          await container.read(playerControllerProvider.future);
+          final controller = container.read(playerControllerProvider.notifier);
+          final live = [
+            _queuedRemoteTrack('duplicate'),
+            _queuedRemoteTrack('duplicate'),
+            _queuedRemoteTrack('later'),
+          ];
+          final local = [_track(21), _track(21), _track(22)];
+          if (downloaded) {
+            await controller.playLocal(
+              local.first,
+              queue: local,
+              useNativeQueue: false,
+              queueSourceId: PlayerController.liveQueueSourceId,
+            );
+          } else {
+            await controller.playRemote(
+              live.first,
+              queue: live,
+              queueSourceId: PlayerController.liveQueueSourceId,
+            );
+          }
+          await controller.playQueueIndex(1);
+          await controller.seek(const Duration(seconds: 19));
+          await controller.playRemote(_queuedRemoteTrack('manual-normal'));
+          await controller.seek(const Duration(seconds: 8));
+          if (downloaded) {
+            await controller.resumeLocalLiveQueue([...local, _track(23)]);
+          } else {
+            await controller.resumeRemoteLiveQueue([
+              ...live,
+              _queuedRemoteTrack('appended'),
+            ]);
+          }
+          expect(controller.isLiveQueueActive, isTrue);
+          expect(container.read(playbackQueueProvider).currentIndex, 1);
+          expect(player.lastSeekPosition, const Duration(seconds: 19));
+          await controller.playNext();
+          expect(container.read(playbackQueueProvider).currentIndex, 2);
+          await controller.playNext();
+          expect(container.read(playbackQueueProvider).currentIndex, 3);
+          await controller.playNext();
+          expect(controller.isLiveQueueActive, isFalse);
+          expect(player.playedRemote.last.id, 'manual-normal');
+          expect(player.lastSeekPosition, const Duration(seconds: 8));
+          expect(
+            container.read(playerControllerProvider).value?.wantsToPlay,
+            isTrue,
+          );
+        },
+      );
+    }
+
+    test(
+      'an explicit LIVE row selection overrides its interrupted cursor',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final live = [
+          _queuedRemoteTrack('explicit-a'),
+          _queuedRemoteTrack('explicit-b'),
+        ];
+        await controller.resumeRemoteLiveQueue(live);
+        await controller.playNext();
+        await controller.seek(const Duration(seconds: 19));
+        await controller.playRemote(_queuedRemoteTrack('outside-explicit'));
+        await controller.playRemote(
+          live.first,
+          queue: live,
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        expect(container.read(playbackQueueProvider).currentIndex, 0);
+        expect(player.currentSnapshot.position, Duration.zero);
+        await controller.playNext();
+        expect(player.currentSnapshot.trackId, live.last.id);
+        expect(player.currentSnapshot.position, Duration.zero);
+      },
+    );
+
+    test(
+      'pausing a slow LIVE re-entry preserves its interrupted seek position',
+      () async {
+        final player = _BlockingRemotePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final live = _queuedRemoteTrack('slow-live-entry');
+        await controller.resumeRemoteLiveQueue([live]);
+        await controller.seek(const Duration(seconds: 19));
+        await controller.playRemote(_queuedRemoteTrack('outside-slow-live'));
+        player.block(live.id);
+        final resume = controller.resumeRemoteLiveQueue([live]);
+        await _waitUntil(
+          () =>
+              player.startedRemoteIds.where((id) => id == live.id).length == 2,
+        );
+        await controller.pause();
+        expect(
+          container.read(playerControllerProvider).value?.position,
+          const Duration(seconds: 19),
+        );
+        player.release(live.id);
+        await resume;
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+        await controller.resume();
+        expect(player.lastSeekPosition, const Duration(seconds: 19));
+      },
+    );
+
+    for (final pauseFirst in [false, true]) {
+      test(
+        'a second manual exit during slow LIVE re-entry keeps the original cursor (paused=$pauseFirst)',
+        () async {
+          final player = _BlockingRemotePlayerService();
+          final container = _container(player);
+          addTearDown(container.dispose);
+          await container.read(playerControllerProvider.future);
+          final controller = container.read(playerControllerProvider.notifier);
+          final live = _queuedRemoteTrack('twice-interrupted-live');
+          await controller.resumeRemoteLiveQueue([live]);
+          await controller.seek(const Duration(seconds: 19));
+          await controller.playRemote(_queuedRemoteTrack('outside-first'));
+          player.block(live.id);
+          final resume = controller.resumeRemoteLiveQueue([live]);
+          await _waitUntil(
+            () =>
+                player.startedRemoteIds.where((id) => id == live.id).length ==
+                2,
+          );
+          if (pauseFirst) await controller.pause();
+          await controller.playRemote(_queuedRemoteTrack('outside-second'));
+          player.release(live.id);
+          await resume;
+          await controller.resumeRemoteLiveQueue([
+            live,
+            _queuedRemoteTrack('after-interrupted'),
+          ]);
+          expect(player.lastSeekPosition, const Duration(seconds: 19));
+          await controller.playNext();
+          await controller.playNext();
+          expect(player.playedRemote.last.id, 'outside-second');
+        },
+      );
+    }
+
+    test(
+      'a previously paused normal queue resumes at its saved position after LIVE',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = _queuedRemoteTrack('paused-normal');
+        await controller.playRemote(normal);
+        await _flushCompletion();
+        await controller.seek(const Duration(seconds: 31));
+        await controller.pause();
+        await controller.playRemote(
+          _queuedRemoteTrack('paused-request'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(() => !controller.isLiveQueueActive);
+        await controller.waitForLiveQueueRestoration();
+        await _flushCompletion();
+        final restored = container.read(playerControllerProvider).requireValue;
+        expect(restored.status, PlayerStatus.playing);
+        expect(restored.wantsToPlay, isTrue);
+        expect(restored.trackId, normal.id);
+        expect(restored.position, const Duration(seconds: 31));
+        expect(player.playedRemote.map((e) => e.id), [
+          normal.id,
+          'paused-request',
+          normal.id,
+        ]);
+        await controller.seek(const Duration(seconds: 45));
+        expect(player.lastSeekPosition, const Duration(seconds: 45));
+        await controller.pause();
+        await controller.resume();
+        await _flushCompletion();
+        expect(player.playedRemote.last.id, normal.id);
+        expect(player.lastSeekPosition, const Duration(seconds: 45));
+      },
+    );
+
+    test(
+      'without a previous queue it clears playback instead of replaying requests',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        await controller.playRemote(
+          _queuedRemoteTrack('lone-request'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(() => !controller.isLiveQueueActive);
+        await controller.waitForLiveQueueRestoration();
+        await _flushCompletion();
+        expect(container.read(playbackQueueProvider).entries, isEmpty);
+        expect(container.read(playerControllerProvider).value?.trackId, isNull);
+        expect(
+          container.read(playerControllerProvider).value?.status,
+          PlayerStatus.idle,
+        );
+        expect(player.playedRemote, hasLength(1));
+      },
+    );
+
+    test(
+      'recommendation continuation is available again after returning',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final tracks = List.generate(
+          6,
+          (i) => _queuedRemoteTrack('recommended-$i'),
+        );
+        var extensions = 0;
+        await controller.playRecommendation(
+          RecommendationPlaybackItem(track: tracks.first),
+          queue: tracks
+              .take(5)
+              .map((t) => RecommendationPlaybackItem(track: t))
+              .toList(),
+          queueSourceId: 'personalized-home:temporary-live',
+          queueExtender: () async {
+            extensions++;
+            return tracks
+                .map((t) => RecommendationPlaybackItem(track: t))
+                .toList();
+          },
+        );
+        expect(extensions, 0);
+        await controller.playRemote(
+          _queuedRemoteTrack('recommendation-request'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        await controller.playNext();
+        await _flushCompletion();
+        expect(extensions, 0);
+        await controller.playNext();
+        await _waitUntil(() => extensions > 0);
+        await _flushCompletion();
+        expect(
+          container.read(playbackQueueProvider).entries.map((e) => e.id),
+          tracks.map((e) => e.id),
+        );
+        expect(player.playedRemote.last.id, tracks[1].id);
+      },
+    );
+
+    test(
+      'an explicit replacement supersedes the old return queue across LIVE cycles',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        await controller.playRemote(_queuedRemoteTrack('discarded-normal'));
+        await controller.playRemote(
+          _queuedRemoteTrack('first-live'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        await controller.playRemote(_queuedRemoteTrack('replacement-normal'));
+        await controller.playRemote(
+          _queuedRemoteTrack('second-live'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        await controller.playNext();
+        await _flushCompletion();
+        expect(player.playedRemote.last.id, 'replacement-normal');
+        expect(
+          player.playedRemote.where((t) => t.id == 'discarded-normal'),
+          hasLength(1),
+        );
+      },
+    );
+
+    test(
+      'a terminal failure in the last LIVE request returns to the normal queue',
+      () async {
+        final player = _FailingLiveRequestPlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final normal = _queuedRemoteTrack('failure-normal');
+        await controller.playRemote(normal);
+        await _flushCompletion();
+        final intents = <bool>[];
+        final listener = container.listen(playerControllerProvider, (_, next) {
+          if (next.value != null) intents.add(next.value!.wantsToPlay);
+        });
+        addTearDown(listener.close);
+        await controller.playRemote(
+          _queuedRemoteTrack('permanent-live-failure'),
+          queueSourceId: PlayerController.liveQueueSourceId,
+        );
+        await _waitUntil(
+          () =>
+              !controller.isLiveQueueActive && player.playedRemote.length == 2,
+        );
+        await controller.waitForLiveQueueRestoration();
+        expect(player.playedRemote.last.id, normal.id);
+        expect(
+          container.read(playbackQueueProvider).entries.single.id,
+          normal.id,
+        );
+        expect(intents, isNotEmpty);
+        expect(intents, everyElement(isTrue));
+      },
+    );
+  });
+
+  group('background playback continuity', () {
+    test('native ready with playback intent is not a user pause', () async {
+      final player = _FakePlayerService();
+      final container = _container(player);
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      await controller.playRemote(_queuedRemoteTrack('native-ready'));
+      await _flushCompletion();
+      player.emit(
+        player.currentSnapshot.copyWith(
+          status: PlayerStatus.paused,
+          playWhenReady: true,
+        ),
+      );
+      await _flushCompletion();
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isTrue,
+      );
+      await controller.pause();
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isFalse,
+      );
+    });
+
+    test('cache-disabled native lookahead rolls beyond five songs', () async {
+      final player = _NativeRemoteQueuePlayerService();
+      final container = _container(player);
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      final tracks = List.generate(
+        8,
+        (index) => _queuedRemoteTrack('rolling-$index'),
+      );
+      await container
+          .read(playerControllerProvider.notifier)
+          .playRemote(tracks.first, queue: tracks);
+      for (var index = 1; index < tracks.length; index++) {
+        await _waitUntil(
+          () => player.remoteWindows.any(
+            (window) =>
+                window.isNotEmpty && window.first.track.id == tracks[index].id,
+          ),
+        );
+        final next = player.remoteWindows
+            .lastWhere(
+              (window) =>
+                  window.isNotEmpty &&
+                  window.first.track.id == tracks[index].id,
+            )
+            .first;
+        player.emitNativeTransition(next);
+        await _flushCompletion();
+        expect(container.read(playbackQueueProvider).currentIndex, index);
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isTrue,
+        );
+      }
+      expect(player.nativeRemoteStarts, 1);
+      expect(
+        player.remoteWindows.map((window) => window.length),
+        everyElement(lessThanOrEqualTo(1)),
+      );
+    });
+
+    test(
+      'Pause invalidates pending Next without reopening the audible song on resume',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final seed = _queuedRemoteTrack('paused-growth');
+        final next = _queuedRemoteTrack('late-growth');
+        final extension = Completer<List<RecommendationPlaybackItem>>();
+        await controller.playRecommendation(
+          RecommendationPlaybackItem(track: seed),
+          queue: [RecommendationPlaybackItem(track: seed)],
+          queueSourceId: 'personalized-home:pause-growth',
+          queueExtender: () => extension.future,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(
+            position: const Duration(seconds: 42),
+          ),
+        );
+        await _flushCompletion();
+        final skip = controller.playNext();
+        await _flushCompletion();
+        await controller.pause();
+        extension.complete([
+          RecommendationPlaybackItem(track: seed),
+          RecommendationPlaybackItem(track: next),
+        ]);
+        await skip;
+        await _flushCompletion();
+        expect(player.playedRemote.map((track) => track.id), [seed.id]);
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+
+        await controller.resume();
+        await _flushCompletion();
+        expect(player.resumeCalls, 1);
+        expect(player.playedRemote, hasLength(1));
+        expect(
+          container.read(playerControllerProvider).value?.position,
+          const Duration(seconds: 42),
+        );
+      },
+    );
+
+    test(
+      'an expired completion cannot block automatic next in a new queue',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(
+          player,
+          extraOverrides: [
+            playbackRecoveryTimeoutProvider.overrideWithValue(
+              const Duration(milliseconds: 70),
+            ),
+          ],
+        );
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final old = _queuedRemoteTrack('old-blocked-completion');
+        final extension = Completer<List<RecommendationPlaybackItem>>();
+        await controller.playRecommendation(
+          RecommendationPlaybackItem(track: old),
+          queue: [RecommendationPlaybackItem(track: old)],
+          queueSourceId: 'personalized-home:blocked-completion',
+          queueExtender: () => extension.future,
+        );
+        await _flushCompletion();
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(
+          () =>
+              container.read(playerControllerProvider).value?.status ==
+              PlayerStatus.failed,
+        );
+
+        final first = _queuedRemoteTrack('new-completion-first');
+        final second = _queuedRemoteTrack('new-completion-second');
+        await controller.playRemote(first, queue: [first, second]);
+        await _flushCompletion();
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(() => player.playedRemote.length == 3);
+        expect(player.playedRemote.last.id, second.id);
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isTrue,
+        );
+        extension.complete([RecommendationPlaybackItem(track: old)]);
+        await _flushCompletion();
+        expect(player.playedRemote.last.id, second.id);
+      },
+    );
+
+    test(
+      'a local terminal exception publishes inactive state to the system session',
+      () async {
+        final player = _FakePlayerService(
+          localPlayError: StateError('decoder unavailable'),
+        );
+        final session = _FakeDesktopMediaSession();
+        final container = _container(player, desktopSession: session);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        container.read(desktopMediaSessionProvider);
+        await container
+            .read(playerControllerProvider.notifier)
+            .playLocal(_track(1));
+        await _flushCompletion();
+        expect(container.read(playerControllerProvider).hasError, isTrue);
+        expect(session.states.last.snapshot.status, PlayerStatus.failed);
+        expect(session.states.last.snapshot.wantsToPlay, isFalse);
+      },
+    );
+
+    test(
+      'resolution keeps playback intent and Pause cancels late resolution',
+      () async {
+        final player = _FakePlayerService();
+        final resolver = _ControlledAudioResolver();
+        final container = _container(player, audioResolver: resolver);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final track = _unresolvedRemoteTrack('slow-background');
+        final loading = controller.playRemote(track);
+        await _waitUntil(() => resolver.resolveCalls == 1);
+
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isTrue,
+        );
+        expect(
+          container.read(playerControllerProvider).value?.status,
+          PlayerStatus.loading,
+        );
+        await controller.pause();
+        resolver.complete(_primaryInnerTubeResolution(track.id));
+        await loading;
+        await _flushCompletion();
+
+        final paused = container.read(playerControllerProvider).value!;
+        expect(paused.status, PlayerStatus.paused);
+        expect(paused.wantsToPlay, isFalse);
+        expect(paused.trackId, track.id);
+        expect(player.playedRemote, isEmpty);
+
+        await controller.resume();
+        await _flushCompletion();
+        expect(player.playedRemote.single.id, track.id);
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'Pause cancels retry backoff without reviving the remote source',
+      () async {
+        final player = _FakePlayerService();
+        final delay = _ControlledRetryDelay();
+        final resolver = _ScriptedModeAwareAudioResolver(
+          primaryOutcomes: [const SocketException('offline')],
+          fallbackOutcomes: [const SocketException('offline fallback')],
+        );
+        final container = _container(
+          player,
+          audioResolver: resolver,
+          retryDelay: delay.call,
+        );
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final loading = controller.playRemote(
+          _unresolvedRemoteTrack('retry-pause'),
+        );
+        await _waitUntil(() => delay.durations.isNotEmpty);
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isTrue,
+        );
+
+        await controller.pause();
+        delay.releaseNext();
+        await loading;
+        await _flushCompletion();
+        expect(player.playedRemote, isEmpty);
+        expect(delay.durations, hasLength(1));
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+      },
+    );
+
+    test(
+      'completion holds the system session until the next remote source starts',
+      () async {
+        final player = _FakePlayerService();
+        final session = _FakeDesktopMediaSession();
+        final container = _container(player, desktopSession: session);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        container.read(desktopMediaSessionProvider);
+        final controller = container.read(playerControllerProvider.notifier);
+        final first = _queuedRemoteTrack('continuity-first');
+        final second = _queuedRemoteTrack('continuity-second');
+        await controller.playRemote(first, queue: [first, second]);
+        await _flushCompletion();
+        session.states.clear();
+
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _waitUntil(() => player.playedRemote.length == 2);
+        await _flushCompletion();
+        expect(session.states, isNotEmpty);
+        expect(
+          session.states.map((state) => state.snapshot.wantsToPlay),
+          everyElement(isTrue),
+        );
+        expect(container.read(playbackQueueProvider).currentIndex, 1);
+
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _flushCompletion();
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+        expect(player.playedRemote, hasLength(2));
+      },
+    );
+
+    test(
+      'a native interruption does not start recovery after a late error',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final interrupted = _queuedRemoteTrack('interrupted');
+        await container
+            .read(playerControllerProvider.notifier)
+            .playRemote(
+              interrupted,
+              queue: [interrupted, _queuedRemoteTrack('must-stay-paused')],
+            );
+        await _flushCompletion();
+        player.emit(
+          player.currentSnapshot.copyWith(
+            status: PlayerStatus.paused,
+            playWhenReady: false,
+          ),
+        );
+        await _flushCompletion();
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(
+            status: PlayerStatus.failed,
+            errorMessage: 'HTTP 503',
+          ),
+        );
+        await _flushCompletion();
+        expect(player.playedRemote, hasLength(1));
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+        player.emit(
+          player.currentSnapshot.copyWith(status: PlayerStatus.completed),
+        );
+        await _flushCompletion();
+        expect(player.playedRemote, hasLength(1));
+        expect(container.read(playbackQueueProvider).currentIndex, 0);
+      },
+    );
+
+    test(
+      'stalled resolution releases protection and rejects a late result',
+      () async {
+        final player = _FakePlayerService();
+        final resolver = _ControlledAudioResolver();
+        final container = _container(
+          player,
+          audioResolver: resolver,
+          extraOverrides: [
+            playbackRecoveryTimeoutProvider.overrideWithValue(
+              const Duration(milliseconds: 40),
+            ),
+          ],
+        );
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final loading = container
+            .read(playerControllerProvider.notifier)
+            .playRemote(_unresolvedRemoteTrack('expired-background'));
+        await _waitUntil(
+          () =>
+              player.stopCalls > 0 &&
+              container.read(playerControllerProvider).value?.status ==
+                  PlayerStatus.failed,
+        );
+        final stoppedCount = player.stopCalls;
+        expect(
+          container.read(playerControllerProvider).value?.wantsToPlay,
+          isFalse,
+        );
+        resolver.complete(_primaryInnerTubeResolution('late-expired'));
+        await loading;
+        await _flushCompletion();
+        expect(player.playedRemote, isEmpty);
+        expect(player.stopCalls, stoppedCount);
+        expect(
+          container.read(playerControllerProvider).value?.status,
+          PlayerStatus.failed,
+        );
+      },
+    );
+
+    test('successful audio cancels the recovery deadline', () async {
+      final player = _FakePlayerService();
+      final container = _container(
+        player,
+        extraOverrides: [
+          playbackRecoveryTimeoutProvider.overrideWithValue(
+            const Duration(milliseconds: 40),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      await container
+          .read(playerControllerProvider.notifier)
+          .playRemote(_queuedRemoteTrack('healthy-background'));
+      await _flushCompletion();
+      final stopCalls = player.stopCalls;
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(player.stopCalls, stopCalls);
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isTrue,
+      );
+    });
+
+    test(
+      'Pause cancels the recovery deadline without stopping later',
+      () async {
+        final player = _FakePlayerService();
+        final resolver = _ControlledAudioResolver();
+        final container = _container(
+          player,
+          audioResolver: resolver,
+          extraOverrides: [
+            playbackRecoveryTimeoutProvider.overrideWithValue(
+              const Duration(milliseconds: 40),
+            ),
+          ],
+        );
+        addTearDown(container.dispose);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        final loading = controller.playRemote(
+          _unresolvedRemoteTrack('paused-deadline'),
+        );
+        await _waitUntil(() => resolver.resolveCalls == 1);
+        await controller.pause();
+        final stopCalls = player.stopCalls;
+        await Future<void>.delayed(const Duration(milliseconds: 80));
+        expect(player.stopCalls, stopCalls);
+        expect(
+          container.read(playerControllerProvider).value?.status,
+          PlayerStatus.paused,
+        );
+        resolver.complete(_primaryInnerTubeResolution('paused-deadline'));
+        await loading;
+      },
+    );
+
+    test('a new selection receives a fresh recovery deadline', () async {
+      final player = _FakePlayerService();
+      final resolver = _ControlledAudioResolver();
+      final container = _container(
+        player,
+        audioResolver: resolver,
+        extraOverrides: [
+          playbackRecoveryTimeoutProvider.overrideWithValue(
+            const Duration(milliseconds: 180),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      final first = controller.playRemote(
+        _unresolvedRemoteTrack('deadline-first'),
+      );
+      await _waitUntil(() => resolver.resolveCalls == 1);
+      await Future<void>.delayed(const Duration(milliseconds: 110));
+      final second = controller.playRemote(
+        _unresolvedRemoteTrack('deadline-second'),
+      );
+      await _waitUntil(() => resolver.resolveCalls == 2);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(
+        container.read(playerControllerProvider).value?.status,
+        PlayerStatus.loading,
+      );
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isTrue,
+      );
+      await controller.pause();
+      resolver.complete(_primaryInnerTubeResolution('deadline-second'));
+      await Future.wait([first, second]);
+    });
   });
 
   test(
@@ -203,6 +1658,136 @@ void main() {
 
       expect(player.playedRemote.map((track) => track.id), ['NextSong001']);
       expect(container.read(playbackQueueProvider).currentIndex, 1);
+    },
+  );
+
+  test(
+    'manual remote selection silences the outgoing source before resolution',
+    () async {
+      final player = _IntentAwareRemotePlayerService();
+      final resolver = _ControlledAudioResolver();
+      final container = _container(player, audioResolver: resolver);
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      final first = _queuedRemoteTrack('audible-outgoing');
+      final selected = _unresolvedRemoteTrack('pending-selected');
+      await controller.playRemote(first);
+      await _flushCompletion();
+      expect(player.physicallyPlaying, isTrue);
+      final stopsBeforeSelection = player.stopCalls;
+
+      final replacement = controller.playRemote(selected);
+      await _waitUntil(() => resolver.resolveCalls == 1);
+      expect(player.pauseCalls, 1);
+      expect(player.physicallyPlaying, isFalse);
+      expect(player.currentSnapshot.wantsToPlay, isFalse);
+      expect(player.stopCalls, stopsBeforeSelection);
+      expect(
+        container.read(playerControllerProvider).value?.trackId,
+        selected.id,
+      );
+      expect(
+        container.read(playerControllerProvider).value?.status,
+        PlayerStatus.loading,
+      );
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isTrue,
+      );
+
+      resolver.complete(_primaryInnerTubeResolution(selected.id));
+      await replacement;
+      await _flushCompletion();
+      expect(player.playedRemote.map((track) => track.id), [
+        first.id,
+        selected.id,
+      ]);
+      expect(player.physicallyPlaying, isTrue);
+      expect(
+        container.read(playerControllerProvider).value?.status,
+        PlayerStatus.playing,
+      );
+    },
+  );
+
+  test(
+    'an outgoing failed load completing during the next resolution stays silent',
+    () async {
+      final player = _IntentAwareRemotePlayerService();
+      final resolver = _ControlledAudioResolver();
+      final first = _queuedRemoteTrack('late-outgoing');
+      final selected = _unresolvedRemoteTrack('late-selected');
+      player.block(first.id);
+      final container = _container(player, audioResolver: resolver);
+      addTearDown(container.dispose);
+      addTearDown(() => player.release(first.id));
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      final abandoned = controller.playRemote(first);
+      await _waitUntil(() => player.started.contains(first.id));
+      final replacement = controller.playRemote(selected);
+      await _waitUntil(() => resolver.resolveCalls == 1);
+      expect(player.pauseCalls, 1);
+      player.emit(
+        player.currentSnapshot.copyWith(
+          status: PlayerStatus.failed,
+          errorMessage: 'Connection aborted',
+        ),
+      );
+      player.release(first.id);
+      await abandoned;
+      await _flushCompletion();
+      expect(player.physicallyPlaying, isFalse);
+      expect(player.playedRemote, isEmpty);
+      expect(
+        container.read(playerControllerProvider).value?.trackId,
+        selected.id,
+      );
+      expect(
+        container.read(playerControllerProvider).value?.status,
+        PlayerStatus.loading,
+      );
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isTrue,
+      );
+
+      resolver.complete(_primaryInnerTubeResolution(selected.id));
+      await replacement;
+      await _flushCompletion();
+      expect(player.playedRemote.map((track) => track.id), [selected.id]);
+      expect(player.physicallyPlaying, isTrue);
+    },
+  );
+
+  test(
+    'technical pause of the same remote identity does not cancel re-selection',
+    () async {
+      final player = _IntentAwareRemotePlayerService();
+      final container = _container(player);
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      final track = _queuedRemoteTrack('same-identity');
+      await controller.playRemote(track);
+      await _flushCompletion();
+      await controller.playRemote(track);
+      await _flushCompletion();
+      expect(player.pauseCalls, 1);
+      expect(player.playedRemote.map((track) => track.id), [
+        track.id,
+        track.id,
+      ]);
+      expect(player.physicallyPlaying, isTrue);
+      expect(
+        container.read(playerControllerProvider).value?.status,
+        PlayerStatus.playing,
+      );
+      expect(
+        container.read(playerControllerProvider).value?.wantsToPlay,
+        isTrue,
+      );
     },
   );
 
@@ -430,9 +2015,11 @@ void main() {
     },
   );
 
-  test(
-    'personalized queue grows in the background before reaching its end',
-    () async {
+  for (final sourceId in [
+    'personalized-home:becauseYouListened',
+    'personalized-home:continueListening',
+  ]) {
+    test('$sourceId grows in the background on its penultimate song', () async {
       final player = _FakePlayerService();
       final container = _container(player);
       addTearDown(container.dispose);
@@ -451,11 +2038,11 @@ void main() {
       await container
           .read(playerControllerProvider.notifier)
           .playRecommendation(
-            RecommendationPlaybackItem(track: tracks[3]),
+            RecommendationPlaybackItem(track: tracks[5]),
             queue: tracks
                 .map((track) => RecommendationPlaybackItem(track: track))
                 .toList(growable: false),
-            queueSourceId: 'personalized-home:becauseYouListened',
+            queueSourceId: sourceId,
             queueExtender: () async {
               extensionCalls++;
               return expanded
@@ -468,63 +2055,63 @@ void main() {
       );
 
       expect(extensionCalls, 1);
-      expect(container.read(playbackQueueProvider).currentIndex, 3);
+      expect(container.read(playbackQueueProvider).currentIndex, 5);
       expect(
         container.read(playbackQueueProvider).entries.map((entry) => entry.id),
         expanded.map((track) => track.id),
       );
-      expect(player.playedRemote.map((track) => track.id), ['because-3']);
-    },
-  );
+      expect(player.playedRemote.map((track) => track.id), ['because-5']);
+    });
 
-  test(
-    'Next at the end waits for personalized growth instead of wrapping',
-    () async {
-      final player = _FakePlayerService();
-      final container = _container(player);
-      addTearDown(container.dispose);
-      final seed = _queuedRemoteTrack('end-seed');
-      final next = _queuedRemoteTrack('end-next');
-      final extension = Completer<List<RecommendationPlaybackItem>>();
-      var extensionCalls = 0;
+    test(
+      '$sourceId Next at the end waits for growth instead of wrapping',
+      () async {
+        final player = _FakePlayerService();
+        final container = _container(player);
+        addTearDown(container.dispose);
+        final seed = _queuedRemoteTrack('end-seed');
+        final next = _queuedRemoteTrack('end-next');
+        final extension = Completer<List<RecommendationPlaybackItem>>();
+        var extensionCalls = 0;
 
-      await container.read(playerControllerProvider.future);
-      final controller = container.read(playerControllerProvider.notifier);
-      await controller.playRecommendation(
-        RecommendationPlaybackItem(track: seed),
-        queue: [RecommendationPlaybackItem(track: seed)],
-        queueSourceId: 'personalized-home:becauseYouListened',
-        queueExtender: () {
-          extensionCalls++;
-          return extension.future;
-        },
-      );
-      await _waitUntil(() => extensionCalls == 1);
+        await container.read(playerControllerProvider.future);
+        final controller = container.read(playerControllerProvider.notifier);
+        await controller.playRecommendation(
+          RecommendationPlaybackItem(track: seed),
+          queue: [RecommendationPlaybackItem(track: seed)],
+          queueSourceId: sourceId,
+          queueExtender: () {
+            extensionCalls++;
+            return extension.future;
+          },
+        );
+        await _waitUntil(() => extensionCalls == 1);
 
-      final skip = controller.playNext();
-      await _flushCompletion();
-      expect(container.read(playbackQueueProvider).currentIndex, 0);
+        final skip = controller.playNext();
+        await _flushCompletion();
+        expect(container.read(playbackQueueProvider).currentIndex, 0);
 
-      extension.complete([
-        RecommendationPlaybackItem(track: seed),
-        RecommendationPlaybackItem(track: next),
-      ]);
-      await skip;
+        extension.complete([
+          RecommendationPlaybackItem(track: seed),
+          RecommendationPlaybackItem(track: next),
+        ]);
+        await skip;
 
-      expect(
-        extensionCalls,
-        2,
-        reason:
-            'The in-flight page is shared by Next; a second sequential request '
-            'is allowed only after playback reaches the newly appended end.',
-      );
-      expect(container.read(playbackQueueProvider).currentIndex, 1);
-      expect(player.playedRemote.map((track) => track.id), [
-        'end-seed',
-        'end-next',
-      ]);
-    },
-  );
+        expect(
+          extensionCalls,
+          2,
+          reason:
+              'The in-flight page is shared by Next; a second sequential request '
+              'is allowed only after playback reaches the newly appended end.',
+        );
+        expect(container.read(playbackQueueProvider).currentIndex, 1);
+        expect(player.playedRemote.map((track) => track.id), [
+          'end-seed',
+          'end-next',
+        ]);
+      },
+    );
+  }
 
   test(
     'a late recommendation page cannot replace a newer queue with the same source id',
@@ -814,24 +2401,27 @@ void main() {
     },
   );
 
-  test('skip silence ignores a backend that does not support it', () async {
-    final player = _CrossfadePlayerService(supportsSkipSilence: false);
-    final settings = _CrossfadeSettingsController(
-      const SettingsState(
-        downloadDirectory: '/tmp/bstream-unsupported-skip-silence-test',
-        language: AppLanguage.spanish,
-        skipSilenceEnabled: true,
-      ),
-    );
-    final container = _container(player, settingsController: settings);
-    addTearDown(container.dispose);
+  test(
+    'skip silence retains its target while the current route is unavailable',
+    () async {
+      final player = _CrossfadePlayerService(supportsSkipSilence: false);
+      final settings = _CrossfadeSettingsController(
+        const SettingsState(
+          downloadDirectory: '/tmp/bstream-unsupported-skip-silence-test',
+          language: AppLanguage.spanish,
+          skipSilenceEnabled: true,
+        ),
+      );
+      final container = _container(player, settingsController: settings);
+      addTearDown(container.dispose);
 
-    await container.read(playerControllerProvider.future);
-    await Future<void>.delayed(const Duration(milliseconds: 20));
+      await container.read(playerControllerProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
 
-    expect(player.skipSilenceConfigurations, isEmpty);
-    expect(player.skipSilenceEnabled, isFalse);
-  });
+      expect(player.skipSilenceConfigurations, [true]);
+      expect(player.skipSilenceEnabled, isTrue);
+    },
+  );
 
   test('a failed skip silence write does not poison later changes', () async {
     final player = _CrossfadePlayerService()..skipSilenceFailuresRemaining = 1;
@@ -1930,7 +3520,7 @@ void main() {
           .read(playerControllerProvider)
           .requireValue;
       expect(retryingBeforeOriginalCompletes.status, PlayerStatus.loading);
-      expect(retryingBeforeOriginalCompletes.errorMessage, contains('1/2'));
+      expect(retryingBeforeOriginalCompletes.errorMessage, isNull);
 
       player.completeOriginalSuccessfully();
       await play;
@@ -1942,8 +3532,8 @@ void main() {
       expect(retryingAfterOriginalCompletes.status, PlayerStatus.loading);
       expect(
         retryingAfterOriginalCompletes.errorMessage,
-        retryingBeforeOriginalCompletes.errorMessage,
-        reason: 'the stale successful Future must not clear the retry notice',
+        isNull,
+        reason: 'the stale successful Future must not publish an error',
       );
       expect(container.read(playbackQueueProvider).currentIndex, 0);
       expect(player.attemptedRemote, hasLength(1));
@@ -2011,7 +3601,7 @@ void main() {
           .read(playerControllerProvider)
           .requireValue;
       expect(noticeBeforeRetry.status, PlayerStatus.loading);
-      expect(noticeBeforeRetry.errorMessage, contains('1/2'));
+      expect(noticeBeforeRetry.errorMessage, isNull);
 
       retryDelay.releaseNext();
       await player.retryAttemptStarted;
@@ -2023,8 +3613,8 @@ void main() {
       expect(whileRetryFutureIsPending.status, PlayerStatus.loading);
       expect(
         whileRetryFutureIsPending.errorMessage,
-        noticeBeforeRetry.errorMessage,
-        reason: 'the duplicate backend failure must preserve the retry notice',
+        isNull,
+        reason: 'the duplicate backend failure must remain transient',
       );
       expect(container.read(playbackQueueProvider).currentIndex, 0);
       expect(player.attemptedRemote, hasLength(2));
@@ -2101,7 +3691,9 @@ void main() {
       await _flushCompletion();
 
       expect(resolver.callsFor('live-lone-failure'), 3);
-      expect(container.read(playbackQueueProvider).currentIndex, 0);
+      expect(container.read(playbackQueueProvider).currentIndex, -1);
+      expect(container.read(playbackQueueProvider).entries, isEmpty);
+      expect(controller.isLiveQueueActive, isFalse);
       expect(player.playedRemote.map((track) => track.id), ['live-next']);
       expect(retryDelay.durations, const [
         Duration(seconds: 2),
@@ -2151,6 +3743,16 @@ void main() {
         'https://media.example/first.m4a',
       ]);
 
+      final observed = <PlayerSnapshot>[];
+      final subscription = container.listen<AsyncValue<PlayerSnapshot>>(
+        playerControllerProvider,
+        (_, next) {
+          final snapshot = next.value;
+          if (snapshot != null) observed.add(snapshot);
+        },
+      );
+      addTearDown(subscription.close);
+
       player.emit(
         const PlayerSnapshot(
           status: PlayerStatus.failed,
@@ -2165,8 +3767,30 @@ void main() {
 
       expect(repository.infoCalls, 2);
       expect(player.playedRemote.last.streamUrl, contains('refreshed.m4a'));
-      expect(player.lastSeekPosition, const Duration(minutes: 5, seconds: 12));
+      expect(player.initialPositions, const <Duration>[
+        Duration.zero,
+        Duration(minutes: 5, seconds: 12),
+      ]);
+      expect(player.lastSeekPosition, isNull);
+      expect(
+        observed.where(
+          (snapshot) =>
+              snapshot.status == PlayerStatus.playing &&
+              snapshot.position == Duration.zero,
+        ),
+        isEmpty,
+        reason: 'Recovery must start at its retained cursor, before audio.',
+      );
       expect(container.read(playbackQueueProvider).currentIndex, 0);
+      expect(
+        observed.where(
+          (snapshot) =>
+              snapshot.status == PlayerStatus.failed ||
+              snapshot.errorMessage != null,
+        ),
+        isEmpty,
+        reason: 'The recoverable backend failure must not flash in the UI.',
+      );
 
       player.emit(
         const PlayerSnapshot(
@@ -2291,7 +3915,8 @@ void main() {
               ) ==
               true,
         ),
-        isTrue,
+        isFalse,
+        reason: 'A recovered source failure is not a playback error.',
       );
       final playing = container.read(playerControllerProvider).requireValue;
       expect(playing.status, PlayerStatus.playing);
@@ -2355,59 +3980,62 @@ void main() {
     },
   );
 
-  testWidgets(
-    'the mini player paints the primary error until fallback starts',
-    (tester) async {
-      final fallbackGate = Completer<void>();
-      final player = _RejectPrimaryInnerTubePlayerService();
-      final resolver = _ModeAwareFallbackAudioResolver(
-        fallbackGate: fallbackGate.future,
-      );
-      final container = _container(player, audioResolver: resolver);
-      addTearDown(container.dispose);
-      const track = TrackInfo(
-        id: 'visible-fallback-error',
-        title: 'Visible fallback error',
-        artist: 'Artist',
-        url: 'https://www.youtube.com/watch?v=visible-error',
-      );
+  testWidgets('the mini player keeps the loading state while fallback starts', (
+    tester,
+  ) async {
+    final fallbackGate = Completer<void>();
+    final player = _RejectPrimaryInnerTubePlayerService();
+    final resolver = _ModeAwareFallbackAudioResolver(
+      fallbackGate: fallbackGate.future,
+    );
+    final container = _container(player, audioResolver: resolver);
+    addTearDown(container.dispose);
+    const track = TrackInfo(
+      id: 'visible-fallback-error',
+      title: 'Visible fallback error',
+      artist: 'Artist',
+      url: 'https://www.youtube.com/watch?v=visible-error',
+    );
 
-      await container.read(playerControllerProvider.future);
-      await tester.pumpWidget(
-        UncontrolledProviderScope(
-          container: container,
-          child: const MaterialApp(
-            home: Scaffold(
-              body: Align(
-                alignment: Alignment.bottomCenter,
-                child: SizedBox(width: 720, child: MiniPlayer()),
-              ),
+    await container.read(playerControllerProvider.future);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.bottomCenter,
+              child: SizedBox(width: 720, child: MiniPlayer()),
             ),
           ),
         ),
-      );
+      ),
+    );
 
-      final playFuture = container
-          .read(playerControllerProvider.notifier)
-          .playRemote(track);
-      await tester.pump();
+    final playFuture = container
+        .read(playerControllerProvider.notifier)
+        .playRemote(track);
+    await tester.pump();
 
-      expect(find.textContaining('InnerTube principal falló'), findsOneWidget);
+    expect(find.textContaining('InnerTube principal falló'), findsNothing);
+    expect(
+      container.read(playerControllerProvider).requireValue.status,
+      PlayerStatus.loading,
+    );
 
-      fallbackGate.complete();
-      await playFuture;
-      await tester.pumpAndSettle();
+    fallbackGate.complete();
+    await playFuture;
+    await tester.pumpAndSettle();
 
-      expect(find.textContaining('InnerTube principal falló'), findsNothing);
-      expect(
-        container.read(playerControllerProvider).requireValue.status,
-        PlayerStatus.playing,
-      );
-      await container
-          .read(playerControllerProvider.notifier)
-          .resetRecommendationHistoryTracking();
-    },
-  );
+    expect(find.textContaining('InnerTube principal falló'), findsNothing);
+    expect(
+      container.read(playerControllerProvider).requireValue.status,
+      PlayerStatus.playing,
+    );
+    await container
+        .read(playerControllerProvider.notifier)
+        .resetRecommendationHistoryTracking();
+  });
 
   testWidgets('the full player shows three lines of the final fallback error', (
     tester,
@@ -3114,6 +4742,139 @@ void main() {
   );
 
   test(
+    'album artwork survives backend video thumbnails and native successors',
+    () async {
+      const albumArtwork =
+          'https://lh3.googleusercontent.com/album-cover=w544-h544-l90-rj';
+      final tracks =
+          [
+                _unresolvedRemoteTrack('q8j3zwNhLNo'),
+                _unresolvedRemoteTrack('dQw4w9WgXcQ'),
+              ]
+              .map((track) {
+                return track.copyWith(
+                  thumbnailUrl: albumArtwork,
+                  catalogThumbnailUrl: albumArtwork,
+                  album: 'Selected album',
+                  albumBrowseId: 'MPREb_selected_album',
+                  metadataSource: TrackMetadataSource.youtubeMusic,
+                );
+              })
+              .toList(growable: false);
+      final player = _NativeRemoteQueuePlayerService();
+      final container = _container(
+        player,
+        audioResolver: _BitrateAudioResolver(),
+        remoteCache: _TrackingRemotePlaybackCache(),
+      );
+      addTearDown(container.dispose);
+
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      await controller.playRemote(tracks.first, queue: tracks);
+      await _waitUntil(
+        () =>
+            player.remoteWindows.isNotEmpty &&
+            player.remoteWindows.last.any(
+              (source) => source.track.id == tracks.last.id,
+            ),
+      );
+      expect(player.playedRemote.single.thumbnailUrl, albumArtwork);
+      expect(
+        container.read(playerControllerProvider).requireValue.thumbnailUrl,
+        albumArtwork,
+      );
+
+      player.emit(
+        player.currentSnapshot.copyWith(
+          thumbnailUrl:
+              'https://i.ytimg.com/vi/${tracks.first.id}/hqdefault.jpg',
+        ),
+      );
+      await _flushCompletion();
+      expect(
+        container.read(playerControllerProvider).requireValue.thumbnailUrl,
+        albumArtwork,
+      );
+
+      final nextSource = player.remoteWindows.last.firstWhere(
+        (source) => source.track.id == tracks.last.id,
+      );
+      expect(nextSource.track.thumbnailUrl, albumArtwork);
+      expect(nextSource.track.catalogThumbnailUrl, albumArtwork);
+      player.emitNativeTransition(nextSource);
+      await _waitUntil(
+        () => container.read(playbackQueueProvider).currentIndex == 1,
+      );
+      player.emit(
+        player.currentSnapshot.copyWith(
+          thumbnailUrl:
+              'https://i.ytimg.com/vi/${tracks.last.id}/hqdefault.jpg',
+        ),
+      );
+      await _flushCompletion();
+      expect(
+        container.read(playerControllerProvider).requireValue.thumbnailUrl,
+        albumArtwork,
+      );
+      expect(
+        controller.currentRemoteTrackFor(tracks.last.url)?.thumbnailUrl,
+        albumArtwork,
+      );
+    },
+  );
+
+  test(
+    'native queue keeps the resolved format when the next song starts',
+    () async {
+      final player = _NativeRemoteQueuePlayerService();
+      final tracks = [
+        _unresolvedRemoteTrack('first'),
+        _unresolvedRemoteTrack('second'),
+      ];
+      final container = _container(
+        player,
+        audioResolver: _BitrateAudioResolver(),
+        remoteCache: _TrackingRemotePlaybackCache(),
+      );
+      addTearDown(container.dispose);
+
+      await container.read(playerControllerProvider.future);
+      await container
+          .read(playerControllerProvider.notifier)
+          .playRemote(tracks.first, queue: tracks);
+      await _waitUntil(
+        () =>
+            player.remoteWindows.isNotEmpty &&
+            player.remoteWindows.last.any(
+              (source) => source.track.id == tracks.last.id,
+            ),
+      );
+
+      final nextSource = player.remoteWindows.last.firstWhere(
+        (source) => source.track.id == tracks.last.id,
+      );
+      player.emitNativeTransition(nextSource);
+      await _waitUntil(
+        () => container.read(playbackQueueProvider).currentIndex == 1,
+      );
+      final controller = container.read(playerControllerProvider.notifier);
+      expect(
+        controller.currentRemoteTrackFor(tracks.last.url)?.streamBitrate,
+        isNull,
+      );
+      expect(
+        controller.preparedAudioSourceFor(tracks.last.url)?.track.streamBitrate,
+        148000,
+      );
+      expect(
+        controller.preparedAudioSourceFor(tracks.last.url)?.track.streamCodec,
+        'opus',
+      );
+    },
+  );
+
+  test(
     'a failed refill preserves the native successors already prepared',
     () async {
       final player = _NativeRemoteQueuePlayerService();
@@ -3234,6 +4995,62 @@ void main() {
         container.read(playerControllerProvider).value?.trackId,
         tracks[1].id,
       );
+    },
+  );
+
+  test(
+    'position snapshots preserve duplicate remote occurrences across reordering',
+    () async {
+      final player = _NativeRemoteQueuePlayerService();
+      final tracks = [
+        _queuedRemoteTrack('duplicate-seed'),
+        _queuedRemoteTrack('duplicate-song'),
+        _queuedRemoteTrack('duplicate-middle'),
+        _queuedRemoteTrack('duplicate-song'),
+      ];
+      final container = _container(
+        player,
+        remoteCache: _TrackingRemotePlaybackCache(),
+      );
+      addTearDown(container.dispose);
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      await controller.playRemote(tracks.first, queue: tracks);
+      await _waitUntil(
+        () =>
+            player.remoteWindows.isNotEmpty &&
+            player.remoteWindows.last.length == 3,
+      );
+      final firstOccurrence = player.remoteWindows.last.first;
+      final secondOccurrence = player.remoteWindows.last.last;
+      expect(firstOccurrence.track.id, secondOccurrence.track.id);
+      expect(
+        firstOccurrence.queueEntryId,
+        isNot(secondOccurrence.queueEntryId),
+      );
+
+      player.emitNativeTransition(secondOccurrence);
+      await _waitUntil(
+        () => container.read(playbackQueueProvider).currentIndex == 3,
+      );
+      player.emit(
+        player.currentSnapshot.copyWith(position: const Duration(seconds: 12)),
+      );
+      await _flushCompletion();
+      expect(container.read(playbackQueueProvider).currentIndex, 3);
+
+      await controller.reorderQueue(3, 1);
+      player.emit(
+        player.currentSnapshot.copyWith(position: const Duration(seconds: 13)),
+      );
+      await _flushCompletion();
+      expect(container.read(playbackQueueProvider).currentIndex, 1);
+
+      player.emitNativeTransition(firstOccurrence);
+      await _waitUntil(
+        () => container.read(playbackQueueProvider).currentIndex == 2,
+      );
+      expect(player.nativeRemoteStarts, 1);
     },
   );
 
@@ -4103,6 +5920,9 @@ void main() {
       track.album,
     );
     expect(container.read(currentLyricsLookupProvider)?.album, track.album);
+    final controller = container.read(playerControllerProvider.notifier);
+    expect(controller.currentLocalTrackFor(track.id)?.filePath, track.filePath);
+    expect(controller.currentLocalTrackFor('another-track'), isNull);
   });
 
   test(
@@ -4419,7 +6239,10 @@ void main() {
           position: Duration(milliseconds: 500),
         ),
       );
-      await _flushCompletion();
+      await _waitUntil(
+        () => repository.playMarks.any((mark) => mark.trackId == 'track-2'),
+        reason: 'The playing notification selection was not recorded.',
+      );
 
       expect(repository.playMarks.map((mark) => mark.trackId), [
         'track-1',
@@ -4609,6 +6432,56 @@ void main() {
       expect(player.resumeCalls, 1);
     },
   );
+
+  test(
+    'system session reuses queue metadata for positions and refreshes on reorder',
+    () async {
+      final player = _FakePlayerService();
+      final session = _FakeDesktopMediaSession();
+      final container = _container(player, desktopSession: session);
+      addTearDown(container.dispose);
+      container.read(desktopMediaSessionProvider);
+      await container.read(playerControllerProvider.future);
+      final controller = container.read(playerControllerProvider.notifier);
+      await controller.playLocal(
+        _track(1),
+        queue: [_track(1), _track(2), _track(3)],
+      );
+      await _waitUntil(
+        () => session.states.any((state) => state.queue.length == 3),
+      );
+      final original = session.states.last;
+
+      for (var index = 1; index <= 10; index++) {
+        player.emit(
+          player.currentSnapshot.copyWith(
+            position: Duration(milliseconds: index * 250),
+          ),
+        );
+        await _flushCompletion();
+        expect(session.states.last.queue, same(original.queue));
+        expect(session.states.last.queueKey, original.queueKey);
+      }
+
+      await controller.reorderQueue(2, 1);
+      await _flushCompletion();
+      final reordered = session.states.last;
+      expect(reordered.queue.map((entry) => entry.id), [
+        'track-1',
+        'track-3',
+        'track-2',
+      ]);
+      expect(reordered.queue, isNot(same(original.queue)));
+      expect(reordered.queueKey, isNot(original.queueKey));
+
+      player.emit(
+        player.currentSnapshot.copyWith(position: const Duration(seconds: 3)),
+      );
+      await _flushCompletion();
+      expect(session.states.last.queue, same(reordered.queue));
+      expect(session.states.last.snapshot.position, const Duration(seconds: 3));
+    },
+  );
 }
 
 ProviderContainer _container(
@@ -4619,6 +6492,7 @@ ProviderContainer _container(
   LocalTrackFileProbe? fileProbe,
   RemotePlaybackCache? remoteCache,
   SettingsController? settingsController,
+  PlaybackSessionStore? sessionStore,
   RemotePlaybackRetryDelay? retryDelay,
   List<Duration>? desktopSessionRetryBackoff,
   List<Override> extraOverrides = const [],
@@ -4627,6 +6501,16 @@ ProviderContainer _container(
   final catalogDatabase = _FakeCatalogDatabase(resolvedRepository);
   return ProviderContainer(
     overrides: [
+      playbackSessionStoreProvider.overrideWithValue(
+        sessionStore ?? _MemoryPlaybackSessionStore(),
+      ),
+      playerControllerProvider.overrideWith(
+        () => PlayerController(
+          remotePrefetchCoordinator: RemotePrefetchCoordinator(
+            additionalWarmupDelay: Duration.zero,
+          ),
+        ),
+      ),
       playerServiceProvider.overrideWithValue(player),
       databaseServiceProvider.overrideWithValue(catalogDatabase),
       settingsControllerProvider.overrideWith(
@@ -4922,6 +6806,25 @@ class _LiveRetryAudioResolver
   Future<void> dispose() async {}
 }
 
+class _MemoryPlaybackSessionStore implements PlaybackSessionStore {
+  PlaybackSession? saved;
+  Completer<PlaybackSession?>? readGate;
+
+  @override
+  Future<PlaybackSession?> read() async =>
+      readGate == null ? saved : await readGate!.future;
+
+  @override
+  Future<void> write(PlaybackSession session) async {
+    saved = session;
+  }
+
+  @override
+  Future<void> clear() async {
+    saved = null;
+  }
+}
+
 class _FakePlayerService implements PlayerService {
   _FakePlayerService({
     this.supportsLocalQueueReplacement = false,
@@ -4936,6 +6839,7 @@ class _FakePlayerService implements PlayerService {
   int pauseCalls = 0;
   int resumeCalls = 0;
   Duration? lastSeekPosition;
+  final List<Duration> initialPositions = [];
   final List<bool> shuffleValues = [];
   final List<PlaybackRepeatMode> repeatModes = [];
   final List<String> playedLocalIds = [];
@@ -4973,8 +6877,12 @@ class _FakePlayerService implements PlayerService {
   }
 
   @override
-  Future<void> playLocal(LocalTrack track) async {
+  Future<void> playLocal(
+    LocalTrack track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     playedLocalIds.add(track.id);
+    initialPositions.add(initialPosition);
     final error = localPlayError;
     if (error != null) {
       throw error;
@@ -4982,6 +6890,7 @@ class _FakePlayerService implements PlayerService {
     emit(
       PlayerSnapshot(
         status: PlayerStatus.playing,
+        position: initialPosition,
         title: track.title,
         artist: track.artist,
         album: track.album,
@@ -4994,23 +6903,32 @@ class _FakePlayerService implements PlayerService {
   }
 
   @override
-  Future<void> playLocalQueue(List<LocalTrack> tracks, int initialIndex) async {
+  Future<void> playLocalQueue(
+    List<LocalTrack> tracks,
+    int initialIndex, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     playLocalQueueCalls++;
     lastLocalQueue = List.unmodifiable(tracks);
     lastLocalQueueIndex = initialIndex;
-    await playLocal(tracks[initialIndex]);
+    await playLocal(tracks[initialIndex], initialPosition: initialPosition);
   }
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     final error = remotePlayError;
     if (error != null) {
       throw error;
     }
     playedRemote.add(track);
+    initialPositions.add(initialPosition);
     emit(
       PlayerSnapshot(
         status: PlayerStatus.playing,
+        position: initialPosition,
         title: track.title,
         artist: track.artist,
         album: track.album,
@@ -5070,6 +6988,28 @@ class _FakePlayerService implements PlayerService {
 
   @override
   Future<void> togglePlayPause() async {}
+}
+
+class _FailingLiveRequestPlayerService extends _FakePlayerService {
+  @override
+  Future<void> playLocal(
+    LocalTrack track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
+    if (track.id == 'track-99') throw StateError('Local decoder unavailable');
+    await super.playLocal(track, initialPosition: initialPosition);
+  }
+
+  @override
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
+    if (track.id == 'permanent-live-failure') {
+      throw StateError('Sign in to confirm you are not a bot');
+    }
+    await super.playRemote(track, initialPosition: initialPosition);
+  }
 }
 
 class _PlaybackOptionsFailingPlayerService extends _FakePlayerService {
@@ -5274,7 +7214,10 @@ class _DelayedLocalPlayerService extends _FakePlayerService {
   void complete(String trackId) => _gates[trackId]!.complete();
 
   @override
-  Future<void> playLocal(LocalTrack track) async {
+  Future<void> playLocal(
+    LocalTrack track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     final generation = ++_generation;
     started.add(track.id);
     final gate = Completer<void>();
@@ -5283,7 +7226,62 @@ class _DelayedLocalPlayerService extends _FakePlayerService {
     if (generation != _generation) {
       return;
     }
-    await super.playLocal(track);
+    await super.playLocal(track, initialPosition: initialPosition);
+  }
+}
+
+/// Models the native intent independently from the controller's selected
+/// metadata, including a load which finishes after a different song was picked.
+class _IntentAwareRemotePlayerService extends _FakePlayerService {
+  bool physicallyPlaying = false;
+  bool _playWhenReady = false;
+  final List<String> started = [];
+  final Map<String, Completer<void>> _loads = {};
+
+  void block(String id) => _loads[id] = Completer<void>();
+
+  void release(String id) {
+    final load = _loads[id];
+    if (load != null && !load.isCompleted) load.complete();
+  }
+
+  @override
+  Future<void> pause() async {
+    pauseCalls++;
+    _playWhenReady = false;
+    physicallyPlaying = false;
+    emit(
+      currentSnapshot.copyWith(
+        status: PlayerStatus.paused,
+        playWhenReady: false,
+      ),
+    );
+  }
+
+  @override
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
+    started.add(track.id);
+    _playWhenReady = true;
+    emit(
+      PlayerSnapshot(
+        status: PlayerStatus.loading,
+        playWhenReady: true,
+        trackId: track.id,
+        title: track.title,
+        artist: track.artist,
+        sourceUrl: track.url,
+        isRemote: true,
+      ),
+    );
+    final load = _loads[track.id];
+    if (load != null) await load.future;
+    if (!_playWhenReady) return;
+    physicallyPlaying = true;
+    await super.playRemote(track, initialPosition: initialPosition);
+    emit(currentSnapshot.copyWith(playWhenReady: true));
   }
 }
 
@@ -5305,12 +7303,15 @@ class _BlockingRemotePlayerService extends _FakePlayerService {
   }
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     startedRemoteIds.add(track.id);
     if (_blockedIds.contains(track.id)) {
       await _gates[track.id]!.future;
     }
-    await super.playRemote(track);
+    await super.playRemote(track, initialPosition: initialPosition);
   }
 }
 
@@ -5327,7 +7328,10 @@ class _StaleOutgoingRemotePlayerService extends _FakePlayerService {
   }
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     if (playedRemote.isNotEmpty) {
       emit(
         currentSnapshot.copyWith(status: PlayerStatus.stopped, isRemote: false),
@@ -5335,7 +7339,7 @@ class _StaleOutgoingRemotePlayerService extends _FakePlayerService {
       _outgoingSnapshotEmitted.complete();
       await _releaseReplacement.future;
     }
-    await super.playRemote(track);
+    await super.playRemote(track, initialPosition: initialPosition);
   }
 }
 
@@ -5343,12 +7347,16 @@ class _RejectPrimaryInnerTubePlayerService extends _FakePlayerService {
   final List<TrackInfo> attemptedRemote = [];
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     attemptedRemote.add(track);
     if (track.streamSource == AudioStreamSource.innerTube.name) {
       emit(
         PlayerSnapshot(
           status: PlayerStatus.failed,
+          position: initialPosition,
           trackId: track.id,
           sourceUrl: track.url,
           isRemote: true,
@@ -5357,16 +7365,19 @@ class _RejectPrimaryInnerTubePlayerService extends _FakePlayerService {
       );
       throw Exception('Source error: format is not supported');
     }
-    await super.playRemote(track);
+    await super.playRemote(track, initialPosition: initialPosition);
   }
 }
 
 class _ReadyInnerTubeFallbackPlayerService
     extends _RejectPrimaryInnerTubePlayerService {
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     if (track.streamSource == AudioStreamSource.innerTube.name) {
-      return super.playRemote(track);
+      return super.playRemote(track, initialPosition: initialPosition);
     }
     attemptedRemote.add(track);
     playedRemote.add(track);
@@ -5390,7 +7401,10 @@ class _LatePrimaryFailurePlayerService extends _FakePlayerService {
   final Completer<void> _primaryCompletion = Completer<void>();
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     attemptedRemote.add(track);
     if (track.streamSource == AudioStreamSource.innerTube.name) {
       emit(
@@ -5405,7 +7419,7 @@ class _LatePrimaryFailurePlayerService extends _FakePlayerService {
       await _primaryCompletion.future;
       return;
     }
-    await super.playRemote(track);
+    await super.playRemote(track, initialPosition: initialPosition);
   }
 
   void completePrimaryWithError() {
@@ -5418,7 +7432,10 @@ class _BlockedOriginalPrimaryFailurePlayerService extends _FakePlayerService {
   final Completer<void> _originalCompletion = Completer<void>();
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     attemptedRemote.add(track);
     if (attemptedRemote.length == 1) {
       emit(
@@ -5454,7 +7471,10 @@ class _BlockedOriginalPrimarySuccessPlayerService extends _FakePlayerService {
   final Completer<void> _originalCompletion = Completer<void>();
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     attemptedRemote.add(track);
     if (attemptedRemote.length == 1) {
       emit(
@@ -5471,7 +7491,7 @@ class _BlockedOriginalPrimarySuccessPlayerService extends _FakePlayerService {
       await _originalCompletion.future;
       return;
     }
-    await super.playRemote(track);
+    await super.playRemote(track, initialPosition: initialPosition);
   }
 
   void completeOriginalSuccessfully() {
@@ -5489,7 +7509,10 @@ class _PendingRetryFailurePlayerService extends _FakePlayerService {
   Future<void> get retryAttemptStarted => _retryAttemptStarted.future;
 
   @override
-  Future<void> playRemote(TrackInfo track) async {
+  Future<void> playRemote(
+    TrackInfo track, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     attemptedRemote.add(track);
     if (attemptedRemote.length == 1) {
       throw const SocketException('HTTP 503 from the initial primary source');
@@ -5512,7 +7535,7 @@ class _PendingRetryFailurePlayerService extends _FakePlayerService {
       _retryAttemptStarted.complete();
     }
     await _retryCompletion.future;
-    await super.playRemote(track);
+    await super.playRemote(track, initialPosition: initialPosition);
   }
 
   void completeRetrySuccessfully() {
@@ -5569,6 +7592,31 @@ class _ModeAwareFallbackAudioResolver
   Future<void> dispose() async {}
 }
 
+class _RejectPrimaryNativeQueuePlayerService
+    extends _NativeRemoteQueuePlayerService {
+  @override
+  Future<void> playRemoteSource(
+    RemotePlaybackSource source, {
+    Duration initialPosition = Duration.zero,
+  }) async {
+    if (source.track.streamSource == AudioStreamSource.innerTube.name) {
+      emit(
+        PlayerSnapshot(
+          status: PlayerStatus.failed,
+          position: initialPosition,
+          trackId: source.track.id,
+          queueEntryId: source.queueEntryId,
+          sourceUrl: source.track.url,
+          isRemote: true,
+          errorMessage: 'Source error: format is not supported',
+        ),
+      );
+      throw StateError('Source error: format is not supported');
+    }
+    await super.playRemoteSource(source, initialPosition: initialPosition);
+  }
+}
+
 class _NativeRemoteQueuePlayerService extends _FakePlayerService
     implements NativeRemoteQueuePlayer {
   _NativeRemoteQueuePlayerService({this.failCachedOpen = false});
@@ -5581,7 +7629,10 @@ class _NativeRemoteQueuePlayerService extends _FakePlayerService
   final List<bool> remoteWindowFinalizations = [];
 
   @override
-  Future<void> playRemoteSource(RemotePlaybackSource source) async {
+  Future<void> playRemoteSource(
+    RemotePlaybackSource source, {
+    Duration initialPosition = Duration.zero,
+  }) async {
     if (failCachedOpen && source.uri.scheme == 'file') {
       failCachedOpen = false;
       cachedOpenFailures++;
@@ -5590,7 +7641,8 @@ class _NativeRemoteQueuePlayerService extends _FakePlayerService
     nativeRemoteStarts++;
     nativeRemoteSources.add(source);
     playedRemote.add(source.track);
-    emit(_remoteSnapshot(source));
+    initialPositions.add(initialPosition);
+    emit(_remoteSnapshot(source).copyWith(position: initialPosition));
   }
 
   @override
@@ -5883,6 +7935,23 @@ class _FakeAudioResolverFromRepository implements AudioStreamResolver {
           : Map<String, String>.unmodifiable(response.httpHeaders!),
       videoId: track.id.isEmpty ? null : track.id,
       formatId: response.extractor,
+    );
+  }
+
+  @override
+  Future<void> dispose() async {}
+}
+
+class _BitrateAudioResolver implements AudioStreamResolver {
+  @override
+  Future<AudioStreamResolution> resolve(TrackInfo track) async {
+    return AudioStreamResolution(
+      source: AudioStreamSource.innerTube,
+      streamUrl: 'https://media.example/${track.id}.webm',
+      streamExtension: 'webm',
+      streamMimeType: 'audio/webm',
+      codec: 'opus',
+      bitrate: 148000,
     );
   }
 

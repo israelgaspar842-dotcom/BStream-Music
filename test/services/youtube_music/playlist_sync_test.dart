@@ -232,6 +232,134 @@ void main() {
       },
     );
 
+    test(
+      'concurrent likes keep one favorite and its downloaded identity',
+      () async {
+        final a = _item('A', localId: 'a', setId: 'set-a');
+        final downloadedB = _item(
+          'B',
+          localId: 'local-b',
+        ).copyWith(localTrackId: 'download-b');
+        const key = PlaylistSyncKey(
+          accountKey: 'account',
+          playlistId: 'bstream:favorites',
+        );
+        final store = _MemoryStore(
+          PlaylistSyncWork(
+            binding: PlaylistSyncBinding(
+              key: key,
+              remotePlaylistId: 'LM',
+              mode: PlaylistSyncMode.automatic,
+              localRevisionAtBase: 1,
+              createdAt: now,
+              updatedAt: now,
+            ),
+            base: _snapshot('Liked Music', <PlaylistSyncItem>[a]),
+            local: _snapshot('Favoritos', <PlaylistSyncItem>[a, downloadedB]),
+            localRevision: 2,
+            localDeleted: false,
+          ),
+        );
+        final gateway = _FakeLikedGateway()
+          ..fetches.add(
+            _snapshot('Liked Music', <PlaylistSyncItem>[
+              _item('B', setId: 'remote-b'),
+              _item('A', setId: 'set-a'),
+            ]),
+          );
+
+        final result = await _engine(store, gateway, now).sync(key);
+
+        expect(result.disposition, PlaylistSyncDisposition.synchronized);
+        expect(gateway.likedMutationCount, 0);
+        expect(gateway.mutationCount, 0);
+        expect(store.work.local.items, hasLength(2));
+        final b = store.work.local.items.singleWhere(
+          (item) => item.videoId == _video('B'),
+        );
+        expect(b.localItemId, 'local-b');
+        expect(b.localTrackId, 'download-b');
+        expect(b.setVideoId, 'remote-b');
+        expect(store.work.intent, isNull);
+      },
+    );
+
+    test(
+      'first link unions imported favorites and preserves local-only files',
+      () async {
+        final downloadedA = _item(
+          'A',
+          localId: 'a',
+        ).copyWith(localTrackId: 'download-a');
+        final localOnly = PlaylistSyncItem(
+          localItemId: 'offline-item',
+          localTrackId: 'offline-file',
+          track: CatalogTrack.local(
+            localTrackId: 'offline-file',
+            title: 'Offline recording',
+          ),
+        );
+        const key = PlaylistSyncKey(
+          accountKey: 'account',
+          playlistId: 'bstream:favorites',
+        );
+        final store = _MemoryStore(
+          PlaylistSyncWork(
+            binding: PlaylistSyncBinding(
+              key: key,
+              remotePlaylistId: 'LM',
+              mode: PlaylistSyncMode.automatic,
+              localRevisionAtBase: 0,
+              createdAt: now,
+              updatedAt: now,
+            ),
+            local: _snapshot('Favoritos', <PlaylistSyncItem>[
+              downloadedA,
+              _item('B', localId: 'imported-b'),
+              localOnly,
+            ]),
+            localRevision: 3,
+            localDeleted: false,
+          ),
+        );
+        final gateway = _FakeLikedGateway()
+          ..fetches.addAll(<PlaylistSyncSnapshot>[
+            _snapshot('Liked Music', <PlaylistSyncItem>[
+              _item('C', setId: 'remote-c'),
+              _item('A', setId: 'remote-a'),
+            ]),
+            _snapshot('Liked Music', <PlaylistSyncItem>[
+              _item('B', setId: 'remote-b'),
+              _item('C', setId: 'remote-c'),
+              _item('A', setId: 'remote-a'),
+            ]),
+          ]);
+
+        final result = await _engine(store, gateway, now).sync(key);
+
+        expect(result.disposition, PlaylistSyncDisposition.synchronized);
+        expect(gateway.likedMutationCount, 1);
+        expect(gateway.mutationCount, 0);
+        expect(
+          gateway.likedDesired!.items.map((item) => item.videoId).toSet(),
+          <String>{_video('A'), _video('B'), _video('C')},
+        );
+        expect(store.work.local.items, hasLength(4));
+        expect(
+          store.work.local.items
+              .singleWhere((item) => item.videoId == _video('A'))
+              .localTrackId,
+          'download-a',
+        );
+        expect(
+          store.work.local.items
+              .singleWhere((item) => item.videoId == null)
+              .localTrackId,
+          'offline-file',
+        );
+      },
+    );
+
     test('Favorites ignore server reordering after a like', () async {
       final a = _item('A', localId: 'a', setId: 'set-a');
       final b = _item('B', localId: 'b', setId: 'set-b');
@@ -465,6 +593,109 @@ void main() {
       expect(gateway.mutationCount, 0);
       expect(store.work.intent?.status, PlaylistSyncIntentStatus.pending);
     });
+
+    test(
+      'a complete 325-song read repairs a previously truncated 100-song base',
+      () async {
+        final truncated = _snapshot('Road', [
+          for (var index = 0; index < 100; index++)
+            _item(
+              's${index.toString().padLeft(3, '0')}',
+              localId: 'local-$index',
+              setId: 'set-$index',
+            ),
+        ]);
+        final complete = _snapshot('Road', [
+          for (var index = 0; index < 325; index++)
+            _item(
+              index == 150 ? 's005' : 's${index.toString().padLeft(3, '0')}',
+              setId: 'set-$index',
+            ),
+        ]);
+        final store = _MemoryStore(_work(base: truncated, local: truncated));
+        final gateway = _FakeGateway()..fetches.addAll([complete, complete]);
+        final engine = _engine(store, gateway, now);
+
+        final repaired = await engine.sync(store.work.binding.key);
+
+        expect(repaired.disposition, PlaylistSyncDisposition.synchronized);
+        expect(gateway.mutationCount, 0);
+        expect(gateway.createCount, 0);
+        expect(store.work.local.items, hasLength(325));
+        expect(store.work.base!.items, hasLength(325));
+        expect(
+          store.work.local.items.map((item) => item.setVideoId),
+          complete.items.map((item) => item.setVideoId),
+        );
+        expect(
+          store.work.local.items.take(100).map((item) => item.localItemId),
+          truncated.items.map((item) => item.localItemId),
+        );
+        final repeatedVideo = store.work.local.items
+            .where((item) => item.videoId == _video('s005'))
+            .toList(growable: false);
+        expect(repeatedVideo, hasLength(2));
+        expect(repeatedVideo.map((item) => item.setVideoId), [
+          'set-5',
+          'set-150',
+        ]);
+        final repairedIds = store.work.local.items
+            .map((item) => item.localItemId)
+            .toList(growable: false);
+        expect(repairedIds.toSet(), hasLength(325));
+
+        final repeated = await engine.sync(store.work.binding.key);
+
+        expect(repeated.disposition, PlaylistSyncDisposition.noChanges);
+        expect(gateway.mutationCount, 0);
+        expect(store.work.local.items, hasLength(325));
+        expect(
+          store.work.local.items.map((item) => item.localItemId),
+          repairedIds,
+        );
+      },
+    );
+
+    test(
+      'an incomplete playlist read preserves all 325 songs until retry',
+      () async {
+        final local = _snapshot('Road', [
+          for (var index = 0; index < 325; index++)
+            _item(
+              's${index.toString().padLeft(3, '0')}',
+              localId: 'local-$index',
+              setId: 'set-$index',
+            ),
+        ]);
+        final store = _MemoryStore(_work(base: local, local: local));
+        final gateway = _FakeGateway()
+          ..fetchError = const PlaylistGatewayUnavailableException(
+            'YouTube Music returned an incomplete playlist.',
+          );
+        final engine = _engine(store, gateway, now);
+
+        final deferred = await engine.sync(store.work.binding.key);
+
+        expect(deferred.disposition, PlaylistSyncDisposition.deferred);
+        expect(gateway.mutationCount, 0);
+        expect(store.commits, 0);
+        expect(store.work.local, same(local));
+        expect(store.work.base, same(local));
+        expect(store.work.intent?.status, PlaylistSyncIntentStatus.pending);
+        expect(store.work.intent?.mutationToken, isNull);
+
+        gateway
+          ..fetchError = null
+          ..fetches.add(local);
+        final retried = await engine.sync(store.work.binding.key);
+
+        expect(retried.disposition, PlaylistSyncDisposition.synchronized);
+        expect(gateway.mutationCount, 0);
+        expect(store.work.local.items, hasLength(325));
+        expect(store.work.local.semanticallyEquals(local), isTrue);
+        expect(store.work.intent, isNull);
+      },
+    );
 
     test(
       'a stale create ACK keeps its remote ID and freezes the write',

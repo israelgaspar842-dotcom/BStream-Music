@@ -10,6 +10,8 @@ class _ClassicVinylPlayerLayout extends StatelessWidget {
     required this.artworkStyle,
     required this.animatedArtworkEnabled,
     required this.canvasUrl,
+    required this.videoStartOffset,
+    required this.videoDurationHint,
     required this.drawBackground,
     required this.hasTrack,
     required this.isFavorite,
@@ -34,6 +36,8 @@ class _ClassicVinylPlayerLayout extends StatelessWidget {
   final PlayerArtworkStyle artworkStyle;
   final bool animatedArtworkEnabled;
   final Uri? canvasUrl;
+  final Duration videoStartOffset;
+  final Duration videoDurationHint;
   final bool drawBackground;
   final bool hasTrack;
   final bool isFavorite;
@@ -55,28 +59,19 @@ class _ClassicVinylPlayerLayout extends StatelessWidget {
       MediaQuery.viewPaddingOf(context).bottom,
       MediaQuery.paddingOf(context).bottom,
     );
+    final systemTopInset = _playerTopSafeInset(context);
     return Stack(
       key: const ValueKey('classic-vinyl-player-layout'),
       fit: StackFit.expand,
       children: [
-        if (drawBackground) ...[
-          _BlurredPlayerBackground(
-            url: artworkSource,
-            fallbackUrl: artworkFallbackSource,
-          ),
+        if (drawBackground)
           Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: playerPlaybackOverlayColors(context),
-                  stops: const [0, 0.38, 0.72, 1],
-                ),
-              ),
+            child: PlaybackArtworkBackdrop(
+              source: artworkSource,
+              fallbackSource: artworkFallbackSource,
+              animateTrackChanges: false,
             ),
           ),
-        ],
         LayoutBuilder(
           builder: (context, constraints) {
             final mobile = AppPlatform.isMobileTargetPlatform(
@@ -94,7 +89,7 @@ class _ClassicVinylPlayerLayout extends StatelessWidget {
                 : constraints.maxWidth >= 430
                 ? 22.0
                 : 16.0;
-            final topPadding = mobileLandscape ? 4.0 : 8.0;
+            final topPadding = systemTopInset + (mobileLandscape ? 4.0 : 8.0);
             final bottomPadding =
                 (mobileLandscape ? 4.0 : 12.0) + systemBottomInset;
             final contentAvailableWidth = math.max(
@@ -224,42 +219,59 @@ class _ClassicVinylPlayerLayout extends StatelessWidget {
                 portraitControlsHeight >= minimumRoomyControlsHeight &&
                 effectiveTextScale <= 1.25 &&
                 !hasError;
-            final controls = _ClassicVinylControls(
-              snapshot: snapshot,
-              visualIdentity: visualIdentity,
-              trackTransitionsEnabled: trackTransitionsEnabled,
-              hasTrack: hasTrack,
-              isFavorite: isFavorite,
-              savedTrackId: savedTrackId,
-              hasError: hasError,
-              errorText: errorText,
-              compact: compactPortrait || tightLandscape,
-              // Only give the lower controls the extra breathing room on
-              // phones with enough vertical budget. Very short 320x568
-              // frames retain their original compact metrics to avoid
-              // introducing scroll just to enlarge a control.
-              smallPhone: compactPortraitViewport && bodyHeight >= 620,
-              tight: tightLandscape,
-              roomy: roomyPortrait,
-              onOpenLyrics: onOpenLyrics,
-              onOpenSearch: onOpenSearch,
-              onOpenArtist: onOpenArtist,
-              onOpenAlbum: onOpenAlbum,
-              strings: strings,
+            final controls = Padding(
+              key: const ValueKey('classic-vinyl-player-controls-inset'),
+              padding: EdgeInsets.symmetric(
+                horizontal: _playerControlsHorizontalInset(mobileLandscape),
+              ),
+              child: _ClassicVinylControls(
+                snapshot: snapshot,
+                visualIdentity: visualIdentity,
+                trackTransitionsEnabled: trackTransitionsEnabled,
+                hasTrack: hasTrack,
+                isFavorite: isFavorite,
+                savedTrackId: savedTrackId,
+                hasError: hasError,
+                errorText: errorText,
+                compact: compactPortrait || tightLandscape,
+                // Only give the lower controls the extra breathing room on
+                // phones with enough vertical budget. Very short 320x568
+                // frames retain their original compact metrics to avoid
+                // introducing scroll just to enlarge a control.
+                smallPhone: compactPortraitViewport && bodyHeight >= 620,
+                tight: tightLandscape,
+                roomy: roomyPortrait,
+                metadataCompactness: _playerControlsCompactness(
+                  constraints,
+                  mobileLandscape: mobileLandscape,
+                  systemBottomInset: systemBottomInset,
+                ),
+                queueVisible: queueVisible,
+                onToggleQueue: onToggleQueue,
+                onOpenLyrics: onOpenLyrics,
+                onOpenSearch: onOpenSearch,
+                onOpenArtist: onOpenArtist,
+                onOpenAlbum: onOpenAlbum,
+                strings: strings,
+              ),
             );
             final deck = SizedBox.square(
               key: const ValueKey('classic-vinyl-player-deck-slot'),
               dimension: deckExtent,
-              child: _ClassicVinylPlaybackDeck(
-                artworkSource: artworkSource,
-                artworkFallbackSource: artworkFallbackSource,
-                visualIdentity: visualIdentity,
-                isPlaying: snapshot.status == PlayerStatus.playing,
-                animationEnabled: animatedArtworkEnabled,
-                canvasUrl: canvasUrl,
-                trackTransitionsEnabled: trackTransitionsEnabled,
-                expanded: deckUsesExpandedGeometry,
-                portraitLayout: !twoColumn,
+              child: _ArtworkAudioQualityOverlay(
+                child: _ClassicVinylPlaybackDeck(
+                  artworkSource: artworkSource,
+                  artworkFallbackSource: artworkFallbackSource,
+                  visualIdentity: visualIdentity,
+                  isPlaying: snapshot.status == PlayerStatus.playing,
+                  animationEnabled: animatedArtworkEnabled,
+                  canvasUrl: canvasUrl,
+                  videoStartOffset: videoStartOffset,
+                  videoDurationHint: videoDurationHint,
+                  trackTransitionsEnabled: trackTransitionsEnabled,
+                  expanded: deckUsesExpandedGeometry,
+                  portraitLayout: !twoColumn,
+                ),
               ),
             );
 
@@ -384,38 +396,14 @@ class _ClassicVinylPlayerLayout extends StatelessWidget {
                 fit: StackFit.expand,
                 children: [
                   Positioned.fill(top: bodyTop, child: body),
-                  Positioned(
-                    top: 0,
-                    right: expandedPortrait ? contentHorizontalPadding : 0,
-                    child: SizedBox.square(
-                      dimension: 44,
-                      child: IconButton(
-                        key: const ValueKey('player-queue-toggle'),
-                        tooltip: strings.playbackQueue,
-                        isSelected: queueVisible,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints.tightFor(
-                          width: 44,
-                          height: 44,
-                        ),
-                        color: queueVisible
-                            ? Theme.of(context).colorScheme.primary
-                            : AppColors.playbackControlForegroundFor(context),
-                        iconSize: 24,
-                        icon: const Icon(Icons.queue_music_rounded),
-                        selectedIcon: const Icon(Icons.queue_music_rounded),
-                        onPressed: onToggleQueue,
-                      ),
+                  Align(
+                    alignment: Alignment.topCenter,
+                    child: PlayerCollapseHandle(
+                      key: const ValueKey('classic-vinyl-player-grabber'),
+                      onCollapse: onCollapse,
+                      label: strings.minimizePlayer,
                     ),
                   ),
-                  if (!mobileLandscape)
-                    Align(
-                      alignment: Alignment.topCenter,
-                      child: _ApplePlayerGrabber(
-                        onCollapse: onCollapse,
-                        label: strings.minimizePlayer,
-                      ),
-                    ),
                 ],
               ),
             );
@@ -434,6 +422,8 @@ class _ClassicVinylPlaybackDeck extends ConsumerWidget {
     required this.isPlaying,
     required this.animationEnabled,
     required this.canvasUrl,
+    required this.videoStartOffset,
+    required this.videoDurationHint,
     required this.trackTransitionsEnabled,
     required this.expanded,
     required this.portraitLayout,
@@ -445,6 +435,8 @@ class _ClassicVinylPlaybackDeck extends ConsumerWidget {
   final bool isPlaying;
   final bool animationEnabled;
   final Uri? canvasUrl;
+  final Duration videoStartOffset;
+  final Duration videoDurationHint;
   final bool trackTransitionsEnabled;
   final bool expanded;
   final bool portraitLayout;
@@ -474,6 +466,8 @@ class _ClassicVinylPlaybackDeck extends ConsumerWidget {
       isPlaying: isPlaying,
       animationEnabled: animationEnabled,
       canvasUrl: canvasUrl,
+      videoStartOffset: videoStartOffset,
+      videoDurationHint: videoDurationHint,
       progress: progress,
       trackTransitionsEnabled: trackTransitionsEnabled,
       expanded: expanded,
@@ -496,6 +490,9 @@ class _ClassicVinylControls extends ConsumerWidget {
     required this.smallPhone,
     required this.tight,
     required this.roomy,
+    required this.metadataCompactness,
+    required this.queueVisible,
+    required this.onToggleQueue,
     required this.onOpenLyrics,
     required this.onOpenSearch,
     required this.onOpenArtist,
@@ -515,6 +512,9 @@ class _ClassicVinylControls extends ConsumerWidget {
   final bool smallPhone;
   final bool tight;
   final bool roomy;
+  final double metadataCompactness;
+  final bool queueVisible;
+  final VoidCallback onToggleQueue;
   final VoidCallback onOpenLyrics;
   final VoidCallback? onOpenSearch;
   final VoidCallback? onOpenArtist;
@@ -541,12 +541,8 @@ class _ClassicVinylControls extends ConsumerWidget {
             snapshot.title ?? strings.noPlayback,
             style: Theme.of(context).textTheme.headlineSmall?.copyWith(
               color: AppColors.playbackTitleFor(context),
-              fontSize: compact
-                  ? (smallPhone ? 24 : 21)
-                  : roomy
-                  ? 28
-                  : 25,
-              fontWeight: FontWeight.w900,
+              fontSize: _playerTitleFontSize(context, metadataCompactness),
+              fontWeight: FontWeight.w800,
               height: 1.08,
             ),
           ),
@@ -567,12 +563,11 @@ class _ClassicVinylControls extends ConsumerWidget {
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.titleMedium?.copyWith(
                         color: secondary,
-                        fontSize: compact
-                            ? (smallPhone ? 17 : 15)
-                            : roomy
-                            ? 18
-                            : 17,
-                        fontWeight: FontWeight.w700,
+                        fontSize: _playerArtistFontSize(
+                          context,
+                          metadataCompactness,
+                        ),
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ),
@@ -618,44 +613,20 @@ class _ClassicVinylControls extends ConsumerWidget {
         : roomy
         ? (smallPhone ? 30.0 : 28.0)
         : (smallPhone ? 27.0 : 25.0);
-    final utilityLabelWidth = tight
-        ? 96.0
-        : compact
-        ? (smallPhone ? 136.0 : 108.0)
-        : roomy
-        ? (smallPhone ? 144.0 : 136.0)
-        : (smallPhone ? 132.0 : 120.0);
-    final utilityButtons = Row(
+    final utilityRow = KeyedSubtree(
       key: const ValueKey('classic-vinyl-player-utility-row'),
-      mainAxisSize: MainAxisSize.max,
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        _LabeledControlButton(
-          key: const ValueKey('player-lyrics-control'),
-          width: utilityLabelWidth,
-          height: utilitySize,
-          tooltip: strings.lyrics,
-          iconSize: utilityIconSize,
-          labelFontSize: smallPhone ? 15.0 : null,
-          color: foreground,
-          label: strings.lyrics,
-          icon: Icons.lyrics_rounded,
-          onPressed: hasTrack ? onOpenLyrics : null,
-        ),
-        _VolumeButton(
-          key: const ValueKey('player-volume-control'),
-          snapshot: snapshot,
-          size: utilitySize,
-          width: utilityLabelWidth,
-          label: strings.volume,
-          tooltip: strings.volume,
-          iconSize: utilityIconSize,
-          labelFontSize: smallPhone ? 15.0 : null,
-          color: foreground,
-        ),
-      ],
+      child: _PlayerUtilityControls(
+        snapshot: snapshot,
+        hasTrack: hasTrack,
+        queueVisible: queueVisible,
+        onToggleQueue: onToggleQueue,
+        onOpenLyrics: onOpenLyrics,
+        strings: strings,
+        size: utilitySize,
+        iconSize: utilityIconSize,
+        color: foreground,
+      ),
     );
-    final utilityRow = utilityButtons;
     final timeline = KeyedSubtree(
       key: const ValueKey('classic-vinyl-player-timeline'),
       child: _AppleMusicTimeline(
@@ -671,6 +642,7 @@ class _ClassicVinylControls extends ConsumerWidget {
     final transport = _ClassicVinylTransportControls(
       hasTrack: hasTrack,
       isPlaying: isPlaying,
+      isLoading: snapshot.status == PlayerStatus.loading,
       shuffleEnabled: snapshot.shuffleEnabled,
       repeatMode: snapshot.repeatMode,
       compact: compact,
@@ -685,9 +657,30 @@ class _ClassicVinylControls extends ConsumerWidget {
         mainAxisSize: MainAxisSize.max,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [metadata, timeline, transport, utilityRow],
+        children: [
+          metadata,
+          timeline,
+          // The progress line sits nine pixels above its touch area's edge.
+          // Center against that line while retaining the roomy layout slots.
+          Transform.translate(offset: const Offset(0, -4.5), child: transport),
+          utilityRow,
+        ],
       );
     }
+
+    final transportSpacing = _playerTransportSpacing(
+      before: tight
+          ? 2
+          : compact
+          ? (smallPhone ? 8 : 5)
+          : 12,
+      after: tight
+          ? 2
+          : compact
+          ? (smallPhone ? 6 : 3)
+          : 8,
+      timelineTail: tight ? 8 : 9,
+    );
 
     return Column(
       key: const ValueKey('classic-vinyl-player-controls'),
@@ -705,25 +698,9 @@ class _ClassicVinylControls extends ConsumerWidget {
               : 12,
         ),
         timeline,
-        SizedBox(
-          height: tight
-              ? 2
-              : compact
-              ? (smallPhone ? 8 : 5)
-              : roomy
-              ? 16
-              : 12,
-        ),
+        SizedBox(height: transportSpacing.before),
         transport,
-        SizedBox(
-          height: tight
-              ? 2
-              : compact
-              ? (smallPhone ? 6 : 3)
-              : roomy
-              ? 12
-              : 8,
-        ),
+        SizedBox(height: transportSpacing.after),
         Center(child: utilityRow),
         if (hasError) ...[
           SizedBox(height: compact ? 6 : 10),
@@ -741,6 +718,7 @@ class _ClassicVinylTransportControls extends ConsumerWidget {
   const _ClassicVinylTransportControls({
     required this.hasTrack,
     required this.isPlaying,
+    required this.isLoading,
     required this.shuffleEnabled,
     required this.repeatMode,
     required this.compact,
@@ -751,6 +729,7 @@ class _ClassicVinylTransportControls extends ConsumerWidget {
 
   final bool hasTrack;
   final bool isPlaying;
+  final bool isLoading;
   final bool shuffleEnabled;
   final PlaybackRepeatMode repeatMode;
   final bool compact;
@@ -875,16 +854,11 @@ class _ClassicVinylTransportControls extends ConsumerWidget {
                           Size.square(fittedPrimaryButtonSize),
                         ),
                         iconSize: primaryIconSize,
-                        icon: Transform.translate(
-                          offset: isPlaying
-                              ? Offset.zero
-                              : const Offset(1.25, 0),
-                          transformHitTests: false,
-                          child: Icon(
-                            isPlaying
-                                ? Icons.pause_rounded
-                                : Icons.play_arrow_rounded,
-                          ),
+                        icon: PlaybackControlIcon(
+                          isLoading: isLoading,
+                          isPlaying: isPlaying,
+                          loadingLabel: strings.playbackLoading,
+                          playOffset: const Offset(1.25, 0),
                         ),
                         onPressed: hasTrack
                             ? () => ref

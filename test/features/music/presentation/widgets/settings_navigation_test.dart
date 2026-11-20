@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:ui';
 
 import 'package:bstream_music/core/theme/app_colors.dart';
@@ -15,6 +17,7 @@ import 'package:bstream_music/services/lyrics/lyrics_romanization_service.dart';
 import 'package:bstream_music/services/player/player_service.dart';
 import 'package:bstream_music/services/sharing/incoming_track_link_service.dart';
 import 'package:bstream_music/services/storage/library_csv_import_service.dart';
+import 'package:bstream_music/services/sharing/incoming_csv_file_service.dart';
 import 'package:bstream_music/services/storage/library_csv_service.dart';
 import 'package:bstream_music/services/storage/local_library_reconciler.dart';
 import 'package:bstream_music/services/youtube_music/auth/youtube_music_account_client.dart';
@@ -22,6 +25,7 @@ import 'package:bstream_music/services/youtube_music/auth/youtube_music_auth_mod
 import 'package:bstream_music/services/youtube_music/auth/youtube_music_session_store.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show RenderParagraph;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter/services.dart';
@@ -422,6 +426,7 @@ void main() {
       final clearCard = find.byKey(
         const ValueKey('settings-card-clear-recommendations'),
       );
+      await _ensureSettingsVisible(tester, historyCard);
       expect(historyCard, findsOneWidget);
       expect(clearCard, findsOneWidget);
 
@@ -486,6 +491,15 @@ void main() {
 
       await tester.tap(find.byKey(const ValueKey('settings-card-appearance')));
       await tester.pump();
+
+      expect(
+        find.byKey(const ValueKey('show-audio-quality-toggle')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('show-audio-quality-switch')),
+        findsOneWidget,
+      );
 
       expect(find.byKey(const ValueKey('settings-root')), findsOneWidget);
       expect(
@@ -573,6 +587,223 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  for (final width in [360.0, 1600.0]) {
+    testWidgets('audio quality appears below player style at width $width', (
+      tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      _configureView(tester, Size(width, 1100));
+      final navigationController = SettingsNavigationController();
+      addTearDown(navigationController.dispose);
+      await tester.pumpWidget(
+        _settingsHarness(
+          navigationController: navigationController,
+          platform: width >= 1200 ? TargetPlatform.windows : null,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('settings-card-appearance')));
+      await tester.pumpAndSettle();
+
+      final style = find.byKey(const ValueKey('player-style-selector'));
+      final quality = find.byKey(const ValueKey('show-audio-quality-toggle'));
+      final qualitySwitch = find.byKey(
+        const ValueKey('show-audio-quality-switch'),
+      );
+      final artwork = find.byKey(const ValueKey('animated-artwork-toggle'));
+      if (width >= 1200) {
+        expect(tester.getSize(quality).width, greaterThan(1200));
+      }
+      expect(tester.widget<Switch>(qualitySwitch).value, isTrue);
+      expect(
+        tester.getTopLeft(quality).dy,
+        greaterThan(tester.getBottomLeft(style).dy),
+      );
+      expect(
+        tester.getBottomLeft(quality).dy,
+        lessThan(tester.getTopLeft(artwork).dy),
+      );
+
+      await tester.ensureVisible(quality);
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.descendant(
+          of: quality,
+          matching: find.text('Mostrar códec y calidad'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.widget<Switch>(qualitySwitch).value, isFalse);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getBool('settings.showAudioQuality'), isFalse);
+      await tester.tap(qualitySwitch);
+      await tester.pumpAndSettle();
+      expect(tester.widget<Switch>(qualitySwitch).value, isTrue);
+      expect(prefs.getBool('settings.showAudioQuality'), isTrue);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('appearance selects and applies a player font', (tester) async {
+    _configureView(tester, const Size(430, 1000));
+    final navigationController = SettingsNavigationController();
+    addTearDown(navigationController.dispose);
+
+    await tester.pumpWidget(
+      _settingsHarness(navigationController: navigationController),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-card-appearance')));
+    await tester.pumpAndSettle();
+
+    final surfaceSelector = find.byKey(
+      const ValueKey('surface-background-selector'),
+    );
+    final fontSelector = find.byKey(const ValueKey('player-font-selector'));
+    final styleSelector = find.byKey(const ValueKey('player-style-selector'));
+    expect(fontSelector, findsOneWidget);
+    expect(
+      find.descendant(
+        of: fontSelector,
+        matching: find.text('Fuente de la app'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: fontSelector,
+        matching: find.text(
+          const AppStrings(AppLanguage.spanish).playerFontCurrent,
+        ),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      tester.getTopLeft(fontSelector).dy,
+      greaterThan(tester.getTopLeft(surfaceSelector).dy),
+    );
+    expect(
+      tester.getTopLeft(fontSelector).dy,
+      lessThan(tester.getTopLeft(styleSelector).dy),
+    );
+
+    await tester.ensureVisible(fontSelector);
+    await tester.tap(fontSelector);
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('settings-player-font-preview-title')),
+      findsNothing,
+    );
+    for (final font in <PlayerFont>[
+      PlayerFont.fredoka,
+      PlayerFont.nunito,
+      PlayerFont.spaceMono,
+      PlayerFont.lora,
+    ]) {
+      final option = find.byKey(
+        ValueKey('settings-player-font-option-${font.code}'),
+      );
+      await tester.ensureVisible(option);
+      await tester.tap(option);
+      await tester.pumpAndSettle();
+      final label = find.descendant(
+        of: option,
+        matching: find.text(
+          const AppStrings(AppLanguage.spanish).playerFontLabel(font),
+        ),
+      );
+      expect(tester.widget<Text>(label).style?.fontFamily, font.fontFamily);
+    }
+
+    expect(
+      find.descendant(
+        of: fontSelector,
+        matching: find.text(
+          const AppStrings(AppLanguage.spanish).playerFontCurrent,
+        ),
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Aplicar'));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: fontSelector, matching: find.text('Lora')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('app background picker preserves the current photo on cancel', (
+    tester,
+  ) async {
+    _configureView(tester, const Size(430, 1000));
+    final navigationController = SettingsNavigationController();
+    addTearDown(navigationController.dispose);
+    var pickCount = 0;
+
+    await tester.pumpWidget(
+      _settingsHarness(
+        navigationController: navigationController,
+        overrides: [
+          appBackgroundPhotoPickerProvider.overrideWithValue(() async {
+            pickCount += 1;
+            return pickCount == 1 ? File('selected-photo.jpg') : null;
+          }),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-card-appearance')));
+    await tester.pumpAndSettle();
+
+    final selector = find.byKey(const ValueKey('app-background-selector'));
+    expect(selector, findsOneWidget);
+    expect(
+      find.descendant(of: selector, matching: find.text('Sin Fondo')),
+      findsOneWidget,
+    );
+    await tester.ensureVisible(selector);
+    await tester.tap(selector);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('settings-app-background-option-custom')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('settings-app-background-option-custom')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: selector, matching: find.text('Personalizado')),
+      findsOneWidget,
+    );
+
+    await tester.tap(selector);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey('settings-app-background-option-custom')),
+    );
+    await tester.pumpAndSettle();
+    expect(pickCount, 2);
+    expect(
+      find.descendant(of: selector, matching: find.text('Personalizado')),
+      findsOneWidget,
+    );
+
+    await tester.tap(selector);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey('settings-app-background-option-none')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: selector, matching: find.text('Sin Fondo')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('appearance selects player, surface, and mini player modes', (
     tester,
@@ -671,7 +902,7 @@ void main() {
     expect(
       find.descendant(
         of: surfaceBackgroundSelector,
-        matching: find.text('Fondo de las superficies'),
+        matching: find.text('Estilo de las superficies'),
       ),
       findsOneWidget,
     );
@@ -719,6 +950,7 @@ void main() {
     );
 
     await tester.ensureVisible(surfaceBackgroundSelector);
+    await tester.pumpAndSettle();
     await tester.tap(surfaceBackgroundSelector);
     await tester.pumpAndSettle();
 
@@ -726,7 +958,7 @@ void main() {
       find.byKey(const ValueKey('settings-surface-background-dialog')),
       findsOneWidget,
     );
-    expect(find.text('Fondo de las superficies'), findsWidgets);
+    expect(find.text('Estilo de las superficies'), findsWidgets);
     expect(
       find.byKey(const ValueKey('settings-surface-background-option-accent')),
       findsOneWidget,
@@ -776,11 +1008,12 @@ void main() {
     );
 
     await tester.ensureVisible(playerStyleSelector);
+    await tester.pumpAndSettle();
     await tester.tap(playerStyleSelector);
     await tester.pumpAndSettle();
 
     expect(
-      find.byKey(const ValueKey('settings-player-style-dialog')),
+      find.byKey(const ValueKey('settings-player-style-gallery')),
       findsOneWidget,
     );
     expect(
@@ -795,9 +1028,20 @@ void main() {
       find.byKey(const ValueKey('settings-player-style-option-classic-vinyl')),
       findsOneWidget,
     );
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('settings-player-style-option-apple-music')),
+    );
+    await tester.pumpAndSettle();
+    await tester.pumpAndSettle();
     await tester.tap(
       find.byKey(const ValueKey('settings-player-style-option-apple-music')),
     );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('settings-player-style-apply')),
+      findsNothing,
+    );
+    await tester.tap(find.byKey(const ValueKey('settings-detail-back')));
     await tester.pumpAndSettle();
 
     expect(
@@ -810,9 +1054,20 @@ void main() {
 
     await tester.tap(playerStyleSelector);
     await tester.pumpAndSettle();
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('settings-player-style-option-classic-vinyl')),
+    );
+    await tester.pumpAndSettle();
+    await tester.pumpAndSettle();
     await tester.tap(
       find.byKey(const ValueKey('settings-player-style-option-classic-vinyl')),
     );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('settings-player-style-apply')),
+      findsNothing,
+    );
+    await tester.tap(find.byKey(const ValueKey('settings-detail-back')));
     await tester.pumpAndSettle();
 
     expect(
@@ -823,13 +1078,39 @@ void main() {
       findsOneWidget,
     );
 
+    await tester.tap(playerStyleSelector);
+    await tester.pumpAndSettle();
+    final spotifyStyle = find.byKey(
+      const ValueKey('settings-player-style-option-spotify-music'),
+    );
+    await tester.ensureVisible(spotifyStyle);
+    await tester.pumpAndSettle();
+    await tester.pumpAndSettle();
+    await tester.tap(spotifyStyle);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('settings-player-style-apply')),
+      findsNothing,
+    );
+    await tester.tap(find.byKey(const ValueKey('settings-detail-back')));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: playerStyleSelector,
+        matching: find.text('Spotify Style'),
+      ),
+      findsOneWidget,
+    );
+
     await tester.ensureVisible(animatedArtworkToggle);
+    await tester.pumpAndSettle();
     await tester.tap(animatedArtworkToggle);
     await tester.pumpAndSettle();
 
     expect(tester.widget<Switch>(animatedArtworkSwitch).value, isFalse);
 
     await tester.ensureVisible(playerArtworkStyleSelector);
+    await tester.pumpAndSettle();
     await tester.tap(playerArtworkStyleSelector);
     await tester.pumpAndSettle();
 
@@ -869,6 +1150,7 @@ void main() {
     );
 
     await tester.ensureVisible(selector);
+    await tester.pumpAndSettle();
     await tester.tap(selector);
     await tester.pumpAndSettle();
 
@@ -903,6 +1185,7 @@ void main() {
     );
 
     await tester.ensureVisible(backgroundSelector);
+    await tester.pumpAndSettle();
     await tester.tap(backgroundSelector);
     await tester.pumpAndSettle();
 
@@ -1072,7 +1355,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byKey(const ValueKey('settings-card-language')));
+      final languageCard = find.byKey(const ValueKey('settings-card-language'));
+      await _ensureSettingsVisible(tester, languageCard);
+      await tester.tap(languageCard);
       await tester.pumpAndSettle();
 
       final dialog = find.byKey(const ValueKey('settings-language-dialog'));
@@ -1082,6 +1367,12 @@ void main() {
       final english = find.byKey(
         const ValueKey('settings-language-option-english'),
       );
+      for (final language in AppLanguage.values) {
+        expect(
+          find.byKey(ValueKey('settings-language-option-${language.name}')),
+          findsOneWidget,
+        );
+      }
       expect(dialog, findsOneWidget);
       expect(find.byKey(const ValueKey('settings-root')), findsOneWidget);
       expect(find.byKey(const ValueKey('settings-detail-back')), findsNothing);
@@ -1117,12 +1408,30 @@ void main() {
         ),
         findsOneWidget,
       );
+      await tester.ensureVisible(languageCard);
+      await tester.tap(languageCard);
+      await tester.pumpAndSettle();
+      final portuguese = find.byKey(
+        const ValueKey('settings-language-option-portuguese'),
+      );
+      await tester.ensureVisible(portuguese);
+      await tester.tap(portuguese);
+      await tester.pumpAndSettle();
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('settings-card-language')),
+          matching: find.text('Português'),
+        ),
+        findsOneWidget,
+      );
       expect(tester.takeException(), isNull);
       debugDefaultTargetPlatformOverride = null;
     },
   );
 
-  testWidgets('settings cards use compact corners and spacing', (tester) async {
+  testWidgets('settings sections share lightweight panels and compact rows', (
+    tester,
+  ) async {
     _configureView(tester, const Size(760, 1100));
     final navigationController = SettingsNavigationController();
     addTearDown(navigationController.dispose);
@@ -1143,15 +1452,31 @@ void main() {
       const ValueKey('settings-inline-crossfade'),
     );
 
-    final cardMaterial = _outerMaterial(tester, appearanceCard);
-    final timerMaterial = _outerMaterial(tester, timerCard);
-    final crossfadeMaterial = _outerMaterial(tester, crossfadeCard);
+    final cardMaterial = _sectionCard(tester, appearanceCard);
+    final timerMaterial = _sectionCard(tester, timerCard);
+    final crossfadeMaterial = _sectionCard(tester, crossfadeCard);
+    expect(
+      tester.element(
+        find.ancestor(of: appearanceCard, matching: find.byType(Card)).first,
+      ),
+      tester.element(
+        find.ancestor(of: lyricsCard, matching: find.byType(Card)).first,
+      ),
+    );
+    expect(
+      tester.element(
+        find.ancestor(of: timerCard, matching: find.byType(Card)).first,
+      ),
+      tester.element(
+        find.ancestor(of: crossfadeCard, matching: find.byType(Card)).first,
+      ),
+    );
     final cardShape = cardMaterial.shape! as RoundedRectangleBorder;
     final timerShape = timerMaterial.shape! as RoundedRectangleBorder;
     final crossfadeShape = crossfadeMaterial.shape! as RoundedRectangleBorder;
-    expect(cardShape.borderRadius, BorderRadius.circular(6));
-    expect(timerShape.borderRadius, BorderRadius.circular(6));
-    expect(crossfadeShape.borderRadius, BorderRadius.circular(6));
+    expect(cardShape.borderRadius, BorderRadius.circular(22));
+    expect(timerShape.borderRadius, BorderRadius.circular(22));
+    expect(crossfadeShape.borderRadius, BorderRadius.circular(22));
     expect(timerMaterial.color, cardMaterial.color);
     expect(crossfadeMaterial.color, cardMaterial.color);
     expect(timerShape.side.color, cardShape.side.color);
@@ -1163,14 +1488,14 @@ void main() {
         of: appearanceCard,
         matching: find.byType(AppCardGradientBorder),
       ),
-      findsOneWidget,
+      findsNothing,
     );
     expect(
       find.descendant(
         of: timerCard,
         matching: find.byType(AppCardGradientBorder),
       ),
-      findsOneWidget,
+      findsNothing,
     );
     final gradient = AppColors.cardBorderGradientFor(
       tester.element(appearanceCard),
@@ -1182,42 +1507,52 @@ void main() {
     final cardGap =
         tester.getTopLeft(lyricsCard).dy -
         tester.getBottomLeft(appearanceCard).dy;
-    expect(cardGap, closeTo(6, 0.1));
+    expect(cardGap, closeTo(1, 0.1));
     final playbackCardGap =
         tester.getTopLeft(crossfadeCard).dy -
         tester.getBottomLeft(timerCard).dy;
-    expect(playbackCardGap, closeTo(6, 0.1));
+    expect(playbackCardGap, closeTo(1, 0.1));
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('desktop crossfade matches the LIVE request storage card width', (
-    tester,
-  ) async {
-    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
-    addTearDown(() => debugDefaultTargetPlatformOverride = null);
-    _configureView(tester, const Size(1100, 1600));
-    final navigationController = SettingsNavigationController();
-    addTearDown(navigationController.dispose);
+  testWidgets(
+    'desktop settings cards fill content width except the sleep timer',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      _configureView(tester, const Size(1100, 1600));
+      final navigationController = SettingsNavigationController();
+      addTearDown(navigationController.dispose);
 
-    await tester.pumpWidget(
-      _settingsHarness(navigationController: navigationController),
-    );
-    await tester.pumpAndSettle();
+      await tester.pumpWidget(
+        _settingsHarness(navigationController: navigationController),
+      );
+      await tester.pumpAndSettle();
 
-    final crossfadeRect = tester.getRect(
-      find.byKey(const ValueKey('settings-inline-crossfade')),
-    );
-    final liveStorageRect = tester.getRect(
-      find.byKey(const ValueKey('settings-card-live-request-storage')),
-    );
+      final crossfadeRect = tester.getRect(
+        find.byKey(const ValueKey('settings-inline-crossfade')),
+      );
+      final liveStorageRect = tester.getRect(
+        find.byKey(const ValueKey('settings-card-live-request-storage')),
+      );
+      final languageRect = tester.getRect(
+        find.byKey(const ValueKey('settings-card-language')),
+      );
+      final timerRect = tester.getRect(
+        find.byKey(const ValueKey('settings-inline-timer')),
+      );
 
-    expect(crossfadeRect.width, closeTo(760, 0.1));
-    expect(crossfadeRect.width, closeTo(liveStorageRect.width, 0.1));
-    expect(crossfadeRect.left, closeTo(liveStorageRect.left, 0.1));
-    expect(crossfadeRect.right, closeTo(liveStorageRect.right, 0.1));
-    expect(tester.takeException(), isNull);
-    debugDefaultTargetPlatformOverride = null;
-  });
+      expect(languageRect.width, greaterThan(760));
+      expect(crossfadeRect.width, greaterThan(760));
+      expect(crossfadeRect.width, closeTo(languageRect.width, 0.1));
+      expect(crossfadeRect.width, closeTo(liveStorageRect.width, 0.1));
+      expect(crossfadeRect.left, closeTo(liveStorageRect.left, 0.1));
+      expect(crossfadeRect.right, closeTo(liveStorageRect.right, 0.1));
+      expect(timerRect.width, closeTo(520, 0.1));
+      expect(tester.takeException(), isNull);
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
 
   testWidgets('wide Android keeps the compact crossfade card width', (
     tester,
@@ -1274,7 +1609,7 @@ void main() {
     expect(
       tester.getTopLeft(skipSilenceCard).dy -
           tester.getBottomLeft(crossfadeCard).dy,
-      closeTo(6, 0.1),
+      closeTo(1, 0.1),
     );
     expect(tester.getSize(skipSilenceCard).width, closeTo(520, 0.1));
 
@@ -1294,7 +1629,7 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('skip silence is not presented as supported on iOS', (
+  testWidgets('iOS exposes and saves the shared skip silence preference', (
     tester,
   ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
@@ -1306,18 +1641,78 @@ void main() {
     await tester.pumpWidget(
       _settingsHarness(
         navigationController: navigationController,
-        overrides: [skipSilenceSupportedProvider.overrideWithValue(false)],
+        overrides: [skipSilenceSupportedProvider.overrideWithValue(true)],
       ),
     );
     await tester.pumpAndSettle();
 
     expect(
       find.byKey(const ValueKey('settings-inline-skip-silence')),
-      findsNothing,
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('settings-skip-silence-switch')),
+    );
+    await tester.pumpAndSettle();
+    final container = ProviderScope.containerOf(
+      tester.element(
+        find.byKey(const ValueKey('settings-inline-skip-silence')),
+      ),
+    );
+    expect(
+      container
+          .read(settingsControllerProvider)
+          .requireValue
+          .skipSilenceEnabled,
+      isTrue,
     );
     expect(tester.takeException(), isNull);
     debugDefaultTargetPlatformOverride = null;
   });
+
+  testWidgets(
+    'an unsupported current iOS audio keeps its preference editable',
+    (tester) async {
+      _configureView(tester, const Size(760, 1400));
+      final navigationController = SettingsNavigationController();
+      addTearDown(navigationController.dispose);
+      await tester.pumpWidget(
+        _settingsHarness(
+          navigationController: navigationController,
+          platform: TargetPlatform.iOS,
+          skipSilenceAvailable: false,
+          overrides: [skipSilenceSupportedProvider.overrideWithValue(true)],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('No disponible para este audio.'), findsOneWidget);
+      final toggle = find.byKey(const ValueKey('settings-skip-silence-switch'));
+      expect(tester.widget<SwitchListTile>(toggle).onChanged, isNotNull);
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      final scope = ProviderScope.containerOf(tester.element(toggle));
+      expect(
+        scope.read(settingsControllerProvider).requireValue.skipSilenceEnabled,
+        isTrue,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  test(
+    'audio-specific silence availability is translated in every language',
+    () {
+      const english = AppStrings(AppLanguage.english);
+      for (final language in AppLanguage.values.where(
+        (language) => language != AppLanguage.english,
+      )) {
+        expect(
+          AppStrings(language).skipSilenceUnavailableForAudio,
+          isNot(english.skipSilenceUnavailableForAudio),
+        );
+      }
+    },
+  );
 
   testWidgets('skip silence fits a compact Android view at large text', (
     tester,
@@ -1360,6 +1755,292 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
     tester.platformDispatcher.clearTextScaleFactorTestValue();
   });
+
+  test('lyrics provider settings have translations in every app language', () {
+    const english = AppStrings(AppLanguage.english);
+    for (final language in AppLanguage.values) {
+      final strings = AppStrings(language);
+      final values = [
+        strings.lyricsProviders,
+        strings.lyricsProvidersHint,
+        strings.lyricsProvidersFallbackHint,
+        strings.noLyricsProvidersEnabled,
+        strings.lyricsProvidersDisabledHint,
+        strings.betterLyricsAvailabilityHint,
+      ];
+      expect(values.every((value) => value.trim().isNotEmpty), isTrue);
+      expect(
+        strings.lyricsProvidersHint,
+        contains('Better Lyrics → LyricsPlus → LRCLIB'),
+      );
+      for (final provider in LyricsProvider.values) {
+        final attribution = strings.lyricsSourceForProvider(provider.label);
+        expect(attribution, contains(provider.label));
+        expect(
+          attribution,
+          strings.lyricsSource.replaceAll('LRCLIB', provider.label),
+        );
+      }
+      if (language != AppLanguage.english) {
+        expect(strings.lyricsProviders, isNot(english.lyricsProviders));
+        expect(strings.lyricsProvidersHint, isNot(english.lyricsProvidersHint));
+        expect(
+          strings.lyricsProvidersFallbackHint,
+          isNot(english.lyricsProvidersFallbackHint),
+        );
+        expect(
+          strings.noLyricsProvidersEnabled,
+          isNot(english.noLyricsProvidersEnabled),
+        );
+        expect(
+          strings.lyricsProvidersDisabledHint,
+          isNot(english.lyricsProvidersDisabledHint),
+        );
+        expect(
+          strings.betterLyricsAvailabilityHint,
+          isNot(english.betterLyricsAvailabilityHint),
+        );
+      }
+    }
+  });
+
+  testWidgets(
+    'lyrics providers are first, persist independent toggles, and return to lyrics',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      _configureView(tester, const Size(430, 900));
+      final navigationController = SettingsNavigationController();
+      addTearDown(navigationController.dispose);
+      await tester.pumpWidget(
+        _settingsHarness(
+          navigationController: navigationController,
+          settingsControllerBuilder: _PersistingCrossfadeSettingsController.new,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final lyricsCard = find.byKey(
+        const ValueKey('settings-card-lyrics-appearance'),
+      );
+      await _ensureSettingsVisible(tester, lyricsCard);
+      await tester.tap(lyricsCard);
+      await tester.pumpAndSettle();
+
+      final providersCard = find.byKey(
+        const ValueKey('settings-card-lyrics-providers'),
+      );
+      final animation = find.byKey(const ValueKey('lyrics-animation-options'));
+      expect(providersCard, findsOneWidget);
+      expect(
+        tester.getBottomLeft(providersCard).dy,
+        lessThan(tester.getTopLeft(animation).dy),
+      );
+      expect(find.text('Better Lyrics · LyricsPlus · LRCLIB'), findsOneWidget);
+
+      final gradientChoice = find.byKey(
+        const ValueKey('lyrics-background-option-gradient'),
+      );
+      // Gradient is the default; choose another mode before testing a save.
+      final initialBlur = find.byKey(
+        const ValueKey('lyrics-background-option-blur'),
+      );
+      await _ensureSettingsVisible(tester, initialBlur);
+      await tester.tap(initialBlur);
+      await tester.pumpAndSettle();
+      await _ensureSettingsVisible(tester, gradientChoice);
+      await tester.tap(gradientChoice);
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<SegmentedButton<LyricsBackgroundStyle>>(
+              find.byKey(const ValueKey('lyrics-background-options')),
+            )
+            .selected,
+        {LyricsBackgroundStyle.gradient},
+      );
+      expect(
+        (await SharedPreferences.getInstance()).getString(
+          'settings.lyricsBackground',
+        ),
+        'gradient',
+      );
+      final blurChoice = find.byKey(
+        const ValueKey('lyrics-background-option-blur'),
+      );
+      await _ensureSettingsVisible(tester, blurChoice);
+      await tester.tap(blurChoice);
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<SegmentedButton<LyricsBackgroundStyle>>(
+              find.byKey(const ValueKey('lyrics-background-options')),
+            )
+            .selected,
+        {LyricsBackgroundStyle.blur},
+      );
+      expect(
+        (await SharedPreferences.getInstance()).getString(
+          'settings.lyricsBackground',
+        ),
+        'blur',
+      );
+
+      await _ensureSettingsVisible(tester, providersCard);
+      await tester.tap(providersCard);
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('settings-detail-lyricsProviders')),
+        findsOneWidget,
+      );
+      expect(find.text('Proveedores de letras'), findsOneWidget);
+      final providerToggles = find.byType(SwitchListTile);
+      expect(
+        tester
+            .widgetList<SwitchListTile>(providerToggles)
+            .map((toggle) => (toggle.title! as Text).data),
+        ['Better Lyrics', 'LyricsPlus', 'LRCLIB'],
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('lyrics-provider-toggle-betterLyrics')),
+          matching: find.text(
+            const AppStrings(AppLanguage.spanish).betterLyricsAvailabilityHint,
+          ),
+        ),
+        findsOneWidget,
+      );
+      for (final provider in LyricsProvider.values) {
+        final toggle = find.byKey(
+          ValueKey('lyrics-provider-toggle-${provider.name}'),
+        );
+        expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+        await tester.tap(toggle);
+        await tester.pumpAndSettle();
+        expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+      }
+
+      const strings = AppStrings(AppLanguage.spanish);
+      expect(find.text(strings.lyricsProvidersDisabledHint), findsOneWidget);
+      expect(find.text(strings.lyricsProvidersFallbackHint), findsNothing);
+      final preferences = await SharedPreferences.getInstance();
+      expect(preferences.getStringList('settings.enabledLyricsProviders'), []);
+
+      final youLyPlus = find.byKey(
+        const ValueKey('lyrics-provider-toggle-youLyPlus'),
+      );
+      await tester.tap(youLyPlus);
+      await tester.pumpAndSettle();
+      expect(tester.widget<SwitchListTile>(youLyPlus).value, isTrue);
+      expect(preferences.getStringList('settings.enabledLyricsProviders'), [
+        'youLyPlus',
+      ]);
+      expect(find.text(strings.lyricsProvidersFallbackHint), findsOneWidget);
+
+      expect(navigationController.maybePop(), isTrue);
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('settings-detail-lyrics')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: providersCard, matching: find.text('LyricsPlus')),
+        findsOneWidget,
+      );
+      await tester.tap(providersCard);
+      await tester.pumpAndSettle();
+      expect(tester.widget<SwitchListTile>(youLyPlus).value, isTrue);
+      expect(
+        tester
+            .widget<SwitchListTile>(
+              find.byKey(const ValueKey('lyrics-provider-toggle-lrclib')),
+            )
+            .value,
+        isFalse,
+      );
+      await tester.tap(find.byKey(const ValueKey('settings-detail-back')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('settings-detail-lyrics')),
+        findsOneWidget,
+      );
+      expect(navigationController.maybePop(), isTrue);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('settings-root')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'lyrics providers fit compact text scaling and full desktop width',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view
+          ..resetPhysicalSize()
+          ..resetDevicePixelRatio();
+        tester.platformDispatcher.clearTextScaleFactorTestValue();
+        debugDefaultTargetPlatformOverride = null;
+      });
+
+      for (final layout in const [
+        (
+          size: Size(320, 720),
+          platform: TargetPlatform.android,
+          textScale: 2.0,
+        ),
+        (
+          size: Size(1400, 900),
+          platform: TargetPlatform.windows,
+          textScale: 1.0,
+        ),
+      ]) {
+        tester.view.physicalSize = layout.size;
+        tester.platformDispatcher.textScaleFactorTestValue = layout.textScale;
+        debugDefaultTargetPlatformOverride = layout.platform;
+        final navigationController = SettingsNavigationController();
+        addTearDown(navigationController.dispose);
+        await tester.pumpWidget(
+          _settingsHarness(
+            navigationController: navigationController,
+            platform: layout.platform,
+            language: AppLanguage.french,
+          ),
+        );
+        await tester.pumpAndSettle();
+        final lyricsCard = find.byKey(
+          const ValueKey('settings-card-lyrics-appearance'),
+        );
+        await _ensureSettingsVisible(tester, lyricsCard);
+        await tester.tap(lyricsCard);
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('settings-card-lyrics-providers')),
+        );
+        await tester.pumpAndSettle();
+
+        final providersCard = find.byKey(
+          const ValueKey('lyrics-providers-card'),
+        );
+        await tester.ensureVisible(providersCard);
+        await tester.pumpAndSettle();
+        final cardRect = tester.getRect(providersCard);
+        expect(cardRect.left, closeTo(18, 0.1));
+        expect(cardRect.width, closeTo(layout.size.width - 36, 0.1));
+        for (final provider in LyricsProvider.values) {
+          expect(
+            find.byKey(ValueKey('lyrics-provider-toggle-${provider.name}')),
+            findsOneWidget,
+          );
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+      }
+      debugDefaultTargetPlatformOverride = null;
+      tester.platformDispatcher.clearTextScaleFactorTestValue();
+    },
+  );
 
   testWidgets('lyrics appearance offers animation, alignment, and preview', (
     tester,
@@ -1451,11 +2132,11 @@ void main() {
     await tester.pumpAndSettle();
     expect(
       tester
-          .widget<ChoiceChip>(
-            find.byKey(const ValueKey('lyrics-animation-option-slide')),
+          .widget<SegmentedButton<LyricsAnimationStyle>>(
+            find.byKey(const ValueKey('lyrics-animation-options')),
           )
           .selected,
-      isTrue,
+      {LyricsAnimationStyle.slide},
     );
 
     await tester.tap(find.text('Centrada'));
@@ -1476,7 +2157,7 @@ void main() {
     final romanizationToggle = find.byKey(
       const ValueKey('lyrics-romanization-toggle'),
     );
-    await tester.ensureVisible(romanizationToggle);
+    await _ensureSettingsVisible(tester, romanizationToggle);
     await tester.tap(romanizationToggle);
     await tester.pumpAndSettle();
     expect(
@@ -1560,12 +2241,13 @@ void main() {
         final card = find.byKey(
           const ValueKey('settings-card-lyrics-appearance'),
         );
-        await tester.ensureVisible(card);
+        await _ensureSettingsVisible(tester, card);
         await tester.tap(card);
         await tester.pumpAndSettle();
 
         final toggle = find.byKey(const ValueKey('lyrics-romanization-toggle'));
         await tester.ensureVisible(toggle);
+        await tester.pumpAndSettle();
         await tester.tap(toggle);
         await tester.pumpAndSettle();
 
@@ -1573,7 +2255,7 @@ void main() {
         await tester.ensureVisible(preview);
         await tester.pumpAndSettle();
         final previewRect = tester.getRect(preview);
-        final expectedWidth = layout.size.width == 320 ? 296.0 : 520.0;
+        final expectedWidth = layout.size.width - 60;
         expect(previewRect.width, closeTo(expectedWidth, 0.1));
 
         for (final slot in const ['previous', 'active', 'next']) {
@@ -1848,7 +2530,7 @@ void main() {
       final storageSettings = find.byKey(
         const ValueKey('settings-card-storage'),
       );
-      await tester.ensureVisible(storageSettings);
+      await _ensureSettingsVisible(tester, storageSettings);
       await tester.pumpAndSettle();
 
       final filtersCard = find.byKey(
@@ -1940,6 +2622,111 @@ void main() {
     },
   );
 
+  testWidgets('theme labels fit narrow phones at the selected text size', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    _configureView(tester, const Size(320, 720));
+    addTearDown(() {
+      debugDefaultTargetPlatformOverride = null;
+      tester.platformDispatcher.clearTextScaleFactorTestValue();
+    });
+    for (final language in [AppLanguage.spanish, AppLanguage.french]) {
+      for (final scale in [1.0, 1.3, 2.0]) {
+        tester.platformDispatcher.textScaleFactorTestValue = scale;
+        final navigationController = SettingsNavigationController();
+        addTearDown(navigationController.dispose);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpWidget(
+          _settingsHarness(
+            navigationController: navigationController,
+            language: language,
+          ),
+        );
+        await tester.pumpAndSettle();
+        final appearance = find.byKey(
+          const ValueKey('settings-card-appearance'),
+        );
+        await _ensureSettingsVisible(tester, appearance);
+        await tester.tap(appearance);
+        await tester.pumpAndSettle();
+
+        final selector = find.byKey(
+          const ValueKey('settings-theme-mode-selector'),
+        );
+        final strings = AppStrings(language);
+        for (final label in [
+          strings.themeSystem,
+          strings.themeLight,
+          strings.themeDark,
+        ]) {
+          final paragraph = tester.renderObject<RenderParagraph>(
+            find.descendant(of: selector, matching: find.text(label)),
+          );
+          expect(
+            paragraph.getMaxIntrinsicWidth(double.infinity),
+            lessThanOrEqualTo(paragraph.size.width + .01),
+            reason: '$label at $scale in $language',
+          );
+          expect(paragraph.didExceedMaxLines, isFalse);
+        }
+        expect(tester.getRect(selector).left, greaterThanOrEqualTo(0));
+        expect(tester.getRect(selector).right, lessThanOrEqualTo(320));
+        expect(tester.takeException(), isNull);
+      }
+    }
+    debugDefaultTargetPlatformOverride = null;
+    tester.platformDispatcher.clearTextScaleFactorTestValue();
+  });
+
+  testWidgets('larger accent circles keep comfortable rows and tap targets', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    _configureView(tester, const Size(430, 900));
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final navigationController = SettingsNavigationController();
+    addTearDown(navigationController.dispose);
+    await tester.pumpWidget(
+      _settingsHarness(navigationController: navigationController),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-card-appearance')));
+    await tester.pumpAndSettle();
+
+    final grid = tester.widget<GridView>(
+      find.byKey(const ValueKey('accent-palette-grid')),
+    );
+    final delegate =
+        grid.gridDelegate as SliverGridDelegateWithFixedCrossAxisCount;
+    expect(delegate.crossAxisCount, inInclusiveRange(6, 7));
+    for (final accent in AppAccent.values) {
+      final target = find.byKey(ValueKey('accent-${accent.code}'));
+      expect(tester.getSize(target).shortestSide, greaterThanOrEqualTo(48));
+      final swatch = find.byKey(ValueKey('accent-swatch-${accent.code}'));
+      expect(tester.getSize(swatch), const Size.square(42));
+      expect(
+        (tester.widget<AnimatedContainer>(swatch).decoration! as BoxDecoration)
+            .shape,
+        BoxShape.circle,
+      );
+    }
+    final lastAccent = find.byKey(const ValueKey('accent-ocean'));
+    await tester.ensureVisible(lastAccent);
+    await tester.pumpAndSettle();
+    await tester.tap(lastAccent);
+    await tester.pumpAndSettle();
+    expect(
+      ProviderScope.containerOf(
+        tester.element(lastAccent),
+      ).read(settingsControllerProvider).requireValue.accent,
+      AppAccent.ocean,
+    );
+    expect(tester.takeException(), isNull);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   testWidgets('playback settings and storage fit a 320 px Android phone', (
     tester,
   ) async {
@@ -1968,6 +2755,14 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('settings-detail-back')));
     await tester.pumpAndSettle();
 
+    await _ensureSettingsVisible(
+      tester,
+      find.byKey(const ValueKey('settings-inline-timer')),
+    );
+    await _ensureSettingsVisible(
+      tester,
+      find.byKey(const ValueKey('settings-inline-crossfade')),
+    );
     expect(find.byKey(const ValueKey('settings-inline-timer')), findsOneWidget);
     final timerSwitch = find.descendant(
       of: find.byKey(const ValueKey('settings-inline-timer')),
@@ -2233,7 +3028,7 @@ void main() {
     final crossfadeSwitch = find.byKey(
       const ValueKey('settings-crossfade-switch'),
     );
-    await tester.ensureVisible(crossfadeSwitch);
+    await _ensureSettingsVisible(tester, crossfadeSwitch);
     await tester.tap(crossfadeSwitch);
     await tester.pump();
 
@@ -2271,7 +3066,8 @@ void main() {
         _settingsHarness(navigationController: navigationController),
       );
       await tester.pumpAndSettle();
-      await tester.ensureVisible(
+      await _ensureSettingsVisible(
+        tester,
         find.byKey(const ValueKey('settings-card-storage')),
       );
       await tester.tap(find.byKey(const ValueKey('settings-card-storage')));
@@ -2316,7 +3112,7 @@ void main() {
                 find.byKey(ValueKey('csv-profile-surface-${profile.$1}')),
               )
               .color,
-          AppColors.neutralSurfaceFor(tester.element(tileFinder)),
+          AppColors.cardSurfaceFor(tester.element(tileFinder)),
         );
       }
       await tester.tap(find.byKey(const ValueKey('csv-export-profile-cancel')));
@@ -2326,7 +3122,7 @@ void main() {
     },
   );
 
-  testWidgets('CSV import previews before downloading and reports completion', (
+  testWidgets('CSV import previews metadata merge and reports completion', (
     tester,
   ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.windows;
@@ -2351,7 +3147,8 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.ensureVisible(
+    await _ensureSettingsVisible(
+      tester,
       find.byKey(const ValueKey('settings-card-storage')),
     );
     await tester.tap(find.byKey(const ValueKey('settings-card-storage')));
@@ -2362,7 +3159,19 @@ void main() {
     await tester.tap(importCsv);
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('csv-import-preview')), findsOneWidget);
+    expect(find.text('Importar canciones'), findsOneWidget);
     expect(find.textContaining('1 canciones'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('csv-import-preview')),
+        matching: find.textContaining('sin descargar audio'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('descargar las canciones más adelante'),
+      findsOneWidget,
+    );
 
     await tester.tap(find.byKey(const ValueKey('csv-import-preview-confirm')));
     await tester.pumpAndSettle();
@@ -2371,12 +3180,107 @@ void main() {
       find.byKey(const ValueKey('csv-import-progress-dialog')),
       findsOneWidget,
     );
-    expect(find.textContaining('1 descargadas'), findsOneWidget);
+    expect(find.textContaining('1 importadas'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('csv-import-close')));
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
     debugDefaultTargetPlatformOverride = null;
   });
+
+  testWidgets(
+    'cold-start CSV open asks permission and cancellation imports nothing',
+    (tester) async {
+      _configureView(tester, const Size(430, 900));
+      final incoming = _FakeIncomingCsvFileService();
+      addTearDown(incoming.close);
+      final transfer = _ImmediateCsvTransferController();
+      const file = IncomingCsvFile(
+        path: '/cache/import/Mi playlist.csv',
+        name: 'Mi playlist.csv',
+        source: 'content://files/first',
+        temporary: true,
+      );
+      incoming.controller.add(file);
+      await tester.pumpWidget(
+        _homeHarness(
+          overrides: [
+            incomingCsvFileServiceProvider.overrideWithValue(incoming),
+            libraryCsvTransferControllerProvider.overrideWith(() => transfer),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const ValueKey('csv-import-preview')), findsOneWidget);
+      expect(find.text('Mi playlist.csv'), findsOneWidget);
+      expect(transfer.previewPaths, [file.path]);
+      expect(transfer.importCalls, 0);
+      expect(incoming.released, isEmpty);
+
+      await tester.tap(find.byKey(const ValueKey('csv-import-preview-cancel')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('csv-import-preview')), findsNothing);
+      expect(transfer.importCalls, 0);
+      expect(incoming.released, [file]);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'warm CSV open imports only after confirmation and ignores duplicate opens',
+    (tester) async {
+      _configureView(tester, const Size(430, 900));
+      final incoming = _FakeIncomingCsvFileService();
+      addTearDown(incoming.close);
+      final transfer = _ImmediateCsvTransferController();
+      await tester.pumpWidget(
+        _homeHarness(
+          overrides: [
+            incomingCsvFileServiceProvider.overrideWithValue(incoming),
+            libraryCsvTransferControllerProvider.overrideWith(() => transfer),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      const file = IncomingCsvFile(
+        path: '/cache/import/Favoritas.csv',
+        name: 'Favoritas.csv',
+        source: 'content://files/favorites',
+        temporary: true,
+      );
+      incoming.controller.add(file);
+      incoming.controller.add(
+        IncomingCsvFile(
+          path: file.path,
+          name: file.name,
+          source: file.source,
+          temporary: true,
+          id: 'same-path-duplicate',
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('csv-import-preview')), findsOneWidget);
+      expect(transfer.previewPaths, [file.path]);
+      expect(transfer.importCalls, 0);
+      expect(incoming.released, isEmpty);
+
+      await tester.tap(
+        find.byKey(const ValueKey('csv-import-preview-confirm')),
+      );
+      await tester.pumpAndSettle();
+      expect(transfer.importCalls, 1);
+      expect(
+        find.byKey(const ValueKey('csv-import-progress-dialog')),
+        findsOneWidget,
+      );
+      expect(incoming.released, isEmpty);
+      await tester.tap(find.byKey(const ValueKey('csv-import-close')));
+      await tester.pumpAndSettle();
+      expect(incoming.released, [file]);
+      expect(find.byKey(const ValueKey('csv-import-preview')), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets(
     'storage transfer cards fit a small phone with large accessible text',
@@ -2482,6 +3386,50 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
+  testWidgets('IME frames resize the viewport without rebuilding the shell', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    _configureView(tester, const Size(400, 900));
+    addTearDown(tester.view.resetViewInsets);
+    await tester.pumpWidget(_homeHarness());
+    await tester.pumpAndSettle();
+    final content = find.byKey(const ValueKey('shell-content-stack'));
+    final fullHeight = tester.getSize(content).height;
+    var shellBuilds = 0;
+    final previousObserver = debugOnRebuildDirtyWidget;
+    debugOnRebuildDirtyWidget = (element, builtOnce) {
+      previousObserver?.call(element, builtOnce);
+      if (element.widget is HomePage) shellBuilds++;
+    };
+    addTearDown(() => debugOnRebuildDirtyWidget = previousObserver);
+
+    tester.view.viewInsets = const FakeViewPadding(bottom: 30);
+    await tester.pump();
+    final openingBuilds = shellBuilds;
+    expect(openingBuilds, greaterThan(0));
+    for (final bottom in [100.0, 200.0, 300.0]) {
+      tester.view.viewInsets = FakeViewPadding(bottom: bottom);
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(shellBuilds, openingBuilds);
+    expect(tester.getSize(content).height, fullHeight - 300);
+
+    for (final bottom in [200.0, 100.0, 30.0]) {
+      tester.view.viewInsets = FakeViewPadding(bottom: bottom);
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(shellBuilds, openingBuilds);
+    tester.view.resetViewInsets();
+    await tester.pumpAndSettle();
+    expect(shellBuilds, openingBuilds + 1);
+    expect(tester.getSize(content).height, fullHeight);
+    expect(tester.takeException(), isNull);
+    debugOnRebuildDirtyWidget = previousObserver;
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   testWidgets('main tab transition respects reduced motion', (tester) async {
     await tester.pumpWidget(_homeHarness(disableAnimations: true));
     await tester.pumpAndSettle();
@@ -2528,7 +3476,7 @@ void main() {
         find.descendant(of: card, matching: find.byType(LiquidGlassSurface)),
         findsNothing,
       );
-      expect(_outerMaterial(tester, card).color?.a, 1);
+      expect(_sectionCard(tester, card).color?.a, closeTo(0.88, 0.001));
     }
   });
 }
@@ -2544,6 +3492,20 @@ void _configureView(WidgetTester tester, Size size) {
   });
 }
 
+Future<void> _ensureSettingsVisible(WidgetTester tester, Finder target) async {
+  final scrollable = find
+      .descendant(
+        of: find.byKey(const ValueKey('settings-root')),
+        matching: find.byType(Scrollable),
+      )
+      .first;
+  if (target.evaluate().isEmpty) {
+    await tester.scrollUntilVisible(target, 220, scrollable: scrollable);
+  }
+  await tester.ensureVisible(target);
+  await tester.pumpAndSettle();
+}
+
 Widget _settingsHarness({
   required SettingsNavigationController navigationController,
   List<Override> overrides = const [],
@@ -2551,16 +3513,22 @@ Widget _settingsHarness({
   bool active = true,
   SurfaceBackgroundMode surfaceBackgroundMode = SurfaceBackgroundMode.accent,
   SettingsController Function()? settingsControllerBuilder,
+  TargetPlatform? platform,
+  AppLanguage language = AppLanguage.spanish,
+  bool skipSilenceAvailable = true,
 }) {
   return ProviderScope(
     overrides: [
       ..._providerOverrides(
         settingsControllerBuilder: settingsControllerBuilder,
+        language: language,
       ),
+      skipSilenceAvailableProvider.overrideWithValue(skipSilenceAvailable),
       ...overrides,
     ],
     child: MaterialApp(
       theme: ThemeData(
+        platform: platform,
         extensions: [AppSurfaceTheme(backgroundMode: surfaceBackgroundMode)],
       ),
       builder: disableAnimations
@@ -2579,7 +3547,10 @@ Widget _settingsHarness({
   );
 }
 
-Widget _homeHarness({bool disableAnimations = false}) {
+Widget _homeHarness({
+  bool disableAnimations = false,
+  List<Override> overrides = const [],
+}) {
   return ProviderScope(
     overrides: [
       ..._providerOverrides(),
@@ -2600,6 +3571,7 @@ Widget _homeHarness({bool disableAnimations = false}) {
       incomingTrackLinkServiceProvider.overrideWithValue(
         const _EmptyIncomingTrackLinkService(),
       ),
+      ...overrides,
     ],
     child: MaterialApp(
       builder: disableAnimations
@@ -2622,12 +3594,13 @@ final class _EmptyIncomingTrackLinkService implements IncomingTrackLinkService {
 
 List<Override> _providerOverrides({
   SettingsController Function()? settingsControllerBuilder,
+  AppLanguage language = AppLanguage.spanish,
 }) {
   return [
     settingsControllerProvider.overrideWith(
       settingsControllerBuilder ?? _FixedSettingsController.new,
     ),
-    appStringsProvider.overrideWithValue(const AppStrings(AppLanguage.spanish)),
+    appStringsProvider.overrideWithValue(AppStrings(language)),
     tiktokLiveControllerProvider.overrideWith(_IdleTikTokLiveController.new),
     youtubeMusicSessionStoreProvider.overrideWithValue(
       const _AnonymousYouTubeMusicSessionStore(),
@@ -2652,9 +3625,9 @@ Color _activeColor(WidgetTester tester) {
   return Theme.of(context).colorScheme.primary;
 }
 
-Material _outerMaterial(WidgetTester tester, Finder surface) {
-  return tester.widget<Material>(
-    find.descendant(of: surface, matching: find.byType(Material)).first,
+Card _sectionCard(WidgetTester tester, Finder row) {
+  return tester.widget<Card>(
+    find.ancestor(of: row, matching: find.byType(Card)).first,
   );
 }
 
@@ -2684,9 +3657,34 @@ class _FixedSettingsController extends SettingsController {
   }
 
   @override
+  Future<void> setAppBackgroundPhoto(File file) async {
+    final current = await future;
+    state = AsyncData(
+      current.copyWith(
+        appBackgroundFileName: 'background_1_1.jpg',
+        appBackgroundPath: file.path,
+      ),
+    );
+  }
+
+  @override
+  Future<void> clearAppBackgroundPhoto() async {
+    final current = await future;
+    state = AsyncData(
+      current.copyWith(appBackgroundFileName: null, appBackgroundPath: null),
+    );
+  }
+
+  @override
   Future<void> setPlayerStyle(PlayerStyle style) async {
     final current = await future;
     state = AsyncData(current.copyWith(playerStyle: style));
+  }
+
+  @override
+  Future<void> setPlayerFont(PlayerFont font) async {
+    final current = await future;
+    state = AsyncData(current.copyWith(playerFont: font));
   }
 
   @override
@@ -2826,6 +3824,7 @@ class _IdlePlayerController extends PlayerController {
 
 class _ImmediateCsvTransferController extends LibraryCsvTransferController {
   int importCalls = 0;
+  final List<String> previewPaths = [];
 
   static const document = LibraryCsvDocument(
     tracks: [
@@ -2843,6 +3842,7 @@ class _ImmediateCsvTransferController extends LibraryCsvTransferController {
 
   @override
   Future<LibraryCsvDocument> preview(String path) async {
+    previewPaths.add(path);
     state = const LibraryCsvTransferState(
       phase: LibraryCsvTransferPhase.completed,
       document: document,
@@ -2858,7 +3858,7 @@ class _ImmediateCsvTransferController extends LibraryCsvTransferController {
     const result = LibraryCsvImportResult(
       total: 1,
       processed: 1,
-      downloaded: 1,
+      imported: 1,
       reused: 0,
       failed: 0,
       playlistsUpdated: 1,
@@ -2872,6 +3872,22 @@ class _ImmediateCsvTransferController extends LibraryCsvTransferController {
     );
     return result;
   }
+}
+
+class _FakeIncomingCsvFileService implements IncomingCsvFileService {
+  final controller = StreamController<IncomingCsvFile>();
+  final List<IncomingCsvFile> released = [];
+
+  @override
+  Stream<IncomingCsvFile> get files => controller.stream;
+
+  @override
+  Future<void> release(IncomingCsvFile file) async => released.add(file);
+
+  @override
+  void dispose() {}
+
+  Future<void> close() => controller.close();
 }
 
 class _PublishingCsvTransferController extends LibraryCsvTransferController {

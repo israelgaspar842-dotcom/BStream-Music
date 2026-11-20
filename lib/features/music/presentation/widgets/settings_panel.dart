@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'player_lyrics_icon.dart';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -19,17 +21,36 @@ import '../../../../platform_channels/android_file_export_channel.dart';
 import '../../../../platform_channels/android_supported_links_settings_channel.dart';
 import '../../../../platform_channels/ios_file_export_channel.dart';
 import '../../../../services/app_update/github_release_checker.dart';
+import '../../../../services/audio_sources/audio_source_policy.dart';
 import '../../../../services/live/tiktok_live_command_service.dart';
-import '../../../../services/storage/library_csv_import_service.dart';
 import '../../../../services/storage/library_csv_service.dart';
 import '../providers/live_overlay_controller.dart';
 import '../providers/music_providers.dart';
 import 'app_update_dialog.dart';
+import 'equalizer_settings_page.dart';
+import 'library_csv_import_dialog.dart';
 import 'lyrics_animation_transition.dart';
+import 'lyrics_background_selector.dart';
+import 'live_widget_style_settings.dart';
 import 'scrolled_under_tab_frame.dart';
+import 'player_style_gallery.dart';
+import 'youtube_music_settings_account_card.dart';
 
 typedef DownloadDirectoryPicker =
     Future<String?> Function({String? dialogTitle, String? initialDirectory});
+
+bool _usesSingleAudioQuality(BuildContext context) =>
+    AppPlatform.isDesktop &&
+    !AppPlatform.isMobileTargetPlatform(Theme.of(context).platform);
+
+enum _AudioQualitySetting { wifi, mobile, downloads }
+
+double _settingsContentMaxWidth(BuildContext context, double compactWidth) {
+  final desktopLayout =
+      AppPlatform.isDesktop &&
+      Theme.of(context).platform != TargetPlatform.android;
+  return desktopLayout ? double.infinity : compactWidth;
+}
 
 final downloadDirectoryPickerProvider = Provider<DownloadDirectoryPicker>((
   ref,
@@ -65,6 +86,30 @@ final storageImportFilePickerProvider = Provider<StorageImportFilePicker>((
   };
 });
 
+typedef AppBackgroundPhotoPicker = Future<File?> Function();
+
+final appBackgroundPhotoPickerProvider = Provider<AppBackgroundPhotoPicker>((
+  ref,
+) {
+  return () async {
+    if (AppPlatform.isMobile) {
+      final selected = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 2048,
+        maxHeight: 2048,
+        imageQuality: 88,
+      );
+      return selected == null ? null : File(selected.path);
+    }
+    final selected = await FilePicker.pickFile(
+      type: FileType.image,
+      windowsOptions: const WindowsOptions(lockParentWindow: true),
+      linuxOptions: const LinuxOptions(lockParentWindow: true),
+    );
+    return selected?.path == null ? null : File(selected!.path!);
+  };
+});
+
 typedef SettingsExternalLauncher = Future<bool> Function(Uri url);
 
 final settingsExternalLauncherProvider = Provider<SettingsExternalLauncher>(
@@ -76,7 +121,9 @@ typedef SettingsReleaseChecker =
     Future<AppReleaseCheckResult> Function({required String currentVersion});
 
 final settingsReleaseCheckerProvider = Provider<SettingsReleaseChecker>((ref) {
-  final checker = GitHubReleaseChecker();
+  final checker = GitHubReleaseChecker(
+    repository: AppConstants.updateRepository,
+  );
   Future<AppReleaseCheckResult>? pendingCheck;
   return ({required currentVersion}) {
     return pendingCheck ??= checker
@@ -100,7 +147,19 @@ final settingsSupportedLinksLauncherProvider =
       return channel.open;
     });
 
-enum _SettingsRoute { root, appearance, lyrics, storage, live, about }
+enum _SettingsRoute {
+  root,
+  appearance,
+  playerStyles,
+  liveWidget,
+  lyrics,
+  lyricsProviders,
+  storage,
+  audioSources,
+  dataSaving,
+  live,
+  about,
+}
 
 const double _settingsRootCardHorizontalPadding = 6.0;
 
@@ -219,13 +278,17 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         : const Duration(milliseconds: 220);
 
     Widget routeFrame(Widget body, {List<Widget>? rootSlivers}) {
+      if (_route == _SettingsRoute.playerStyles) return body;
       final header = _SettingsHeader(
         route: _route,
         title: _routeTitle(_route, strings),
         strings: strings,
-        onBack: _goRoot,
+        onBack: _goBack,
       );
       if (_route != _SettingsRoute.root) {
+        final desktopLayout =
+            AppPlatform.isDesktop &&
+            Theme.of(context).platform != TargetPlatform.android;
         return ScrolledUnderTabFrame(
           surfaceKey: ValueKey('settings-detail-header-surface-${_route.name}'),
           scrollKey: ValueKey('settings-detail-scroll-${_route.name}'),
@@ -241,9 +304,14 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
               sliver: SliverToBoxAdapter(
                 child: Align(
                   alignment: Alignment.topLeft,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 760),
-                    child: body,
+                  child: SizedBox(
+                    width: desktopLayout ? double.infinity : null,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: desktopLayout ? double.infinity : 760,
+                      ),
+                      child: body,
+                    ),
                   ),
                 ),
               ),
@@ -325,7 +393,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     if (!_canPop) {
       return false;
     }
-    _goRoot();
+    _goBack();
     return true;
   }
 
@@ -337,11 +405,18 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     widget.navigationController?._routeChanged();
   }
 
-  void _goRoot() {
+  void _goBack() {
     if (_route == _SettingsRoute.root) {
       return;
     }
-    setState(() => _route = _SettingsRoute.root);
+    setState(() {
+      _route = switch (_route) {
+        _SettingsRoute.liveWidget ||
+        _SettingsRoute.playerStyles => _SettingsRoute.appearance,
+        _SettingsRoute.lyricsProviders => _SettingsRoute.lyrics,
+        _ => _SettingsRoute.root,
+      };
+    });
     widget.navigationController?._routeChanged();
   }
 
@@ -349,8 +424,13 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     return switch (route) {
       _SettingsRoute.root => strings.settings,
       _SettingsRoute.appearance => strings.appearance,
+      _SettingsRoute.playerStyles => strings.playerStyles,
+      _SettingsRoute.liveWidget => strings.liveWidget,
       _SettingsRoute.lyrics => strings.lyricsAppearance,
+      _SettingsRoute.lyricsProviders => strings.lyricsProviders,
       _SettingsRoute.storage => strings.storage,
+      _SettingsRoute.audioSources => strings.audioSources,
+      _SettingsRoute.dataSaving => strings.dataSaving,
       _SettingsRoute.live => strings.liveConnection,
       _SettingsRoute.about => strings.aboutApplication,
     };
@@ -367,7 +447,16 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         themeMode: state.themeMode,
         accent: state.accent,
         surfaceBackgroundMode: state.surfaceBackgroundMode,
+        appBackgroundPath: state.appBackgroundPath,
+        playerFont: state.playerFont,
+        liveWidgetStyle: state.liveWidgetStyle,
+        onOpenLiveWidget:
+            AppPlatform.isDesktop &&
+                !AppPlatform.isMobileTargetPlatform(Theme.of(context).platform)
+            ? () => _openRoute(_SettingsRoute.liveWidget)
+            : null,
         playerStyle: state.playerStyle,
+        showAudioQuality: state.showAudioQuality,
         animatedArtworkEnabled: state.animatedArtworkEnabled,
         playerArtworkStyle: state.playerArtworkStyle,
         appleAnimatedArtworkEnabled: state.appleAnimatedArtworkEnabled,
@@ -382,8 +471,19 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         onSurfaceBackgroundModeChanged: (mode) => ref
             .read(settingsControllerProvider.notifier)
             .setSurfaceBackgroundMode(mode),
-        onPlayerStyleChanged: (style) =>
-            ref.read(settingsControllerProvider.notifier).setPlayerStyle(style),
+        onPickAppBackgroundPhoto: ref.read(appBackgroundPhotoPickerProvider),
+        onAppBackgroundPhotoSelected: (file) => ref
+            .read(settingsControllerProvider.notifier)
+            .setAppBackgroundPhoto(file),
+        onAppBackgroundCleared: () => ref
+            .read(settingsControllerProvider.notifier)
+            .clearAppBackgroundPhoto(),
+        onPlayerFontChanged: (font) =>
+            ref.read(settingsControllerProvider.notifier).setPlayerFont(font),
+        onOpenPlayerStyles: () => _openRoute(_SettingsRoute.playerStyles),
+        onShowAudioQualityChanged: (enabled) => ref
+            .read(settingsControllerProvider.notifier)
+            .setShowAudioQuality(enabled),
         onAnimatedArtworkEnabledChanged: (enabled) => ref
             .read(settingsControllerProvider.notifier)
             .setAnimatedArtworkEnabled(enabled),
@@ -403,8 +503,35 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
             .read(settingsControllerProvider.notifier)
             .setMiniPlayerBackgroundMode(mode),
       ),
+      _SettingsRoute.playerStyles => PlayerStyleGalleryPage(
+        style: state.playerStyle,
+        strings: strings,
+        header: _SettingsHeader(
+          route: _SettingsRoute.playerStyles,
+          title: strings.playerStyles,
+          strings: strings,
+          onBack: _goBack,
+        ),
+        bottomContentPadding: widget.bottomContentPadding,
+        onChanged: (style) async {
+          await ref
+              .read(settingsControllerProvider.notifier)
+              .setPlayerStyle(style);
+        },
+      ),
+      _SettingsRoute.liveWidget => LiveWidgetStyleSettings(
+        style: state.liveWidgetStyle,
+        accent: state.accent,
+        strings: strings,
+        onChanged: (style) => ref
+            .read(settingsControllerProvider.notifier)
+            .setLiveWidgetStyle(style),
+      ),
       _SettingsRoute.lyrics => _LyricsAppearanceSettings(
+        enabledProviders: state.enabledLyricsProviders,
+        onOpenProviders: () => _openRoute(_SettingsRoute.lyricsProviders),
         animationStyle: state.lyricsAnimationStyle,
+        backgroundStyle: state.lyricsBackgroundStyle,
         alignment: state.lyricsTextAlignment,
         romanizationEnabled: state.lyricsRomanizationEnabled,
         romanizationLanguages: state.lyricsRomanizationLanguages,
@@ -412,6 +539,9 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         onAnimationChanged: (style) => ref
             .read(settingsControllerProvider.notifier)
             .setLyricsAnimationStyle(style),
+        onBackgroundChanged: (style) => ref
+            .read(settingsControllerProvider.notifier)
+            .setLyricsBackgroundStyle(style),
         onAlignmentChanged: (alignment) => ref
             .read(settingsControllerProvider.notifier)
             .setLyricsTextAlignment(alignment),
@@ -421,6 +551,26 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         onRomanizationLanguagesChanged: (languages) => ref
             .read(settingsControllerProvider.notifier)
             .setLyricsRomanizationLanguages(languages),
+      ),
+      _SettingsRoute.lyricsProviders => _LyricsProvidersSettings(
+        enabledProviders: state.enabledLyricsProviders,
+        strings: strings,
+        onChanged: (provider, enabled) => ref
+            .read(settingsControllerProvider.notifier)
+            .toggleLyricsProvider(provider, enabled),
+      ),
+      _SettingsRoute.audioSources => _AudioSourcesSettings(
+        jioSaavnEnabled: state.jioSaavnEnabled,
+        strings: strings,
+        onJioSaavnChanged: (enabled) => ref
+            .read(settingsControllerProvider.notifier)
+            .setJioSaavnEnabled(enabled),
+      ),
+      _SettingsRoute.dataSaving => _DataSavingSettings(
+        state: state,
+        strings: strings,
+        singleProfile: _usesSingleAudioQuality(context),
+        onQualityTap: _chooseAudioQuality,
       ),
       _SettingsRoute.storage => _StorageSettings(
         strings: strings,
@@ -489,6 +639,13 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         ),
         sliver: SliverList.list(
           children: [
+            Padding(
+              padding: const EdgeInsets.only(bottom: appSectionGap),
+              child: YouTubeMusicSettingsAccountCard(
+                strings: strings,
+                active: widget.active,
+              ),
+            ),
             _SettingsGroup(
               titleKey: const ValueKey('settings-first-section-title'),
               title: strings.general,
@@ -497,9 +654,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
                   key: const ValueKey('settings-card-language'),
                   icon: Icons.language_rounded,
                   title: strings.language,
-                  subtitle: state.language == AppLanguage.spanish
-                      ? strings.spanish
-                      : strings.english,
+                  subtitle: state.language.label,
                   onTap: () => _chooseLanguage(
                     currentLanguage: state.language,
                     strings: strings,
@@ -523,7 +678,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
                 const SizedBox(height: appCardGap),
                 _SettingsEntryCard(
                   key: const ValueKey('settings-card-lyrics-appearance'),
-                  icon: Icons.lyrics_rounded,
+                  leading: const PlayerLyricsIcon(),
                   title: strings.lyrics,
                   subtitle:
                       '${strings.lyricsAnimationLabel(state.lyricsAnimationStyle)}'
@@ -536,6 +691,16 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
             _SettingsGroup(
               title: strings.playback,
               children: [
+                if (supportsEqualizerSettings(context)) ...[
+                  _SettingsEntryCard(
+                    key: const ValueKey('settings-card-equalizer'),
+                    icon: Icons.equalizer_rounded,
+                    title: strings.equalizer,
+                    subtitle: strings.equalizerSummary,
+                    onTap: () => unawaited(showEqualizerSettings(context)),
+                  ),
+                  const SizedBox(height: appCardGap),
+                ],
                 KeyedSubtree(
                   key: const ValueKey('settings-inline-timer'),
                   child: _SleepTimerSettingsScope(
@@ -561,6 +726,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
                   _SkipSilenceSettings(
                     key: const ValueKey('settings-inline-skip-silence'),
                     enabled: state.skipSilenceEnabled,
+                    available: ref.watch(skipSilenceAvailableProvider),
                     strings: strings,
                     onEnabledChanged: ref
                         .read(settingsControllerProvider.notifier)
@@ -619,6 +785,14 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
               title: strings.storage,
               children: [
                 _SettingsEntryCard(
+                  key: const ValueKey('storage-data-saving'),
+                  icon: Icons.data_saver_on_rounded,
+                  title: strings.dataSaving,
+                  subtitle: strings.dataSavingSummary,
+                  onTap: () => _openRoute(_SettingsRoute.dataSaving),
+                ),
+                const SizedBox(height: appCardGap),
+                _SettingsEntryCard(
                   key: const ValueKey('settings-card-storage'),
                   icon: Icons.storage_rounded,
                   title: strings.backupAndRestore,
@@ -640,55 +814,62 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
                 ),
               ],
             ),
-            if (showSupportedLinks || supportsTikTokLive)
-              Consumer(
-                builder: (context, scopedRef, _) {
-                  final tiktokLive = supportsTikTokLive
-                      ? scopedRef.watch(tiktokLiveControllerProvider)
-                      : null;
-                  final liveState = tiktokLive?.value;
-                  return _SettingsGroup(
-                    title: strings.integrations,
-                    children: [
-                      if (showSupportedLinks)
-                        _SettingsEntryCard(
-                          key: const ValueKey('settings-card-supported-links'),
-                          icon: Icons.link_rounded,
-                          title: strings.supportedLinks,
-                          subtitle: strings.supportedLinksSummary,
-                          onTap: _openSupportedLinksSettings,
-                        ),
-                      if (showSupportedLinks && tiktokLive != null)
-                        const SizedBox(height: appCardGap),
-                      if (tiktokLive != null) ...[
-                        _SettingsEntryCard(
-                          key: const ValueKey('settings-card-live'),
-                          icon: Icons.live_tv_rounded,
-                          title: strings.liveConnection,
-                          subtitle:
-                              liveState?.message ??
-                              strings.liveConnectionSummary,
-                          status: switch (liveState?.status) {
-                            TikTokLiveStatus.connected => true,
-                            TikTokLiveStatus.error ||
-                            TikTokLiveStatus.liveEnded => false,
-                            _ => null,
-                          },
-                          onTap: () => _openRoute(_SettingsRoute.live),
-                        ),
-                        const SizedBox(height: appCardGap),
-                        _LiveRequestStorageCard(
-                          state: liveState,
-                          strings: strings,
-                          onChanged: (value) => scopedRef
-                              .read(tiktokLiveControllerProvider.notifier)
-                              .setSaveRequestsToLibrary(value),
-                        ),
-                      ],
+            Consumer(
+              builder: (context, scopedRef, _) {
+                final tiktokLive = supportsTikTokLive
+                    ? scopedRef.watch(tiktokLiveControllerProvider)
+                    : null;
+                final liveState = tiktokLive?.value;
+                return _SettingsGroup(
+                  title: strings.integrations,
+                  children: [
+                    _SettingsEntryCard(
+                      key: const ValueKey('settings-card-audio-sources'),
+                      icon: Icons.library_music_rounded,
+                      title: strings.audioSources,
+                      subtitle: strings.audioSourcesSummary,
+                      onTap: () => _openRoute(_SettingsRoute.audioSources),
+                    ),
+                    if (showSupportedLinks || tiktokLive != null)
+                      const SizedBox(height: appCardGap),
+                    if (showSupportedLinks)
+                      _SettingsEntryCard(
+                        key: const ValueKey('settings-card-supported-links'),
+                        icon: Icons.link_rounded,
+                        title: strings.supportedLinks,
+                        subtitle: strings.supportedLinksSummary,
+                        onTap: _openSupportedLinksSettings,
+                      ),
+                    if (showSupportedLinks && tiktokLive != null)
+                      const SizedBox(height: appCardGap),
+                    if (tiktokLive != null) ...[
+                      _SettingsEntryCard(
+                        key: const ValueKey('settings-card-live'),
+                        icon: Icons.live_tv_rounded,
+                        title: strings.liveConnection,
+                        subtitle:
+                            liveState?.message ?? strings.liveConnectionSummary,
+                        status: switch (liveState?.status) {
+                          TikTokLiveStatus.connected => true,
+                          TikTokLiveStatus.error ||
+                          TikTokLiveStatus.liveEnded => false,
+                          _ => null,
+                        },
+                        onTap: () => _openRoute(_SettingsRoute.live),
+                      ),
+                      const SizedBox(height: appCardGap),
+                      _LiveRequestStorageCard(
+                        state: liveState,
+                        strings: strings,
+                        onChanged: (value) => scopedRef
+                            .read(tiktokLiveControllerProvider.notifier)
+                            .setSaveRequestsToLibrary(value),
+                      ),
                     ],
-                  );
-                },
-              ),
+                  ],
+                );
+              },
+            ),
             _SettingsGroup(
               title: strings.applicationInformation,
               children: [
@@ -770,6 +951,56 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
       return;
     }
     await ref.read(settingsControllerProvider.notifier).setLanguage(selected);
+  }
+
+  Future<void> _chooseAudioQuality(_AudioQualitySetting setting) async {
+    final state = ref.read(settingsControllerProvider).value;
+    if (state == null) return;
+    final strings = ref.read(appStringsProvider);
+    final (title, saved) = switch (setting) {
+      _AudioQualitySetting.wifi => (
+        _usesSingleAudioQuality(context)
+            ? strings.audioQuality
+            : strings.wifiNetwork,
+        state.wifiAudioQuality,
+      ),
+      _AudioQualitySetting.mobile => (
+        strings.mobileNetwork,
+        state.mobileAudioQuality,
+      ),
+      _AudioQualitySetting.downloads => (
+        strings.downloadAudioQuality,
+        state.downloadAudioQuality,
+      ),
+    };
+    final selected = await showAppDialog<AudioQualityProfile>(
+      context: context,
+      builder: (_) => _AudioQualityProfileDialog(
+        title: title,
+        selected: state.jioSaavnEnabled ? saved : AudioQualityProfile.standard,
+        jioSaavnEnabled: state.jioSaavnEnabled,
+        highQualitySource: setting == _AudioQualitySetting.downloads
+            ? strings.downloadHighQualitySource
+            : 'JioSaavn',
+        strings: strings,
+      ),
+    );
+    if (!mounted || selected == null) return;
+    // The source may be disabled while a dialog is open. Never select an
+    // unavailable provider; the mandatory YouTube Music choice stays usable.
+    final current = ref.read(settingsControllerProvider).value;
+    if (current == null ||
+        (selected == AudioQualityProfile.high && !current.jioSaavnEnabled)) {
+      return;
+    }
+    final controller = ref.read(settingsControllerProvider.notifier);
+    await switch (setting) {
+      _AudioQualitySetting.wifi => controller.setWifiAudioQuality(selected),
+      _AudioQualitySetting.mobile => controller.setMobileAudioQuality(selected),
+      _AudioQualitySetting.downloads => controller.setDownloadAudioQuality(
+        selected,
+      ),
+    };
   }
 
   Future<void> _chooseLocalMusicFilters({
@@ -1074,44 +1305,25 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
         throw const FormatException('No se pudo leer el archivo seleccionado.');
       }
 
-      final controller = ref.read(
-        libraryCsvTransferControllerProvider.notifier,
-      );
-      controller.reset();
-      final document = await controller.preview(path);
       if (!mounted) return;
-      final confirmed = await showAppDialog<bool>(
-        context: context,
-        builder: (dialogContext) => _CsvImportPreviewDialog(
-          document: document,
-          strings: strings,
-          onCancel: () => Navigator.of(dialogContext).pop(false),
-          onConfirm: () => Navigator.of(dialogContext).pop(true),
-        ),
-      );
-      if (!mounted || confirmed != true) {
-        controller.reset();
-        return;
-      }
-
-      await showAppDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) =>
-            _CsvImportProgressDialog(document: document, strings: strings),
-      );
-      controller.reset();
+      await showLibraryCsvImportFlow(context: context, ref: ref, path: path);
     } catch (error) {
-      ref.read(libraryCsvTransferControllerProvider.notifier).reset();
       if (mounted) {
-        _showSnackBar('${strings.csvImportFailed} ${_readableCsvError(error)}');
+        _showSnackBar('${strings.csvImportFailed} ${readableCsvError(error)}');
       }
     } finally {
       if (mounted) setState(() => _backupBusy = false);
     }
   }
 
-  Future<void> _exportCsv() async {
+  Future<void> _exportCsv() => runLibraryCsvTransferFlow(
+    ref: ref,
+    operation: () async {
+      if (mounted) await _exportCsvNow();
+    },
+  );
+
+  Future<void> _exportCsvNow() async {
     if (_backupBusy || ref.read(libraryCsvTransferControllerProvider).isBusy) {
       return;
     }
@@ -1184,7 +1396,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     } catch (error) {
       ref.read(libraryCsvTransferControllerProvider.notifier).reset();
       if (mounted) {
-        _showSnackBar('${strings.csvExportFailed} ${_readableCsvError(error)}');
+        _showSnackBar('${strings.csvExportFailed} ${readableCsvError(error)}');
       }
     } finally {
       try {
@@ -1218,270 +1430,6 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(message)));
-  }
-}
-
-class _CsvImportPreviewDialog extends StatelessWidget {
-  const _CsvImportPreviewDialog({
-    required this.document,
-    required this.strings,
-    required this.onCancel,
-    required this.onConfirm,
-  });
-
-  final LibraryCsvDocument document;
-  final AppStrings strings;
-  final VoidCallback onCancel;
-  final VoidCallback onConfirm;
-
-  @override
-  Widget build(BuildContext context) {
-    return AppAlertDialog(
-      key: const ValueKey('csv-import-preview'),
-      scrollable: true,
-      title: Text(strings.csvImportTitle),
-      content: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 520),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Chip(
-                avatar: const Icon(Icons.table_view_rounded, size: 18),
-                label: Text(_csvDetectedFormatLabel(document.detectedFormat)),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                strings.csvImportPreview(
-                  tracks: document.uniqueTrackCount,
-                  playlists: document.playlistCount,
-                  invalid: document.invalidRowCount,
-                  duplicates: document.duplicateRowCount,
-                ),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    Icons.info_outline_rounded,
-                    size: 20,
-                    color: Theme.of(context).colorScheme.primary,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(strings.csvImportDataNotice)),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-      actions: [
-        TextButton(
-          key: const ValueKey('csv-import-preview-cancel'),
-          onPressed: onCancel,
-          child: Text(strings.cancel),
-        ),
-        FilledButton(
-          key: const ValueKey('csv-import-preview-confirm'),
-          onPressed: onConfirm,
-          child: Text(strings.importAndDownload),
-        ),
-      ],
-    );
-  }
-}
-
-class _CsvImportProgressDialog extends ConsumerStatefulWidget {
-  const _CsvImportProgressDialog({
-    required this.document,
-    required this.strings,
-  });
-
-  final LibraryCsvDocument document;
-  final AppStrings strings;
-
-  @override
-  ConsumerState<_CsvImportProgressDialog> createState() =>
-      _CsvImportProgressDialogState();
-}
-
-class _CsvImportProgressDialogState
-    extends ConsumerState<_CsvImportProgressDialog> {
-  bool _started = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      setState(() => _started = true);
-      unawaited(_runImport());
-    });
-  }
-
-  Future<void> _runImport() async {
-    try {
-      await ref
-          .read(libraryCsvTransferControllerProvider.notifier)
-          .importDocument(widget.document);
-    } catch (_) {
-      // The controller publishes the terminal error for this dialog.
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final transfer = ref.watch(libraryCsvTransferControllerProvider);
-    final progress = transfer.progress;
-    final result = transfer.result;
-    final failed = transfer.phase == LibraryCsvTransferPhase.failed;
-    final completed = result != null;
-    final terminal = failed || completed;
-    final cancelRequested = transfer.cancelRequested;
-
-    return PopScope(
-      canPop: terminal,
-      child: AppAlertDialog(
-        key: const ValueKey('csv-import-progress-dialog'),
-        scrollable: true,
-        title: Text(
-          failed
-              ? widget.strings.csvImportFailed
-              : completed
-              ? widget.strings.csvImportCompleted
-              : widget.strings.csvImporting,
-        ),
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 520),
-          child: SingleChildScrollView(
-            child: _buildContent(
-              context,
-              progress: progress,
-              result: result,
-              error: transfer.error,
-              failed: failed,
-              started: _started,
-              cancelRequested: cancelRequested,
-            ),
-          ),
-        ),
-        actions: [
-          if (!terminal)
-            TextButton(
-              key: const ValueKey('csv-import-request-cancel'),
-              onPressed: cancelRequested
-                  ? null
-                  : () => ref
-                        .read(libraryCsvTransferControllerProvider.notifier)
-                        .requestCancel(),
-              child: Text(
-                cancelRequested
-                    ? widget.strings.csvStopRequested
-                    : widget.strings.stopAfterCurrent,
-              ),
-            ),
-          if (terminal)
-            FilledButton(
-              key: const ValueKey('csv-import-close'),
-              onPressed: () => Navigator.of(context).pop(),
-              child: Text(widget.strings.close),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildContent(
-    BuildContext context, {
-    required LibraryCsvImportProgress? progress,
-    required LibraryCsvImportResult? result,
-    required Object? error,
-    required bool failed,
-    required bool started,
-    required bool cancelRequested,
-  }) {
-    if (result != null) {
-      final details = result.failures.take(3).toList(growable: false);
-      return Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(
-            result.cancelled
-                ? Icons.stop_circle_outlined
-                : Icons.check_circle_rounded,
-            size: 40,
-            color: result.cancelled
-                ? Theme.of(context).colorScheme.tertiary
-                : Theme.of(context).colorScheme.primary,
-          ),
-          const SizedBox(height: 12),
-          Text(
-            widget.strings.csvImportResult(
-              downloaded: result.downloaded,
-              reused: result.reused,
-              failed: result.failed,
-              playlists: result.playlistsUpdated,
-            ),
-          ),
-          if (result.cancelled) ...[
-            const SizedBox(height: 8),
-            Text(widget.strings.csvImportCancelled),
-          ],
-          if (details.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            for (final failure in details)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Text(
-                  '${failure.title}: ${_readableCsvError(failure.message)}',
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              ),
-          ],
-        ],
-      );
-    }
-    if (failed) {
-      return Text(
-        '${widget.strings.csvImportFailed}\n${_readableCsvError(error)}',
-        key: const ValueKey('csv-import-error'),
-        maxLines: 4,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(color: Theme.of(context).colorScheme.error),
-      );
-    }
-
-    final processed = progress?.processed ?? 0;
-    final total = progress?.total ?? widget.document.uniqueTrackCount;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        LinearProgressIndicator(
-          key: const ValueKey('csv-import-progress'),
-          value: started && progress != null ? progress.fraction : null,
-        ),
-        const SizedBox(height: 12),
-        Text(widget.strings.csvImportProgress(processed, total)),
-        if ((progress?.currentTitle ?? '').trim().isNotEmpty) ...[
-          const SizedBox(height: 6),
-          Text(
-            progress!.currentTitle,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-        ],
-        if (cancelRequested) ...[
-          const SizedBox(height: 10),
-          Text(widget.strings.csvStopRequested),
-        ],
-      ],
-    );
   }
 }
 
@@ -1520,7 +1468,7 @@ class _CsvProfileDialog extends StatelessWidget {
                   key: ValueKey(
                     'csv-profile-surface-${options[index].$1.name}',
                   ),
-                  color: AppColors.neutralSurfaceFor(context),
+                  color: AppColors.cardSurfaceFor(context),
                   borderRadius: BorderRadius.circular(appCardRadius),
                   clipBehavior: Clip.antiAlias,
                   child: ListTile(
@@ -1547,35 +1495,8 @@ class _CsvProfileDialog extends StatelessWidget {
   }
 }
 
-String _csvDetectedFormatLabel(LibraryCsvDetectedFormat format) =>
-    switch (format) {
-      LibraryCsvDetectedFormat.bstream => 'BStream',
-      LibraryCsvDetectedFormat.metroList => 'MetroList',
-      LibraryCsvDetectedFormat.harmony => 'Harmony / RiMusic',
-      LibraryCsvDetectedFormat.exportify => 'Exportify',
-      LibraryCsvDetectedFormat.soundiiz => 'Soundiiz',
-      LibraryCsvDetectedFormat.generic => 'CSV',
-    };
-
 String _ensureCsvExtension(String path) =>
     path.toLowerCase().endsWith('.csv') ? path : '$path.csv';
-
-String _readableCsvError(Object? error) {
-  if (error == null) return '';
-  var message = error.toString().trim();
-  message = message.replaceFirst(
-    RegExp(r'^(?:FormatException|Exception|StateError):\s*'),
-    '',
-  );
-  final lines = message
-      .split(RegExp(r'[\r\n]+'))
-      .map((line) => line.trim())
-      .where((line) => line.isNotEmpty)
-      .take(3)
-      .join('\n');
-  final readable = lines.isEmpty ? message : lines;
-  return readable.length <= 600 ? readable : '${readable.substring(0, 597)}...';
-}
 
 class _SettingsHeader extends StatelessWidget {
   const _SettingsHeader({
@@ -1628,6 +1549,33 @@ class _SettingsHeader extends StatelessWidget {
   }
 }
 
+class _SettingsLeadingIcon extends StatelessWidget {
+  const _SettingsLeadingIcon({this.icon, this.child, this.color})
+    : assert(icon != null || child != null);
+
+  final IconData? icon;
+  final Widget? child;
+  final Color? color;
+
+  @override
+  Widget build(BuildContext context) {
+    final highlight = color ?? Theme.of(context).colorScheme.primary;
+    return Container(
+      width: 46,
+      height: 46,
+      decoration: BoxDecoration(
+        color: highlight.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(appListCardIconRadius),
+        border: Border.all(color: highlight.withValues(alpha: 0.24)),
+      ),
+      child: IconTheme.merge(
+        data: IconThemeData(color: highlight, size: 24),
+        child: Center(child: child ?? Icon(icon)),
+      ),
+    );
+  }
+}
+
 class _SettingsEntryCard extends StatelessWidget {
   const _SettingsEntryCard({
     this.icon,
@@ -1654,16 +1602,10 @@ class _SettingsEntryCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final desktopLayout =
+        AppPlatform.isDesktop && theme.platform != TargetPlatform.android;
     final highlight = accent ?? colors.primary;
-    final card = Material(
-      color: AppColors.cardSurfaceFor(context, solidInLiquidGlass: true),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(appCardRadius),
-        side: BorderSide(
-          color: AppColors.cardBorderFor(context, solidInLiquidGlass: true),
-        ),
-      ),
-      clipBehavior: Clip.antiAlias,
+    final card = _SettingsItemSurface(
       child: InkWell(
         onTap: onTap,
         child: ConstrainedBox(
@@ -1672,22 +1614,10 @@ class _SettingsEntryCard extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
             child: Row(
               children: [
-                Container(
-                  width: 46,
-                  height: 46,
-                  decoration: BoxDecoration(
-                    color: highlight.withValues(alpha: 0.14),
-                    borderRadius: BorderRadius.circular(appListCardIconRadius),
-                    border: Border.all(
-                      color: highlight.withValues(alpha: 0.24),
-                    ),
-                  ),
-                  child: IconTheme.merge(
-                    data: IconThemeData(color: highlight, size: 24),
-                    child: Center(
-                      child: leading ?? Icon(icon, color: highlight, size: 24),
-                    ),
-                  ),
+                _SettingsLeadingIcon(
+                  icon: icon,
+                  color: highlight,
+                  child: leading,
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -1738,8 +1668,10 @@ class _SettingsEntryCard extends StatelessWidget {
       ),
     );
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 760),
-      child: AppCardGradientBorder(solidInLiquidGlass: true, child: card),
+      constraints: BoxConstraints(
+        maxWidth: desktopLayout ? double.infinity : 760,
+      ),
+      child: card,
     );
   }
 }
@@ -1757,8 +1689,7 @@ class _AboutApplicationSettings extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return _SettingsSectionPanel(
       children: [
         _SettingsEntryCard(
           key: const ValueKey('settings-about-version'),
@@ -1778,14 +1709,8 @@ class _AboutApplicationSettings extends StatelessWidget {
         _SettingsEntryCard(
           key: const ValueKey('settings-about-whats-new'),
           icon: Icons.auto_awesome_rounded,
-          title: strings.choose(
-            'Novedades de ${AppConstants.appVersion}',
-            "What's new in ${AppConstants.appVersion}",
-          ),
-          subtitle: strings.choose(
-            'Vinilo Clásico, Saltar silencios, letras fluidas y gestos',
-            'Classic Vinyl, smoother lyrics, silence skipping, and gestures',
-          ),
+          title: strings.whatsNewTitle(AppConstants.appVersion),
+          subtitle: strings.whatsNewSummary,
           onTap: () => _showWhatsNew(context),
         ),
         const SizedBox(height: appCardGap),
@@ -1811,31 +1736,12 @@ class _AboutApplicationSettings extends StatelessWidget {
   }
 
   Future<void> _showWhatsNew(BuildContext context) async {
-    final highlights = strings.isEnglish
-        ? const <String>[
-            'Added the Classic Vinyl player with a spinning record and animated tonearm. IVG Music, Apple Music Style, and Classic Vinyl now use responsive landscape layouts.',
-            'Android can now conservatively shorten confirmed prolonged silence in streaming and downloaded songs without disrupting crossfade or quiet musical passages.',
-            'Swipe the mobile mini player left for the next song or right for the previous one, with subtle resisted movement and protection against accidental changes.',
-            'New animated artwork styles are available: Spotify Canvas and Animated Artwork from Apple Music.',
-            'TikTok LIVE connection bootstrap, fallbacks, and bounded retries are now more resilient to transient upstream changes.',
-          ]
-        : const <String>[
-            'Se agregó el reproductor Vinilo Clásico con disco giratorio y aguja animada. IVG Music, Apple Music y Vinilo Clásico ahora usan diseños horizontales adaptables.',
-            'Android ahora puede acortar de forma conservadora los silencios prolongados confirmados en canciones en streaming y descargadas, sin afectar el crossfade ni los pasajes musicales suaves.',
-            'Desliza el mini reproductor móvil hacia la izquierda para avanzar o hacia la derecha para volver, con movimiento sutil y protección contra cambios accidentales.',
-            'Hay nuevos estilos de portadas animadas: Spotify Canvas y Animated Artwork de Apple Music.',
-            'Se reforzaron el inicio de conexión, los fallbacks y los reintentos limitados de TikTok LIVE ante cambios temporales del servicio.',
-          ];
+    final highlights = strings.whatsNewHighlights;
     await showAppDialog<void>(
       context: context,
       builder: (dialogContext) => AppAlertDialog(
         key: const ValueKey('settings-about-whats-new-dialog'),
-        title: Text(
-          strings.choose(
-            'Novedades de ${AppConstants.appVersion}',
-            "What's new in ${AppConstants.appVersion}",
-          ),
-        ),
+        title: Text(strings.whatsNewTitle(AppConstants.appVersion)),
         content: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 480),
           child: SingleChildScrollView(
@@ -1900,21 +1806,19 @@ class _LanguageSelectorDialog extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            _SettingsDialogOption(
-              key: const ValueKey('settings-language-option-spanish'),
-              selected: language == AppLanguage.spanish,
-              icon: Icons.language_rounded,
-              label: strings.spanish,
-              onTap: () => Navigator.of(context).pop(AppLanguage.spanish),
-            ),
-            const SizedBox(height: 8),
-            _SettingsDialogOption(
-              key: const ValueKey('settings-language-option-english'),
-              selected: language == AppLanguage.english,
-              icon: Icons.translate_rounded,
-              label: strings.english,
-              onTap: () => Navigator.of(context).pop(AppLanguage.english),
-            ),
+            for (var index = 0; index < AppLanguage.values.length; index++) ...[
+              if (index > 0) const SizedBox(height: 8),
+              _SettingsDialogOption(
+                key: ValueKey(
+                  'settings-language-option-${AppLanguage.values[index].name}',
+                ),
+                selected: language == AppLanguage.values[index],
+                icon: Icons.language_rounded,
+                label: AppLanguage.values[index].label,
+                onTap: () =>
+                    Navigator.of(context).pop(AppLanguage.values[index]),
+              ),
+            ],
           ],
         ),
       ),
@@ -1955,8 +1859,10 @@ class _SettingsDialogOption extends StatelessWidget {
       excludeSemantics: true,
       child: Material(
         color: selected
-            ? colors.primaryContainer.withValues(alpha: 0.72)
-            : colors.surfaceContainerHighest.withValues(alpha: 0.72),
+            ? colors.primaryContainer.withValues(
+                alpha: AppColors.cardSurfaceOpacityFor(context),
+              )
+            : AppColors.cardSurfaceFor(context),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(appListCardIconRadius),
           side: BorderSide(
@@ -2015,60 +1921,150 @@ class _SettingsDialogOption extends StatelessWidget {
   }
 }
 
-class _PlayerStyleSelectorDialog extends StatelessWidget {
-  const _PlayerStyleSelectorDialog({
-    required this.style,
-    required this.strings,
-  });
+class _PlayerFontSelectorDialog extends StatefulWidget {
+  const _PlayerFontSelectorDialog({required this.font, required this.strings});
 
-  final PlayerStyle style;
+  final PlayerFont font;
   final AppStrings strings;
+
+  @override
+  State<_PlayerFontSelectorDialog> createState() =>
+      _PlayerFontSelectorDialogState();
+}
+
+class _PlayerFontSelectorDialogState extends State<_PlayerFontSelectorDialog> {
+  late PlayerFont selected = widget.font;
 
   @override
   Widget build(BuildContext context) {
     return AppAlertDialog(
-      key: const ValueKey('settings-player-style-dialog'),
+      key: const ValueKey('settings-player-font-dialog'),
       scrollable: true,
       insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-      title: Text(strings.player),
+      title: Text(widget.strings.playerFont),
       content: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 420),
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _SettingsDialogOption(
-              key: const ValueKey('settings-player-style-option-bstream-music'),
-              selected: style == PlayerStyle.bstreamMusic,
-              icon: Icons.graphic_eq_rounded,
-              label: strings.playerStyleBStreamMusic,
-              onTap: () => Navigator.of(context).pop(PlayerStyle.bstreamMusic),
-            ),
-            const SizedBox(height: 8),
-            _SettingsDialogOption(
-              key: const ValueKey('settings-player-style-option-apple-music'),
-              selected: style == PlayerStyle.appleMusic,
-              icon: Icons.music_note_rounded,
-              label: strings.playerStyleAppleMusic,
-              onTap: () => Navigator.of(context).pop(PlayerStyle.appleMusic),
-            ),
-            const SizedBox(height: 8),
-            _SettingsDialogOption(
-              key: const ValueKey('settings-player-style-option-classic-vinyl'),
-              selected: style == PlayerStyle.classicVinyl,
-              icon: Icons.album_rounded,
-              label: strings.playerStyleClassicVinyl,
-              onTap: () => Navigator.of(context).pop(PlayerStyle.classicVinyl),
-            ),
+            for (final font in PlayerFont.values) ...[
+              if (font != PlayerFont.current) const SizedBox(height: 8),
+              _PlayerFontOption(
+                key: ValueKey('settings-player-font-option-${font.code}'),
+                font: font,
+                selected: selected == font,
+                strings: widget.strings,
+                onTap: () => setState(() => selected = font),
+              ),
+            ],
           ],
         ),
       ),
       actions: [
         TextButton(
-          key: const ValueKey('settings-player-style-cancel'),
           onPressed: () => Navigator.of(context).pop(),
-          child: Text(strings.cancel),
+          child: Text(widget.strings.cancel),
+        ),
+        FilledButton(
+          key: const ValueKey('settings-player-font-apply'),
+          onPressed: () => Navigator.of(context).pop(selected),
+          child: Text(widget.strings.apply),
         ),
       ],
+    );
+  }
+}
+
+class _PlayerFontOption extends StatelessWidget {
+  const _PlayerFontOption({
+    required this.font,
+    required this.selected,
+    required this.strings,
+    required this.onTap,
+    super.key,
+  });
+
+  final PlayerFont font;
+  final bool selected;
+  final AppStrings strings;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: strings.playerFontLabel(font),
+      excludeSemantics: true,
+      child: Material(
+        color: selected
+            ? colors.primaryContainer.withValues(
+                alpha: AppColors.cardSurfaceOpacityFor(context),
+              )
+            : AppColors.cardSurfaceFor(context),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(appListCardIconRadius),
+          side: BorderSide(
+            color: selected ? colors.primary : colors.outlineVariant,
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.text_fields_rounded,
+                  color: selected ? colors.primary : colors.onSurfaceVariant,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        strings.playerFontLabel(font),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontFamily: font.fontFamily,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                          color: selected
+                              ? colors.onPrimaryContainer
+                              : colors.onSurface,
+                        ),
+                      ),
+                      Text(
+                        strings.playerFontDescription(font),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: selected
+                              ? colors.onPrimaryContainer.withValues(alpha: 0.8)
+                              : colors.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Icon(
+                  selected
+                      ? Icons.check_circle_rounded
+                      : Icons.radio_button_unchecked_rounded,
+                  color: selected ? colors.primary : colors.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -2250,6 +2246,59 @@ class _SurfaceBackgroundSelectorDialog extends StatelessWidget {
   }
 }
 
+enum _AppBackgroundChoice { none, custom }
+
+class _AppBackgroundSelectorDialog extends StatelessWidget {
+  const _AppBackgroundSelectorDialog({
+    required this.customSelected,
+    required this.strings,
+  });
+
+  final bool customSelected;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    return AppAlertDialog(
+      key: const ValueKey('settings-app-background-dialog'),
+      scrollable: true,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      title: Text(strings.appBackground),
+      content: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _SettingsDialogOption(
+              key: const ValueKey('settings-app-background-option-none'),
+              selected: !customSelected,
+              icon: Icons.hide_image_rounded,
+              label: strings.appBackgroundNone,
+              onTap: () => Navigator.of(context).pop(_AppBackgroundChoice.none),
+            ),
+            const SizedBox(height: 8),
+            _SettingsDialogOption(
+              key: const ValueKey('settings-app-background-option-custom'),
+              selected: customSelected,
+              icon: Icons.add_photo_alternate_rounded,
+              label: strings.appBackgroundCustom,
+              onTap: () =>
+                  Navigator.of(context).pop(_AppBackgroundChoice.custom),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          key: const ValueKey('settings-app-background-cancel'),
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(strings.cancel),
+        ),
+      ],
+    );
+  }
+}
+
 class _MiniPlayerBackgroundSelectorDialog extends StatelessWidget {
   const _MiniPlayerBackgroundSelectorDialog({
     required this.mode,
@@ -2335,7 +2384,12 @@ class _AppearanceSettings extends StatelessWidget {
     required this.themeMode,
     required this.accent,
     required this.surfaceBackgroundMode,
+    required this.appBackgroundPath,
+    required this.playerFont,
+    required this.liveWidgetStyle,
+    this.onOpenLiveWidget,
     required this.playerStyle,
+    required this.showAudioQuality,
     required this.animatedArtworkEnabled,
     required this.playerArtworkStyle,
     required this.appleAnimatedArtworkEnabled,
@@ -2346,7 +2400,12 @@ class _AppearanceSettings extends StatelessWidget {
     required this.onThemeModeChanged,
     required this.onAccentChanged,
     required this.onSurfaceBackgroundModeChanged,
-    required this.onPlayerStyleChanged,
+    required this.onPickAppBackgroundPhoto,
+    required this.onAppBackgroundPhotoSelected,
+    required this.onAppBackgroundCleared,
+    required this.onPlayerFontChanged,
+    required this.onOpenPlayerStyles,
+    required this.onShowAudioQualityChanged,
     required this.onAnimatedArtworkEnabledChanged,
     required this.onPlayerArtworkStyleChanged,
     required this.onAppleAnimatedArtworkEnabledChanged,
@@ -2358,7 +2417,12 @@ class _AppearanceSettings extends StatelessWidget {
   final AppThemeMode themeMode;
   final AppAccent accent;
   final SurfaceBackgroundMode surfaceBackgroundMode;
+  final String? appBackgroundPath;
+  final PlayerFont playerFont;
+  final LiveWidgetStyle liveWidgetStyle;
+  final VoidCallback? onOpenLiveWidget;
   final PlayerStyle playerStyle;
+  final bool showAudioQuality;
   final bool animatedArtworkEnabled;
   final PlayerArtworkStyle playerArtworkStyle;
   final bool appleAnimatedArtworkEnabled;
@@ -2370,7 +2434,12 @@ class _AppearanceSettings extends StatelessWidget {
   final ValueChanged<AppAccent> onAccentChanged;
   final Future<void> Function(SurfaceBackgroundMode)
   onSurfaceBackgroundModeChanged;
-  final Future<void> Function(PlayerStyle) onPlayerStyleChanged;
+  final AppBackgroundPhotoPicker onPickAppBackgroundPhoto;
+  final Future<void> Function(File) onAppBackgroundPhotoSelected;
+  final Future<void> Function() onAppBackgroundCleared;
+  final Future<void> Function(PlayerFont) onPlayerFontChanged;
+  final VoidCallback onOpenPlayerStyles;
+  final Future<void> Function(bool) onShowAudioQualityChanged;
   final Future<void> Function(bool) onAnimatedArtworkEnabledChanged;
   final Future<void> Function(PlayerArtworkStyle) onPlayerArtworkStyleChanged;
   final Future<void> Function(bool) onAppleAnimatedArtworkEnabledChanged;
@@ -2391,16 +2460,14 @@ class _AppearanceSettings extends StatelessWidget {
     await onMiniPlayerModeChanged(selected);
   }
 
-  Future<void> _choosePlayerStyle(BuildContext context) async {
-    final selected = await showAppDialog<PlayerStyle>(
+  Future<void> _choosePlayerFont(BuildContext context) async {
+    final selected = await showAppDialog<PlayerFont>(
       context: context,
       builder: (_) =>
-          _PlayerStyleSelectorDialog(style: playerStyle, strings: strings),
+          _PlayerFontSelectorDialog(font: playerFont, strings: strings),
     );
-    if (!context.mounted || selected == null || selected == playerStyle) {
-      return;
-    }
-    await onPlayerStyleChanged(selected);
+    if (!context.mounted || selected == null || selected == playerFont) return;
+    await onPlayerFontChanged(selected);
   }
 
   Future<void> _choosePlayerArtworkStyle(BuildContext context) async {
@@ -2435,6 +2502,33 @@ class _AppearanceSettings extends StatelessWidget {
     await onSurfaceBackgroundModeChanged(selected);
   }
 
+  Future<void> _chooseAppBackground(BuildContext context) async {
+    final selected = await showAppDialog<_AppBackgroundChoice>(
+      context: context,
+      builder: (_) => _AppBackgroundSelectorDialog(
+        customSelected: appBackgroundPath != null,
+        strings: strings,
+      ),
+    );
+    if (!context.mounted || selected == null) return;
+    try {
+      if (selected == _AppBackgroundChoice.none) {
+        await onAppBackgroundCleared();
+        return;
+      }
+      final image = await onPickAppBackgroundPhoto();
+      if (image != null) {
+        await onAppBackgroundPhotoSelected(image);
+      }
+    } catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(strings.appBackgroundSelectionFailed)),
+      );
+      debugPrint('Could not select app background: $error');
+    }
+  }
+
   Future<void> _chooseMiniPlayerBackgroundMode(BuildContext context) async {
     final selected = await showAppDialog<MiniPlayerBackgroundMode>(
       context: context,
@@ -2454,233 +2548,256 @@ class _AppearanceSettings extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 520),
+      constraints: BoxConstraints(
+        maxWidth: _settingsContentMaxWidth(context, 520),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            strings.theme,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          SegmentedButton<AppThemeMode>(
-            selected: {themeMode},
-            style: ButtonStyle(
-              minimumSize: WidgetStateProperty.all(const Size(0, 50)),
-              padding: WidgetStateProperty.all(
-                const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              ),
-              textStyle: WidgetStateProperty.all(
-                Theme.of(
-                  context,
-                ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w800),
-              ),
-              iconSize: WidgetStateProperty.all(22),
-            ),
-            segments: [
-              ButtonSegment(
-                value: AppThemeMode.system,
-                icon: const Icon(Icons.settings_suggest_rounded),
-                label: Text(strings.themeSystem),
-              ),
-              ButtonSegment(
-                value: AppThemeMode.light,
-                icon: const Icon(Icons.light_mode_rounded),
-                label: Text(strings.themeLight),
-              ),
-              ButtonSegment(
-                value: AppThemeMode.dark,
-                icon: const Icon(Icons.dark_mode_rounded),
-                label: Text(strings.themeDark),
+          _SettingsSectionPanel(
+            title: strings.theme,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                child: _ThemeModeSelector(
+                  selected: themeMode,
+                  strings: strings,
+                  onChanged: onThemeModeChanged,
+                ),
               ),
             ],
-            onSelectionChanged: (selection) =>
-                onThemeModeChanged(selection.first),
           ),
-          const SizedBox(height: 16),
-          Text(
-            strings.accentColor,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 328),
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final columnCount = constraints.maxWidth < 328 ? 5 : 6;
-                  return GridView.builder(
-                    key: const ValueKey('accent-palette-grid'),
-                    shrinkWrap: true,
-                    primary: false,
-                    physics: const NeverScrollableScrollPhysics(),
-                    padding: EdgeInsets.zero,
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: columnCount,
-                      crossAxisSpacing: 8,
-                      mainAxisSpacing: 8,
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.accentColor,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(0, 6, 0, 12),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 384),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final columnCount =
+                            ((constraints.maxWidth / 48).floor().clamp(1, 8) -
+                                    1)
+                                .clamp(1, 7);
+                        return GridView.builder(
+                          key: const ValueKey('accent-palette-grid'),
+                          shrinkWrap: true,
+                          primary: false,
+                          physics: const NeverScrollableScrollPhysics(),
+                          padding: EdgeInsets.zero,
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: columnCount,
+                              ),
+                          itemCount: AppAccent.values.length,
+                          itemBuilder: (context, index) {
+                            final option = AppAccent.values[index];
+                            return _AccentSwatch(
+                              accent: option,
+                              selected: option == accent,
+                              label: strings.accentLabel(option),
+                              onTap: () => onAccentChanged(option),
+                            );
+                          },
+                        );
+                      },
                     ),
-                    itemCount: AppAccent.values.length,
-                    itemBuilder: (context, index) {
-                      final option = AppAccent.values[index];
-                      return _AccentSwatch(
-                        accent: option,
-                        selected: option == accent,
-                        label: strings.accentLabel(option),
-                        onTap: () => onAccentChanged(option),
-                      );
-                    },
-                  );
-                },
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-          Text(
-            strings.surfaceEffects,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          _SettingsEntryCard(
-            key: const ValueKey('surface-background-selector'),
-            icon: switch (surfaceBackgroundMode) {
-              SurfaceBackgroundMode.accent => Icons.format_color_fill_rounded,
-              SurfaceBackgroundMode.transparent => Icons.blur_on_rounded,
-              SurfaceBackgroundMode.liquidGlass => Icons.water_drop_rounded,
-            },
-            title: strings.surfaceBackground,
-            subtitle: strings.surfaceBackgroundModeLabel(surfaceBackgroundMode),
-            onTap: () => _chooseSurfaceBackgroundMode(context),
-          ),
-          const SizedBox(height: 24),
-          Text(
-            strings.player,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          _SettingsEntryCard(
-            key: const ValueKey('player-style-selector'),
-            icon: switch (playerStyle) {
-              PlayerStyle.bstreamMusic => Icons.graphic_eq_rounded,
-              PlayerStyle.appleMusic => Icons.music_note_rounded,
-              PlayerStyle.classicVinyl => Icons.album_rounded,
-            },
-            title: strings.playerStyle,
-            subtitle: strings.playerStyleLabel(playerStyle),
-            onTap: () => _choosePlayerStyle(context),
-          ),
-          const SizedBox(height: appCardGap),
-          _SettingsEntryCard(
-            key: const ValueKey('animated-artwork-toggle'),
-            icon: Icons.motion_photos_auto_rounded,
-            title: strings.animatedArtwork,
-            subtitle: strings.animatedArtworkDescription,
-            onTap: () =>
-                onAnimatedArtworkEnabledChanged(!animatedArtworkEnabled),
-            trailing: Switch.adaptive(
-              key: const ValueKey('animated-artwork-switch'),
-              value: animatedArtworkEnabled,
-              onChanged: onAnimatedArtworkEnabledChanged,
-            ),
-          ),
-          const SizedBox(height: appCardGap),
-          _SettingsEntryCard(
-            key: const ValueKey('player-artwork-style-selector'),
-            icon: switch (playerArtworkStyle) {
-              PlayerArtworkStyle.classic => Icons.crop_square_rounded,
-              PlayerArtworkStyle.expanded => Icons.aspect_ratio_rounded,
-            },
-            title: strings.playerArtworkStyle,
-            subtitle: strings.playerArtworkStyleLabel(playerArtworkStyle),
-            onTap: () => _choosePlayerArtworkStyle(context),
-          ),
-          const SizedBox(height: appCardGap),
-          _SettingsEntryCard(
-            key: const ValueKey('apple-animated-artwork-toggle'),
-            icon: Icons.live_tv_rounded,
-            title: strings.appleAnimatedArtwork,
-            subtitle: AppPlatform.current == AppPlatformType.linux
-                ? strings.spotifyCanvasUnavailable
-                : strings.appleAnimatedArtworkDescription,
-            onTap: AppPlatform.current == AppPlatformType.linux
-                ? null
-                : () => onAppleAnimatedArtworkEnabledChanged(
-                    !appleAnimatedArtworkEnabled,
                   ),
-            trailing: Switch.adaptive(
-              key: const ValueKey('apple-animated-artwork-switch'),
-              value:
-                  AppPlatform.current != AppPlatformType.linux &&
-                  appleAnimatedArtworkEnabled,
-              onChanged: AppPlatform.current == AppPlatformType.linux
-                  ? null
-                  : onAppleAnimatedArtworkEnabledChanged,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.surfaceEffects,
+            children: [
+              _SettingsEntryCard(
+                key: const ValueKey('surface-background-selector'),
+                icon: switch (surfaceBackgroundMode) {
+                  SurfaceBackgroundMode.accent =>
+                    Icons.format_color_fill_rounded,
+                  SurfaceBackgroundMode.transparent => Icons.blur_on_rounded,
+                  SurfaceBackgroundMode.liquidGlass => Icons.water_drop_rounded,
+                },
+                title: strings.surfaceBackground,
+                subtitle: strings.surfaceBackgroundModeLabel(
+                  surfaceBackgroundMode,
+                ),
+                onTap: () => _chooseSurfaceBackgroundMode(context),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('app-background-selector'),
+                icon: Icons.wallpaper_rounded,
+                title: strings.appBackground,
+                subtitle: appBackgroundPath == null
+                    ? strings.appBackgroundNone
+                    : strings.appBackgroundCustom,
+                onTap: () => _chooseAppBackground(context),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('player-font-selector'),
+                icon: Icons.text_fields_rounded,
+                title: strings.playerFont,
+                subtitle: strings.playerFontLabel(playerFont),
+                onTap: () => _choosePlayerFont(context),
+              ),
+            ],
+          ),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.player,
+            children: [
+              _SettingsEntryCard(
+                key: const ValueKey('player-style-selector'),
+                icon: switch (playerStyle) {
+                  PlayerStyle.bstreamMusic => Icons.graphic_eq_rounded,
+                  PlayerStyle.appleMusic => Icons.music_note_rounded,
+                  PlayerStyle.classicVinyl => Icons.album_rounded,
+                  PlayerStyle.spotifyMusic => Icons.play_circle_rounded,
+                },
+                title: strings.playerStyle,
+                subtitle: strings.playerStyleLabel(playerStyle),
+                onTap: onOpenPlayerStyles,
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('show-audio-quality-toggle'),
+                icon: Icons.high_quality_rounded,
+                title: strings.showAudioQuality,
+                subtitle: strings.showAudioQualityDescription,
+                onTap: () => onShowAudioQualityChanged(!showAudioQuality),
+                trailing: Switch.adaptive(
+                  key: const ValueKey('show-audio-quality-switch'),
+                  value: showAudioQuality,
+                  onChanged: onShowAudioQualityChanged,
+                ),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('animated-artwork-toggle'),
+                icon: Icons.motion_photos_auto_rounded,
+                title: strings.animatedArtwork,
+                subtitle: strings.animatedArtworkDescription,
+                onTap: () =>
+                    onAnimatedArtworkEnabledChanged(!animatedArtworkEnabled),
+                trailing: Switch.adaptive(
+                  key: const ValueKey('animated-artwork-switch'),
+                  value: animatedArtworkEnabled,
+                  onChanged: onAnimatedArtworkEnabledChanged,
+                ),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('player-artwork-style-selector'),
+                icon: switch (playerArtworkStyle) {
+                  PlayerArtworkStyle.classic => Icons.crop_square_rounded,
+                  PlayerArtworkStyle.expanded => Icons.aspect_ratio_rounded,
+                },
+                title: strings.playerArtworkStyle,
+                subtitle: strings.playerArtworkStyleLabel(playerArtworkStyle),
+                onTap: () => _choosePlayerArtworkStyle(context),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('apple-animated-artwork-toggle'),
+                icon: Icons.live_tv_rounded,
+                title: strings.appleAnimatedArtwork,
+                subtitle: AppPlatform.current == AppPlatformType.linux
+                    ? strings.spotifyCanvasUnavailable
+                    : strings.appleAnimatedArtworkDescription,
+                onTap: AppPlatform.current == AppPlatformType.linux
+                    ? null
+                    : () => onAppleAnimatedArtworkEnabledChanged(
+                        !appleAnimatedArtworkEnabled,
+                      ),
+                trailing: Switch.adaptive(
+                  key: const ValueKey('apple-animated-artwork-switch'),
+                  value:
+                      AppPlatform.current != AppPlatformType.linux &&
+                      appleAnimatedArtworkEnabled,
+                  onChanged: AppPlatform.current == AppPlatformType.linux
+                      ? null
+                      : onAppleAnimatedArtworkEnabledChanged,
+                ),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('spotify-canvas-toggle'),
+                icon: Icons.movie_filter_rounded,
+                title: strings.spotifyCanvas,
+                subtitle: AppPlatform.current == AppPlatformType.linux
+                    ? strings.spotifyCanvasUnavailable
+                    : strings.spotifyCanvasDescription,
+                onTap: AppPlatform.current == AppPlatformType.linux
+                    ? null
+                    : () =>
+                          onSpotifyCanvasEnabledChanged(!spotifyCanvasEnabled),
+                trailing: Switch.adaptive(
+                  key: const ValueKey('spotify-canvas-switch'),
+                  value:
+                      AppPlatform.current != AppPlatformType.linux &&
+                      spotifyCanvasEnabled,
+                  onChanged: AppPlatform.current == AppPlatformType.linux
+                      ? null
+                      : onSpotifyCanvasEnabledChanged,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.miniPlayer,
+            children: [
+              _SettingsEntryCard(
+                key: const ValueKey('mini-player-mode-selector'),
+                leading: _MiniPlayerStyleIcon(
+                  key: const ValueKey('mini-player-mode-selector-icon'),
+                  mode: miniPlayerMode,
+                ),
+                title: strings.miniPlayerStyle,
+                subtitle: strings.miniPlayerModeLabel(miniPlayerMode),
+                onTap: () => _chooseMiniPlayerMode(context),
+              ),
+              const SizedBox(height: appCardGap),
+              _SettingsEntryCard(
+                key: const ValueKey('mini-player-background-selector'),
+                icon: switch (miniPlayerBackgroundMode) {
+                  MiniPlayerBackgroundMode.accent =>
+                    Icons.format_color_fill_rounded,
+                  MiniPlayerBackgroundMode.artwork => Icons.image_rounded,
+                  MiniPlayerBackgroundMode.transparent => Icons.blur_on_rounded,
+                  MiniPlayerBackgroundMode.liquidGlass =>
+                    Icons.water_drop_rounded,
+                },
+                title: strings.miniPlayerBackground,
+                subtitle: strings.miniPlayerBackgroundModeLabel(
+                  miniPlayerBackgroundMode,
+                ),
+                onTap: () => _chooseMiniPlayerBackgroundMode(context),
+              ),
+            ],
+          ),
+          const SizedBox(height: appSectionGap),
+          if (onOpenLiveWidget != null) ...[
+            _SettingsSectionPanel(
+              title: strings.liveWidget,
+              children: [
+                _SettingsEntryCard(
+                  key: const ValueKey('live-widget-style-selector'),
+                  icon: Icons.live_tv_rounded,
+                  title: strings.liveWidget,
+                  subtitle: strings.liveWidgetStyleLabel(liveWidgetStyle),
+                  onTap: onOpenLiveWidget,
+                ),
+              ],
             ),
-          ),
-          const SizedBox(height: appCardGap),
-          _SettingsEntryCard(
-            key: const ValueKey('spotify-canvas-toggle'),
-            icon: Icons.movie_filter_rounded,
-            title: strings.spotifyCanvas,
-            subtitle: AppPlatform.current == AppPlatformType.linux
-                ? strings.spotifyCanvasUnavailable
-                : strings.spotifyCanvasDescription,
-            onTap: AppPlatform.current == AppPlatformType.linux
-                ? null
-                : () => onSpotifyCanvasEnabledChanged(!spotifyCanvasEnabled),
-            trailing: Switch.adaptive(
-              key: const ValueKey('spotify-canvas-switch'),
-              value:
-                  AppPlatform.current != AppPlatformType.linux &&
-                  spotifyCanvasEnabled,
-              onChanged: AppPlatform.current == AppPlatformType.linux
-                  ? null
-                  : onSpotifyCanvasEnabledChanged,
-            ),
-          ),
-          const SizedBox(height: 24),
-          Text(
-            strings.miniPlayer,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          _SettingsEntryCard(
-            key: const ValueKey('mini-player-mode-selector'),
-            leading: _MiniPlayerStyleIcon(
-              key: const ValueKey('mini-player-mode-selector-icon'),
-              mode: miniPlayerMode,
-            ),
-            title: strings.miniPlayerStyle,
-            subtitle: strings.miniPlayerModeLabel(miniPlayerMode),
-            onTap: () => _chooseMiniPlayerMode(context),
-          ),
-          const SizedBox(height: appCardGap),
-          _SettingsEntryCard(
-            key: const ValueKey('mini-player-background-selector'),
-            icon: switch (miniPlayerBackgroundMode) {
-              MiniPlayerBackgroundMode.accent =>
-                Icons.format_color_fill_rounded,
-              MiniPlayerBackgroundMode.artwork => Icons.image_rounded,
-              MiniPlayerBackgroundMode.transparent => Icons.blur_on_rounded,
-              MiniPlayerBackgroundMode.liquidGlass => Icons.water_drop_rounded,
-            },
-            title: strings.miniPlayerBackground,
-            subtitle: strings.miniPlayerBackgroundModeLabel(
-              miniPlayerBackgroundMode,
-            ),
-            onTap: () => _chooseMiniPlayerBackgroundMode(context),
-          ),
+          ],
         ],
       ),
     );
@@ -2778,23 +2895,31 @@ class _MiniPlayerStyleIconPainter extends CustomPainter {
 
 class _LyricsAppearanceSettings extends StatelessWidget {
   const _LyricsAppearanceSettings({
+    required this.enabledProviders,
+    required this.onOpenProviders,
     required this.animationStyle,
+    required this.backgroundStyle,
     required this.alignment,
     required this.romanizationEnabled,
     required this.romanizationLanguages,
     required this.strings,
     required this.onAnimationChanged,
+    required this.onBackgroundChanged,
     required this.onAlignmentChanged,
     required this.onRomanizationEnabledChanged,
     required this.onRomanizationLanguagesChanged,
   });
 
+  final Set<LyricsProvider> enabledProviders;
+  final VoidCallback onOpenProviders;
   final LyricsAnimationStyle animationStyle;
+  final LyricsBackgroundStyle backgroundStyle;
   final LyricsTextAlignment alignment;
   final bool romanizationEnabled;
   final Set<LyricsRomanizationLanguage> romanizationLanguages;
   final AppStrings strings;
   final ValueChanged<LyricsAnimationStyle> onAnimationChanged;
+  final ValueChanged<LyricsBackgroundStyle> onBackgroundChanged;
   final ValueChanged<LyricsTextAlignment> onAlignmentChanged;
   final ValueChanged<bool> onRomanizationEnabledChanged;
   final ValueChanged<Set<LyricsRomanizationLanguage>>
@@ -2803,166 +2928,198 @@ class _LyricsAppearanceSettings extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 520),
+      constraints: BoxConstraints(
+        maxWidth: _settingsContentMaxWidth(context, 520),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            strings.lyricsAnimation,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          Wrap(
-            key: const ValueKey('lyrics-animation-options'),
-            spacing: 8,
-            runSpacing: 8,
+          _SettingsSectionPanel(
             children: [
-              for (final option in LyricsAnimationStyle.values)
-                ChoiceChip(
-                  key: ValueKey('lyrics-animation-option-${option.code}'),
-                  selected: animationStyle == option,
-                  showCheckmark: true,
-                  avatar: Icon(_lyricsAnimationIcon(option), size: 18),
-                  label: Text(strings.lyricsAnimationLabel(option)),
-                  onSelected: (_) => onAnimationChanged(option),
-                ),
+              _SettingsEntryCard(
+                key: const ValueKey('settings-card-lyrics-providers'),
+                icon: Icons.library_music_rounded,
+                title: strings.lyricsProviders,
+                subtitle: enabledProviders.isEmpty
+                    ? strings.noLyricsProvidersEnabled
+                    : LyricsProvider.values
+                          .where(enabledProviders.contains)
+                          .map((provider) => provider.label)
+                          .join(' · '),
+                onTap: onOpenProviders,
+              ),
             ],
           ),
-          const SizedBox(height: 22),
-          Text(
-            strings.lyricsAlignment,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          SizedBox(
-            width: double.infinity,
-            child: SegmentedButton<LyricsTextAlignment>(
-              key: const ValueKey('lyrics-alignment-options'),
-              selected: {alignment},
-              segments: [
-                ButtonSegment(
-                  value: LyricsTextAlignment.normal,
-                  icon: const Icon(Icons.format_align_left_rounded),
-                  label: Text(strings.normalLyricsAlignment),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.lyricsBackground,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                child: LyricsBackgroundSelector(
+                  value: backgroundStyle,
+                  strings: strings,
+                  onChanged: onBackgroundChanged,
                 ),
-                ButtonSegment(
-                  value: LyricsTextAlignment.centered,
-                  icon: const Icon(Icons.format_align_center_rounded),
-                  label: Text(strings.centeredLyricsAlignment),
+              ),
+            ],
+          ),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.lyricsAnimation,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                child: LyricsAppearanceSelector<LyricsAnimationStyle>(
+                  keyPrefix: 'lyrics-animation',
+                  value: animationStyle,
+                  onChanged: onAnimationChanged,
+                  options: [
+                    for (final option in LyricsAnimationStyle.values)
+                      (
+                        value: option,
+                        code: option.code,
+                        label: strings.lyricsAnimationLabel(option),
+                      ),
+                  ],
                 ),
-              ],
-              onSelectionChanged: (selection) =>
-                  onAlignmentChanged(selection.first),
-            ),
+              ),
+            ],
           ),
-          const SizedBox(height: 22),
-          Text(
-            strings.lyricsRomanization,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          Material(
-            key: const ValueKey('lyrics-romanization-card'),
-            color: AppColors.neutralSurfaceFor(context),
-            borderRadius: BorderRadius.circular(appCardRadius),
-            clipBehavior: Clip.antiAlias,
-            child: Column(
-              children: [
-                SwitchListTile.adaptive(
-                  key: const ValueKey('lyrics-romanization-toggle'),
-                  value: romanizationEnabled,
-                  title: Text(strings.romanizeLyrics),
-                  subtitle: Text(
-                    strings.romanizeLyricsSummary,
-                    style: appListCardSubtitleStyle(context),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.lyricsAlignment,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<LyricsTextAlignment>(
+                    key: const ValueKey('lyrics-alignment-options'),
+                    selected: {alignment},
+                    segments: [
+                      ButtonSegment(
+                        value: LyricsTextAlignment.normal,
+                        icon: const Icon(Icons.format_align_left_rounded),
+                        label: Text(strings.normalLyricsAlignment),
+                      ),
+                      ButtonSegment(
+                        value: LyricsTextAlignment.centered,
+                        icon: const Icon(Icons.format_align_center_rounded),
+                        label: Text(strings.centeredLyricsAlignment),
+                      ),
+                    ],
+                    onSelectionChanged: (selection) =>
+                        onAlignmentChanged(selection.first),
                   ),
-                  secondary: const Icon(Icons.translate_rounded),
-                  onChanged: onRomanizationEnabledChanged,
                 ),
-                if (romanizationEnabled) ...[
-                  const Divider(height: 1),
-                  Padding(
-                    key: const ValueKey('lyrics-romanization-languages'),
-                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            strings.romanizationLanguages,
-                            style: Theme.of(context).textTheme.labelLarge
-                                ?.copyWith(fontWeight: FontWeight.w800),
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              for (final language
-                                  in LyricsRomanizationLanguage.values)
-                                FilterChip(
-                                  key: ValueKey(
-                                    'lyrics-romanization-language-'
-                                    '${language.code}',
-                                  ),
-                                  selected: romanizationLanguages.contains(
-                                    language,
-                                  ),
-                                  showCheckmark: true,
-                                  label: Text(
-                                    strings.romanizationLanguageLabel(language),
-                                  ),
-                                  onSelected:
-                                      romanizationLanguages.contains(
-                                            language,
-                                          ) &&
-                                          romanizationLanguages.length == 1
-                                      ? null
-                                      : (selected) {
-                                          final next = romanizationLanguages
-                                              .toSet();
-                                          if (selected) {
-                                            next.add(language);
-                                          } else {
-                                            next.remove(language);
-                                          }
-                                          onRomanizationLanguagesChanged(next);
-                                        },
-                                ),
-                            ],
-                          ),
-                        ),
-                      ],
+              ),
+            ],
+          ),
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.lyricsRomanization,
+            children: [
+              _SettingsItemSurface(
+                key: const ValueKey('lyrics-romanization-card'),
+                child: Column(
+                  children: [
+                    SwitchListTile.adaptive(
+                      key: const ValueKey('lyrics-romanization-toggle'),
+                      value: romanizationEnabled,
+                      title: Text(strings.romanizeLyrics),
+                      subtitle: Text(
+                        strings.romanizeLyricsSummary,
+                        style: appListCardSubtitleStyle(context),
+                      ),
+                      secondary: const Icon(Icons.translate_rounded),
+                      onChanged: onRomanizationEnabledChanged,
                     ),
-                  ),
-                ],
-              ],
-            ),
+                    if (romanizationEnabled) ...[
+                      const Divider(height: 1),
+                      Padding(
+                        key: const ValueKey('lyrics-romanization-languages'),
+                        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                strings.romanizationLanguages,
+                                style: Theme.of(context).textTheme.labelLarge
+                                    ?.copyWith(fontWeight: FontWeight.w800),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  for (final language
+                                      in LyricsRomanizationLanguage.values)
+                                    FilterChip(
+                                      key: ValueKey(
+                                        'lyrics-romanization-language-'
+                                        '${language.code}',
+                                      ),
+                                      selected: romanizationLanguages.contains(
+                                        language,
+                                      ),
+                                      showCheckmark: true,
+                                      label: Text(
+                                        strings.romanizationLanguageLabel(
+                                          language,
+                                        ),
+                                      ),
+                                      onSelected:
+                                          romanizationLanguages.contains(
+                                                language,
+                                              ) &&
+                                              romanizationLanguages.length == 1
+                                          ? null
+                                          : (selected) {
+                                              final next = romanizationLanguages
+                                                  .toSet();
+                                              if (selected) {
+                                                next.add(language);
+                                              } else {
+                                                next.remove(language);
+                                              }
+                                              onRomanizationLanguagesChanged(
+                                                next,
+                                              );
+                                            },
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 22),
-          Text(
-            strings.lyricsPreview,
-            style: Theme.of(
-              context,
-            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
-          ),
-          const SizedBox(height: 10),
-          _LyricsAnimationPreview(
-            animationStyle: animationStyle,
-            alignment: alignment,
-            romanizationEnabled: romanizationEnabled,
-            romanizationLanguages: romanizationLanguages,
-            strings: strings,
+          const SizedBox(height: appSectionGap),
+          _SettingsSectionPanel(
+            title: strings.lyricsPreview,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                child: _LyricsAnimationPreview(
+                  animationStyle: animationStyle,
+                  alignment: alignment,
+                  romanizationEnabled: romanizationEnabled,
+                  romanizationLanguages: romanizationLanguages,
+                  strings: strings,
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -2970,11 +3127,72 @@ class _LyricsAppearanceSettings extends StatelessWidget {
   }
 }
 
-IconData _lyricsAnimationIcon(LyricsAnimationStyle style) => switch (style) {
-  LyricsAnimationStyle.smooth => Icons.auto_awesome_rounded,
-  LyricsAnimationStyle.slide => Icons.swipe_up_rounded,
-  LyricsAnimationStyle.highlight => Icons.zoom_in_rounded,
-};
+class _LyricsProvidersSettings extends StatelessWidget {
+  const _LyricsProvidersSettings({
+    required this.enabledProviders,
+    required this.strings,
+    required this.onChanged,
+  });
+
+  final Set<LyricsProvider> enabledProviders;
+  final AppStrings strings;
+  final void Function(LyricsProvider provider, bool enabled) onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: BoxConstraints(
+        maxWidth: _settingsContentMaxWidth(context, 520),
+      ),
+      child: _SettingsSectionPanel(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+            child: Text(
+              strings.lyricsProvidersHint,
+              style: appListCardSubtitleStyle(context),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _SettingsItemSurface(
+            key: const ValueKey('lyrics-providers-card'),
+            child: Column(
+              children: [
+                for (final provider in LyricsProvider.values) ...[
+                  if (provider != LyricsProvider.values.first)
+                    const Divider(height: 1),
+                  SwitchListTile.adaptive(
+                    key: ValueKey('lyrics-provider-toggle-${provider.name}'),
+                    title: Text(provider.label),
+                    subtitle: provider == LyricsProvider.betterLyrics
+                        ? Text(
+                            strings.betterLyricsAvailabilityHint,
+                            style: appListCardSubtitleStyle(context),
+                          )
+                        : null,
+                    value: enabledProviders.contains(provider),
+                    onChanged: (enabled) => onChanged(provider, enabled),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: Text(
+              enabledProviders.isEmpty
+                  ? strings.lyricsProvidersDisabledHint
+                  : strings.lyricsProvidersFallbackHint,
+              key: const ValueKey('lyrics-providers-status'),
+              style: appListCardSubtitleStyle(context),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _LyricsAnimationPreview extends ConsumerStatefulWidget {
   const _LyricsAnimationPreview({
@@ -3257,6 +3475,109 @@ List<String> _lyricsRomanizationPreviewLines(
   ],
 };
 
+class _ThemeModeSelector extends StatelessWidget {
+  const _ThemeModeSelector({
+    required this.selected,
+    required this.strings,
+    required this.onChanged,
+  });
+
+  final AppThemeMode selected;
+  final AppStrings strings;
+  final ValueChanged<AppThemeMode> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final textStyle = Theme.of(
+      context,
+    ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w800);
+    final options = [
+      (
+        value: AppThemeMode.system,
+        icon: Icons.settings_suggest_rounded,
+        label: strings.themeSystem,
+      ),
+      (
+        value: AppThemeMode.light,
+        icon: Icons.light_mode_rounded,
+        label: strings.themeLight,
+      ),
+      (
+        value: AppThemeMode.dark,
+        icon: Icons.dark_mode_rounded,
+        label: strings.themeDark,
+      ),
+    ];
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final painter = TextPainter(
+          textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
+          locale: Localizations.maybeLocaleOf(context),
+          maxLines: 1,
+        );
+        var widestLabel = 0.0;
+        try {
+          for (final option in options) {
+            painter.text = TextSpan(text: option.label, style: textStyle);
+            painter.layout();
+            if (painter.width > widestLabel) widestLabel = painter.width;
+          }
+        } finally {
+          painter.dispose();
+        }
+        // Keep full labels at the user's text size. Stack icons on compact
+        // screens, then use vertical segments if enlarged text needs more room.
+        final compact =
+            (widestLabel + 22 + 8 + 28) * options.length > constraints.maxWidth;
+        final vertical =
+            compact &&
+            (widestLabel + 16) * options.length > constraints.maxWidth;
+        final stacked = compact && !vertical;
+        return SizedBox(
+          width: constraints.maxWidth,
+          child: SegmentedButton<AppThemeMode>(
+            key: const ValueKey('settings-theme-mode-selector'),
+            selected: {selected},
+            direction: vertical ? Axis.vertical : Axis.horizontal,
+            expandedInsets: vertical ? null : EdgeInsets.zero,
+            showSelectedIcon: !stacked,
+            style: ButtonStyle(
+              minimumSize: WidgetStateProperty.all(const Size(0, 50)),
+              padding: WidgetStateProperty.all(
+                EdgeInsets.symmetric(
+                  horizontal: stacked ? 8 : 14,
+                  vertical: 10,
+                ),
+              ),
+              textStyle: WidgetStateProperty.all(textStyle),
+              iconSize: WidgetStateProperty.all(22),
+            ),
+            segments: [
+              for (final option in options)
+                ButtonSegment(
+                  value: option.value,
+                  icon: stacked ? null : Icon(option.icon),
+                  label: stacked
+                      ? Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(option.icon),
+                            const SizedBox(height: 5),
+                            Text(option.label, textAlign: TextAlign.center),
+                          ],
+                        )
+                      : Text(option.label),
+                ),
+            ],
+            onSelectionChanged: (selection) => onChanged(selection.first),
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _AccentSwatch extends StatelessWidget {
   const _AccentSwatch({
     required this.accent,
@@ -3282,42 +3603,45 @@ class _AccentSwatch extends StatelessWidget {
         message: label,
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(appListCardIconRadius),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
-            width: 48,
-            height: 48,
-            padding: const EdgeInsets.all(5),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [accent.seedColor, accent.darkColor],
+          customBorder: const CircleBorder(),
+          child: Center(
+            child: AnimatedContainer(
+              key: ValueKey('accent-swatch-${accent.code}'),
+              duration: const Duration(milliseconds: 180),
+              width: 42,
+              height: 42,
+              padding: const EdgeInsets.all(5),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [accent.seedColor, accent.darkColor],
+                ),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: selected ? scheme.onSurface : scheme.outlineVariant,
+                  width: selected ? 3 : 1,
+                ),
+                boxShadow: selected
+                    ? [
+                        BoxShadow(
+                          color: accent.seedColor.withValues(alpha: 0.38),
+                          blurRadius: 10,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : null,
               ),
-              borderRadius: BorderRadius.circular(appListCardIconRadius),
-              border: Border.all(
-                color: selected ? scheme.onSurface : scheme.outlineVariant,
-                width: selected ? 3 : 1,
-              ),
-              boxShadow: selected
-                  ? [
-                      BoxShadow(
-                        color: accent.seedColor.withValues(alpha: 0.38),
-                        blurRadius: 10,
-                        spreadRadius: 1,
-                      ),
-                    ]
+              child: selected
+                  ? Icon(
+                      Icons.check_rounded,
+                      color: accent.seedColor.computeLuminance() > 0.58
+                          ? Colors.black
+                          : Colors.white,
+                      size: 20,
+                    )
                   : null,
             ),
-            child: selected
-                ? Icon(
-                    Icons.check_rounded,
-                    color: accent.seedColor.computeLuminance() > 0.58
-                        ? Colors.black
-                        : Colors.white,
-                    size: 22,
-                  )
-                : null,
           ),
         ),
       ),
@@ -3434,83 +3758,75 @@ class _SleepTimerSettings extends StatelessWidget {
     final customSelected = !_presets.contains(state.selectedDuration);
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 520),
-      child: AppCardGradientBorder(
-        solidInLiquidGlass: true,
-        child: Material(
-          color: AppColors.cardSurfaceFor(context, solidInLiquidGlass: true),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(appCardRadius),
-            side: BorderSide(
-              color: AppColors.cardBorderFor(context, solidInLiquidGlass: true),
+      child: _SettingsItemSurface(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SwitchListTile.adaptive(
+              value: state.isActive,
+              onChanged: onEnabledChanged,
+              secondary: const _SettingsLeadingIcon(
+                icon: Icons.bedtime_rounded,
+              ),
+              horizontalTitleGap: 14,
+              title: Text(
+                strings.automaticShutdown,
+                style: const TextStyle(fontWeight: FontWeight.w800),
+              ),
+              subtitle: Text(
+                state.isActive
+                    ? strings.sleepTimerRemaining(state.remaining)
+                    : strings.sleepTimerOff,
+                style: appListCardSubtitleStyle(context),
+              ),
             ),
-          ),
-          clipBehavior: Clip.antiAlias,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SwitchListTile.adaptive(
-                value: state.isActive,
-                onChanged: onEnabledChanged,
-                secondary: const Icon(Icons.bedtime_rounded),
-                title: Text(
-                  strings.automaticShutdown,
-                  style: const TextStyle(fontWeight: FontWeight.w800),
-                ),
-                subtitle: Text(
-                  state.isActive
-                      ? strings.sleepTimerRemaining(state.remaining)
-                      : strings.sleepTimerOff,
-                  style: appListCardSubtitleStyle(context),
-                ),
-              ),
-              AnimatedSize(
-                duration: const Duration(milliseconds: 240),
-                curve: Curves.easeOutCubic,
-                alignment: Alignment.topCenter,
-                child: state.isActive
-                    ? Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Row(
-                              children: [
-                                for (
-                                  var index = 0;
-                                  index < _presets.length;
-                                  index++
-                                ) ...[
-                                  if (index > 0) const SizedBox(width: 8),
-                                  Expanded(
-                                    child: _PlaybackOptionButton(
-                                      selected:
-                                          state.selectedDuration ==
-                                          _presets[index],
-                                      inactiveIcon: Icons.schedule_rounded,
-                                      label: strings.timerMinutes(
-                                        _presets[index].inMinutes,
-                                      ),
-                                      onTap: () =>
-                                          onDurationSelected(_presets[index]),
+            AnimatedSize(
+              duration: const Duration(milliseconds: 240),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.topCenter,
+              child: state.isActive
+                  ? Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(
+                            children: [
+                              for (
+                                var index = 0;
+                                index < _presets.length;
+                                index++
+                              ) ...[
+                                if (index > 0) const SizedBox(width: 8),
+                                Expanded(
+                                  child: _PlaybackOptionButton(
+                                    selected:
+                                        state.selectedDuration ==
+                                        _presets[index],
+                                    inactiveIcon: Icons.schedule_rounded,
+                                    label: strings.timerMinutes(
+                                      _presets[index].inMinutes,
                                     ),
+                                    onTap: () =>
+                                        onDurationSelected(_presets[index]),
                                   ),
-                                ],
+                                ),
                               ],
-                            ),
-                            const SizedBox(height: 10),
-                            _PlaybackOptionButton(
-                              selected: customSelected,
-                              inactiveIcon: Icons.tune_rounded,
-                              label: strings.customDuration,
-                              onTap: onCustomDuration,
-                            ),
-                          ],
-                        ),
-                      )
-                    : const SizedBox.shrink(),
-              ),
-            ],
-          ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          _PlaybackOptionButton(
+                            selected: customSelected,
+                            inactiveIcon: Icons.tune_rounded,
+                            label: strings.customDuration,
+                            onTap: onCustomDuration,
+                          ),
+                        ],
+                      ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
+          ],
         ),
       ),
     );
@@ -3539,68 +3855,62 @@ class _CrossfadeSettings extends StatelessWidget {
         AppPlatform.isDesktop &&
         Theme.of(context).platform != TargetPlatform.android;
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: desktopLayout ? 760 : 520),
-      child: AppCardGradientBorder(
-        solidInLiquidGlass: true,
-        child: Material(
-          color: AppColors.cardSurfaceFor(context, solidInLiquidGlass: true),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(appCardRadius),
-            side: BorderSide(
-              color: AppColors.cardBorderFor(context, solidInLiquidGlass: true),
+      constraints: BoxConstraints(
+        maxWidth: desktopLayout ? double.infinity : 520,
+      ),
+      child: _SettingsItemSurface(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SwitchListTile.adaptive(
+              key: const ValueKey('settings-crossfade-switch'),
+              value: enabled,
+              onChanged: onEnabledChanged,
+              secondary: const _SettingsLeadingIcon(
+                icon: Icons.multitrack_audio_rounded,
+              ),
+              horizontalTitleGap: 14,
+              title: Text(
+                strings.crossfade,
+                style: const TextStyle(fontWeight: FontWeight.w800),
+              ),
+              subtitle: Text(
+                strings.crossfadeSummary,
+                style: appListCardSubtitleStyle(context),
+              ),
             ),
-          ),
-          clipBehavior: Clip.antiAlias,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SwitchListTile.adaptive(
-                key: const ValueKey('settings-crossfade-switch'),
-                value: enabled,
-                onChanged: onEnabledChanged,
-                secondary: const Icon(Icons.multitrack_audio_rounded),
-                title: Text(
-                  strings.crossfade,
-                  style: const TextStyle(fontWeight: FontWeight.w800),
-                ),
-                subtitle: Text(
-                  strings.crossfadeSummary,
-                  style: appListCardSubtitleStyle(context),
+            AnimatedSwitcher(
+              key: const ValueKey('settings-crossfade-options-transition'),
+              duration: MediaQuery.disableAnimationsOf(context)
+                  ? Duration.zero
+                  : const Duration(milliseconds: 180),
+              reverseDuration: MediaQuery.disableAnimationsOf(context)
+                  ? Duration.zero
+                  : const Duration(milliseconds: 140),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              transitionBuilder: (child, animation) => ClipRect(
+                child: SizeTransition(
+                  sizeFactor: animation,
+                  alignment: Alignment.topCenter,
+                  child: FadeTransition(opacity: animation, child: child),
                 ),
               ),
-              AnimatedSwitcher(
-                key: const ValueKey('settings-crossfade-options-transition'),
-                duration: MediaQuery.disableAnimationsOf(context)
-                    ? Duration.zero
-                    : const Duration(milliseconds: 180),
-                reverseDuration: MediaQuery.disableAnimationsOf(context)
-                    ? Duration.zero
-                    : const Duration(milliseconds: 140),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) => ClipRect(
-                  child: SizeTransition(
-                    sizeFactor: animation,
-                    alignment: Alignment.topCenter,
-                    child: FadeTransition(opacity: animation, child: child),
-                  ),
-                ),
-                child: enabled
-                    ? Padding(
-                        key: const ValueKey('settings-crossfade-options'),
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-                        child: _CrossfadeDurationSlider(
-                          duration: duration,
-                          strings: strings,
-                          onDurationSelected: onDurationSelected,
-                        ),
-                      )
-                    : const SizedBox.shrink(
-                        key: ValueKey('settings-crossfade-options-hidden'),
+              child: enabled
+                  ? Padding(
+                      key: const ValueKey('settings-crossfade-options'),
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                      child: _CrossfadeDurationSlider(
+                        duration: duration,
+                        strings: strings,
+                        onDurationSelected: onDurationSelected,
                       ),
-              ),
-            ],
-          ),
+                    )
+                  : const SizedBox.shrink(
+                      key: ValueKey('settings-crossfade-options-hidden'),
+                    ),
+            ),
+          ],
         ),
       ),
     );
@@ -3610,12 +3920,14 @@ class _CrossfadeSettings extends StatelessWidget {
 class _SkipSilenceSettings extends StatelessWidget {
   const _SkipSilenceSettings({
     required this.enabled,
+    required this.available,
     required this.strings,
     required this.onEnabledChanged,
     super.key,
   });
 
   final bool enabled;
+  final bool available;
   final AppStrings strings;
   final ValueChanged<bool> onEnabledChanged;
 
@@ -3625,31 +3937,27 @@ class _SkipSilenceSettings extends StatelessWidget {
         AppPlatform.isDesktop &&
         Theme.of(context).platform != TargetPlatform.android;
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: desktopLayout ? 760 : 520),
-      child: AppCardGradientBorder(
-        solidInLiquidGlass: true,
-        child: Material(
-          color: AppColors.cardSurfaceFor(context, solidInLiquidGlass: true),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(appCardRadius),
-            side: BorderSide(
-              color: AppColors.cardBorderFor(context, solidInLiquidGlass: true),
-            ),
+      constraints: BoxConstraints(
+        maxWidth: desktopLayout ? double.infinity : 520,
+      ),
+      child: _SettingsItemSurface(
+        child: SwitchListTile.adaptive(
+          key: const ValueKey('settings-skip-silence-switch'),
+          value: enabled,
+          onChanged: onEnabledChanged,
+          secondary: const _SettingsLeadingIcon(
+            icon: Icons.fast_forward_rounded,
           ),
-          clipBehavior: Clip.antiAlias,
-          child: SwitchListTile.adaptive(
-            key: const ValueKey('settings-skip-silence-switch'),
-            value: enabled,
-            onChanged: onEnabledChanged,
-            secondary: const Icon(Icons.fast_forward_rounded),
-            title: Text(
-              strings.skipSilence,
-              style: const TextStyle(fontWeight: FontWeight.w800),
-            ),
-            subtitle: Text(
-              strings.skipSilenceSummary,
-              style: appListCardSubtitleStyle(context),
-            ),
+          horizontalTitleGap: 14,
+          title: Text(
+            strings.skipSilence,
+            style: const TextStyle(fontWeight: FontWeight.w800),
+          ),
+          subtitle: Text(
+            available
+                ? strings.skipSilenceSummary
+                : strings.skipSilenceUnavailableForAudio,
+            style: appListCardSubtitleStyle(context),
           ),
         ),
       ),
@@ -4071,8 +4379,10 @@ class _PlaybackOptionButton extends StatelessWidget {
       height: 52,
       child: Material(
         color: selected
-            ? colors.primaryContainer
-            : colors.surfaceContainerHighest.withValues(alpha: 0.58),
+            ? colors.primaryContainer.withValues(
+                alpha: AppColors.cardSurfaceOpacityFor(context),
+              )
+            : AppColors.cardSurfaceFor(context),
         shape: RoundedRectangleBorder(
           borderRadius: borderRadius,
           side: BorderSide(
@@ -4129,27 +4439,301 @@ class _SettingsGroup extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(bottom: appSectionGap),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal:
-                  appTabTitleHorizontalPadding -
-                  _settingsRootCardHorizontalPadding,
-            ),
-            child: Text(
-              title,
-              key: titleKey,
-              style: appSectionTitleStyle(context),
-            ),
-          ),
-          const SizedBox(height: appGroupHeadingGap),
-          ...children,
-        ],
+      child: _SettingsSectionPanel(
+        title: title,
+        titleKey: titleKey,
+        children: children,
       ),
     );
   }
+}
+
+/// Shares a single, inexpensive painted surface between related settings.
+/// Rows use this Material for their ink response instead of adding individual
+/// cards, borders, blur filters, or composited opacity layers.
+class _SettingsSectionPanel extends StatelessWidget {
+  const _SettingsSectionPanel({
+    this.title,
+    this.titleKey,
+    required this.children,
+  });
+
+  final String? title;
+  final Key? titleKey;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return SizedBox(
+      width: double.infinity,
+      child: Card(
+        key: title == null ? null : ValueKey('settings-section-panel-$title'),
+        margin: EdgeInsets.zero,
+        elevation: 0,
+        color: colors.surfaceContainerLow.withValues(alpha: 0.88),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(22),
+          side: BorderSide(color: colors.outlineVariant.withValues(alpha: 0.5)),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: _SettingsSectionScope(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(6, 6, 6, 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (title != null) ...[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                    child: Text(
+                      title!,
+                      key: titleKey,
+                      style: appSectionTitleStyle(context),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                ],
+                for (final child in children)
+                  if (child is SizedBox &&
+                      child.child == null &&
+                      child.height == appCardGap)
+                    const Divider(height: 1, indent: 16, endIndent: 16)
+                  else
+                    child,
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SettingsSectionScope extends InheritedWidget {
+  const _SettingsSectionScope({required super.child});
+
+  static bool contains(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_SettingsSectionScope>() !=
+      null;
+
+  @override
+  bool updateShouldNotify(_SettingsSectionScope oldWidget) => false;
+}
+
+class _SettingsItemSurface extends StatelessWidget {
+  const _SettingsItemSurface({required this.child, super.key});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (_SettingsSectionScope.contains(context)) return child;
+    return AppCardGradientBorder(
+      solidInLiquidGlass: true,
+      child: Material(
+        color: AppColors.cardSurfaceFor(context),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(appCardRadius),
+          side: BorderSide(
+            color: AppColors.cardBorderFor(context, solidInLiquidGlass: true),
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: child,
+      ),
+    );
+  }
+}
+
+class _AudioSourcesSettings extends StatelessWidget {
+  const _AudioSourcesSettings({
+    required this.jioSaavnEnabled,
+    required this.strings,
+    required this.onJioSaavnChanged,
+  });
+
+  final bool jioSaavnEnabled;
+  final AppStrings strings;
+  final ValueChanged<bool> onJioSaavnChanged;
+
+  @override
+  Widget build(BuildContext context) => _SettingsSectionPanel(
+    children: [
+      _SettingsEntryCard(
+        key: const ValueKey('audio-source-youtube-music'),
+        icon: Icons.play_circle_rounded,
+        title: 'YouTube Music',
+        subtitle: strings.youtubeMusicSourceDescription,
+        onTap: null,
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Tooltip(
+              message: strings.audioSourceAlwaysEnabled,
+              child: const Icon(Icons.lock_outline_rounded, size: 18),
+            ),
+            Switch.adaptive(
+              key: const ValueKey('audio-source-youtube-music-switch'),
+              value: true,
+              onChanged: null,
+            ),
+          ],
+        ),
+      ),
+      const SizedBox(height: appCardGap),
+      _SettingsEntryCard(
+        key: const ValueKey('audio-source-jiosaavn'),
+        icon: Icons.high_quality_rounded,
+        title: 'JioSaavn',
+        subtitle: strings.jioSaavnSourceDescription,
+        onTap: () => onJioSaavnChanged(!jioSaavnEnabled),
+        trailing: Switch.adaptive(
+          key: const ValueKey('audio-source-jiosaavn-switch'),
+          value: jioSaavnEnabled,
+          onChanged: onJioSaavnChanged,
+        ),
+      ),
+    ],
+  );
+}
+
+class _DataSavingSettings extends StatelessWidget {
+  const _DataSavingSettings({
+    required this.state,
+    required this.strings,
+    required this.singleProfile,
+    required this.onQualityTap,
+  });
+
+  final SettingsState state;
+  final AppStrings strings;
+  final bool singleProfile;
+  final ValueChanged<_AudioQualitySetting> onQualityTap;
+
+  String _selectionLabel(AudioQualityProfile saved) {
+    final high = state.jioSaavnEnabled && saved == AudioQualityProfile.high;
+    return high
+        ? '${strings.highAudioQuality} · JioSaavn'
+        : '${strings.standardAudioQuality} · YouTube Music';
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      _SettingsGroup(
+        title: strings.streamingAudio,
+        children: [
+          _SettingsEntryCard(
+            key: ValueKey(
+              singleProfile ? 'data-saving-quality' : 'data-saving-wifi',
+            ),
+            icon: singleProfile ? Icons.headphones_rounded : Icons.wifi_rounded,
+            title: singleProfile ? strings.audioQuality : strings.wifiNetwork,
+            subtitle: _selectionLabel(state.wifiAudioQuality),
+            onTap: () => onQualityTap(_AudioQualitySetting.wifi),
+          ),
+          if (!singleProfile) ...[
+            const SizedBox(height: appCardGap),
+            _SettingsEntryCard(
+              key: const ValueKey('data-saving-mobile'),
+              icon: Icons.signal_cellular_alt_rounded,
+              title: strings.mobileNetwork,
+              subtitle: _selectionLabel(state.mobileAudioQuality),
+              onTap: () => onQualityTap(_AudioQualitySetting.mobile),
+            ),
+          ],
+        ],
+      ),
+      _SettingsSectionPanel(
+        title: strings.downloads,
+        children: [
+          _SettingsEntryCard(
+            key: const ValueKey('data-saving-download-quality'),
+            icon: Icons.download_rounded,
+            title: strings.downloadAudioQuality,
+            subtitle: _selectionLabel(state.downloadAudioQuality),
+            onTap: () => onQualityTap(_AudioQualitySetting.downloads),
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+class _AudioQualityProfileDialog extends StatelessWidget {
+  const _AudioQualityProfileDialog({
+    required this.title,
+    required this.selected,
+    required this.jioSaavnEnabled,
+    required this.highQualitySource,
+    required this.strings,
+  });
+
+  final String title;
+  final AudioQualityProfile selected;
+  final bool jioSaavnEnabled;
+  final String highQualitySource;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) => AppAlertDialog(
+    key: const ValueKey('audio-quality-profile-dialog'),
+    scrollable: true,
+    title: Text(title),
+    content: ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 480),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (jioSaavnEnabled) ...[
+            _option(
+              context,
+              profile: AudioQualityProfile.high,
+              title: strings.highAudioQuality,
+              provider: highQualitySource,
+              icon: Icons.high_quality_rounded,
+            ),
+            const SizedBox(height: appCardGap),
+          ],
+          _option(
+            context,
+            profile: AudioQualityProfile.standard,
+            title: strings.standardAudioQuality,
+            provider: 'YouTube Music',
+            icon: Icons.play_circle_rounded,
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.of(context).pop(),
+        child: Text(strings.cancel),
+      ),
+    ],
+  );
+
+  Widget _option(
+    BuildContext context, {
+    required AudioQualityProfile profile,
+    required String title,
+    required String provider,
+    required IconData icon,
+  }) => _SettingsEntryCard(
+    key: ValueKey('audio-quality-profile-${profile.name}'),
+    icon: icon,
+    title: title,
+    subtitle: provider,
+    onTap: () => Navigator.of(context).pop(profile),
+    trailing: Icon(
+      selected == profile
+          ? Icons.check_circle_rounded
+          : Icons.radio_button_unchecked_rounded,
+      color: selected == profile ? Theme.of(context).colorScheme.primary : null,
+    ),
+  );
 }
 
 class _StorageSettings extends StatelessWidget {
@@ -4183,15 +4767,21 @@ class _StorageSettings extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         if (canChangeDownloadDirectory) ...[
-          Text(strings.downloads, style: appSectionTitleStyle(context)),
-          const SizedBox(height: 8),
-          _PathField(
-            controller: downloadPathController,
-            focusNode: downloadPathFocusNode,
-            label: strings.folder,
-            icon: Icons.folder_rounded,
-            browseTooltip: strings.browseFolder,
-            onBrowse: onBrowse,
+          _SettingsSectionPanel(
+            title: strings.downloads,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+                child: _PathField(
+                  controller: downloadPathController,
+                  focusNode: downloadPathFocusNode,
+                  label: strings.folder,
+                  icon: Icons.folder_rounded,
+                  browseTooltip: strings.browseFolder,
+                  onBrowse: onBrowse,
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: appSectionGap),
         ],
@@ -4379,8 +4969,10 @@ class _LocalMusicFilterOption extends StatelessWidget {
     final colors = Theme.of(context).colorScheme;
     return Material(
       color: selected
-          ? colors.primaryContainer.withValues(alpha: 0.52)
-          : colors.surfaceContainerHighest.withValues(alpha: 0.56),
+          ? colors.primaryContainer.withValues(
+              alpha: AppColors.cardSurfaceOpacityFor(context),
+            )
+          : AppColors.cardSurfaceFor(context),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(appListCardIconRadius),
         side: BorderSide(
@@ -4412,14 +5004,7 @@ class _StorageTransferSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(title, style: appSectionTitleStyle(context)),
-        const SizedBox(height: appGroupHeadingGap),
-        ...children,
-      ],
-    );
+    return _SettingsSectionPanel(title: title, children: children);
   }
 }
 
@@ -4492,7 +5077,9 @@ class _TikTokLiveSettings extends StatelessWidget {
     };
 
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 760),
+      constraints: BoxConstraints(
+        maxWidth: _settingsContentMaxWidth(context, 760),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -4669,21 +5256,15 @@ class _LiveOverlayServerControl extends ConsumerWidget {
     }
 
     final overlay = ref.watch(liveOverlayControllerProvider);
-    final live = ref.watch(tiktokLiveControllerProvider).value;
     final strings = ref.watch(appStringsProvider);
-    final connected = live?.isConnected ?? false;
     final canStop = overlay.isActive;
     final canStart =
-        connected &&
         !overlay.isBusy &&
         !overlay.isActive &&
         overlay.status != LiveOverlayStatus.unsupported;
     final canToggle = canStop || canStart;
     final subtitle = switch (overlay.status) {
-      LiveOverlayStatus.inactive =>
-        connected
-            ? strings.liveOverlayInactive
-            : strings.liveOverlayConnectFirst,
+      LiveOverlayStatus.inactive => strings.liveOverlayInactive,
       LiveOverlayStatus.starting => strings.liveOverlayStarting,
       LiveOverlayStatus.active =>
         overlay.error ??
@@ -4785,7 +5366,7 @@ class _TikTokCommandAudienceSection extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     return Material(
       key: ValueKey('tiktok-command-section-${audience.name}'),
-      color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.28),
+      color: AppColors.cardSurfaceFor(context),
       clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(14),
@@ -4922,7 +5503,9 @@ class _PathField extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 760),
+      constraints: BoxConstraints(
+        maxWidth: _settingsContentMaxWidth(context, 760),
+      ),
       child: Row(
         children: [
           Expanded(

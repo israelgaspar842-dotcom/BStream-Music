@@ -6,9 +6,11 @@ void main() {
     expect(PlayerStyle.bstreamMusic.code, 'bstreamMusic');
     expect(PlayerStyle.appleMusic.code, 'appleMusic');
     expect(PlayerStyle.classicVinyl.code, 'classicVinyl');
+    expect(PlayerStyle.spotifyMusic.code, 'spotifyMusic');
     expect(PlayerStyle.fromCode('bstreamMusic'), PlayerStyle.bstreamMusic);
     expect(PlayerStyle.fromCode('appleMusic'), PlayerStyle.appleMusic);
     expect(PlayerStyle.fromCode('classicVinyl'), PlayerStyle.classicVinyl);
+    expect(PlayerStyle.fromCode('spotifyMusic'), PlayerStyle.spotifyMusic);
     expect(PlayerStyle.fromCode(null), defaultPlayerStyle);
     expect(PlayerStyle.fromCode('futureStyle'), defaultPlayerStyle);
     expect(defaultPlayerStyle, PlayerStyle.bstreamMusic);

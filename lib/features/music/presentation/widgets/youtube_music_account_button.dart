@@ -28,7 +28,6 @@ typedef YouTubeMusicAccountButtonAction =
       YouTubeMusicAuthState state,
     );
 
-@visibleForTesting
 Widget buildYouTubeMusicLoginPageForPlatform({
   required bool isWeb,
   required TargetPlatform platform,
@@ -116,18 +115,33 @@ class _YouTubeMusicAccountButtonState
   ) async {
     final profile = state.profile;
     if (state.isAuthenticated && profile != null) {
+      unawaited(
+        ref
+            .read(youtubeMusicAuthControllerProvider.notifier)
+            .refreshProfile(force: true),
+      );
       await showAppDialog<void>(
         context: context,
-        builder: (dialogContext) => YouTubeMusicAccountDialog(
-          profile: profile,
-          strings: strings,
-          onSyncNow: () => _syncNow(strings),
-          onLogout: () =>
-              ref.read(youtubeMusicAuthControllerProvider.notifier).logout(),
-          onResolveConflicts: () =>
-              _openPlaylistConflicts(context, ref, strings),
-          onChangeAccount: () {
-            unawaited(_openLogin(strings));
+        builder: (dialogContext) => Consumer(
+          builder: (_, dialogRef, child) {
+            final currentProfile = dialogRef
+                .watch(youtubeMusicAuthControllerProvider)
+                .profile;
+            return YouTubeMusicAccountDialog(
+              profile: currentProfile?.channelId == profile.channelId
+                  ? currentProfile!
+                  : profile,
+              strings: strings,
+              onSyncNow: () => _syncNow(strings),
+              onLogout: () => ref
+                  .read(youtubeMusicAuthControllerProvider.notifier)
+                  .logout(),
+              onResolveConflicts: () =>
+                  _openPlaylistConflicts(context, ref, strings),
+              onChangeAccount: () {
+                unawaited(_openLogin(strings));
+              },
+            );
           },
         ),
       );

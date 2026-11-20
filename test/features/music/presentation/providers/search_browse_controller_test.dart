@@ -7,8 +7,329 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:bstream_music/features/music/domain/entities/track_info.dart';
 import 'package:bstream_music/features/music/presentation/providers/music_providers.dart';
 import 'package:bstream_music/services/youtube_music/innertube_search_service.dart';
+import 'package:bstream_music/services/youtube_music/search_browse_catalog_cache.dart';
+import 'package:bstream_music/services/youtube_music/search_browse_artwork_cache.dart';
 
 void main() {
+  test('keeps the complete advertised catalog beyond 24 cards', () async {
+    final source = _FakeMoodGenreSearch(
+      sections: [
+        InnerTubeMoodGenreSection(
+          title: 'Géneros',
+          categories: [
+            for (var i = 0; i < 40; i++)
+              InnerTubeMoodGenreCategory(
+                title: 'Género $i',
+                target: InnerTubeBrowseTarget(
+                  browseId: 'FEmusic_moods_and_genres_category',
+                  params: 'genre-$i',
+                ),
+              ),
+          ],
+        ),
+      ],
+    );
+    final catalog = await _container(
+      source,
+    ).read(searchBrowseCatalogProvider.future);
+    expect(catalog.categories, hasLength(40));
+    expect(catalog.categories.last.title, 'Género 39');
+  });
+
+  test(
+    'bounds category lookups and skips disposed requests in the queue',
+    () async {
+      final release = Completer<void>();
+      var active = 0;
+      var maximumActive = 0;
+      final source = _FakeMoodGenreSearch(
+        sections: [],
+        moodLookup: (_) async {
+          active++;
+          if (active > maximumActive) maximumActive = active;
+          await release.future;
+          active--;
+          return InnerTubeMoodGenrePage(sections: []);
+        },
+      );
+      final container = _container(source);
+      final categories = [
+        for (var i = 0; i < 6; i++)
+          SearchBrowseCategory(
+            id: 'q$i',
+            title: '$i',
+            searchQuery: '$i',
+            target: InnerTubeBrowseTarget(
+              browseId: 'FEmusic_moods_and_genres_category',
+              params: 'q$i',
+            ),
+          ),
+      ];
+      final subscriptions = [
+        for (final category in categories)
+          container.listen(
+            searchBrowseCategoryPageProvider(category),
+            (_, _) {},
+          ),
+      ];
+      for (final subscription in subscriptions) {
+        addTearDown(subscription.close);
+      }
+      await Future<void>.delayed(Duration.zero);
+      expect(source.moodCalls, 2);
+      subscriptions[3].close();
+      await container.pump();
+      release.complete();
+      await Future.wait([
+        for (final i in [0, 1, 2, 4, 5])
+          container.read(
+            searchBrowseCategoryPageProvider(categories[i]).future,
+          ),
+      ]);
+      expect(source.moodCalls, 5);
+      expect(maximumActive, 2);
+    },
+  );
+
+  test('shares an in-flight category page across offscreen visits', () async {
+    final pending = Completer<InnerTubeMoodGenrePage>();
+    final page = InnerTubeMoodGenrePage(sections: []);
+    final source = _FakeMoodGenreSearch(
+      sections: [],
+      moodLookup: (_) => pending.future,
+    );
+    final container = _container(source);
+    final provider = searchBrowseCategoryPageProvider(_category('pending'));
+    final first = container.listen(provider, (_, _) {});
+    await container.pump();
+    expect(source.moodCalls, 1);
+
+    first.close();
+    await container.pump();
+    final next = container.listen(provider, (_, _) {});
+    addTearDown(next.close);
+    await container.pump();
+    expect(source.moodCalls, 1);
+
+    pending.complete(page);
+    expect(await container.read(provider.future), same(page));
+    next.close();
+    await container.pump();
+    expect(await container.read(provider.future), same(page));
+    expect(
+      source.moodCalls,
+      1,
+      reason: 'successful pages keep the timed cache',
+    );
+  });
+
+  test(
+    'the temporary page hold ends when its successful cache expires',
+    () async {
+      final page = InnerTubeMoodGenrePage(sections: []);
+      final source = _FakeMoodGenreSearch(sections: [], moodPage: page);
+      final container = _container(
+        source,
+        remoteCacheDuration: const Duration(milliseconds: 5),
+      );
+      final provider = searchBrowseCategoryPageProvider(_category('expires'));
+      final first = container.listen(provider, (_, _) {});
+      expect(await container.read(provider.future), same(page));
+      first.close();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await container.pump();
+
+      final next = container.listen(provider, (_, _) {});
+      addTearDown(next.close);
+      expect(await container.read(provider.future), same(page));
+      expect(source.moodCalls, 2);
+    },
+  );
+
+  test('a failed in-flight page is not retained after leaving', () async {
+    final pending = Completer<InnerTubeMoodGenrePage>();
+    final page = InnerTubeMoodGenrePage(sections: []);
+    var attempts = 0;
+    final source = _FakeMoodGenreSearch(
+      sections: [],
+      moodLookup: (_) => ++attempts == 1 ? pending.future : Future.value(page),
+    );
+    final container = _container(source);
+    final provider = searchBrowseCategoryPageProvider(_category('retry'));
+    final first = container.listen(provider, (_, _) {});
+    final failed = expectLater(
+      container.read(provider.future),
+      throwsA(isA<StateError>()),
+    );
+    await container.pump();
+    first.close();
+    await container.pump();
+    pending.completeError(StateError('temporary network failure'));
+    await failed;
+    await container.pump();
+
+    final next = container.listen(provider, (_, _) {});
+    addTearDown(next.close);
+    expect(await container.read(provider.future), same(page));
+    expect(source.moodCalls, 2);
+  });
+
+  test('leaving a pending page does not start its cover lookup', () async {
+    final pending = Completer<InnerTubeMoodGenrePage>();
+    final source = _FakeMoodGenreSearch(
+      sections: [],
+      moodLookup: (_) => pending.future,
+      collectionSongs: {
+        'VLpending': [_song('pending0001', 'Pending')],
+      },
+    );
+    final container = _container(source);
+    final category = _category('pending-cover');
+    final provider = searchBrowseCategoryArtworkProvider(category);
+    final first = container.listen(provider, (_, _) {});
+    await container.pump();
+    expect(source.moodCalls, 1);
+    first.close();
+    await container.pump();
+
+    pending.complete(_collectionPage('VLpending'));
+    await container.read(searchBrowseCategoryPageProvider(category).future);
+    await container.pump();
+    expect(source.collectionCalls, isEmpty);
+
+    final next = container.listen(provider, (_, _) {});
+    addTearDown(next.close);
+    expect(
+      await container.read(provider.future),
+      'https://img.test/pending0001.jpg',
+    );
+    expect(source.moodCalls, 1);
+    expect(source.collectionCalls, ['VLpending']);
+  });
+
+  test(
+    'shares an in-flight cover collection across offscreen visits',
+    () async {
+      final pending = Completer<List<InnerTubeSong>>();
+      final started = Completer<void>();
+      final source = _FakeMoodGenreSearch(
+        sections: [],
+        moodPage: _collectionPage('VLcover'),
+        collectionLookup: (_) {
+          if (!started.isCompleted) started.complete();
+          return pending.future;
+        },
+      );
+      final container = _container(source);
+      final provider = searchBrowseCategoryArtworkProvider(_category('cover'));
+      final first = container.listen(provider, (_, _) {});
+      await started.future.timeout(const Duration(seconds: 5));
+      expect(source.collectionCalls, ['VLcover']);
+      first.close();
+      await container.pump();
+      final next = container.listen(provider, (_, _) {});
+      addTearDown(next.close);
+      await container.pump();
+      expect(source.collectionCalls, ['VLcover']);
+
+      pending.complete([_song('cover000001', 'Cover')]);
+      expect(
+        await container.read(provider.future),
+        'https://img.test/cover000001.jpg',
+      );
+      next.close();
+      await container.pump();
+      expect(
+        await container.read(provider.future),
+        'https://img.test/cover000001.jpg',
+      );
+      expect(source.moodCalls, 1);
+      expect(source.collectionCalls, ['VLcover']);
+    },
+  );
+
+  test(
+    'drops an offscreen cover while its collection is still queued',
+    () async {
+      final pending = Completer<InnerTubeMoodGenrePage>();
+      final source = _FakeMoodGenreSearch(
+        sections: [],
+        moodLookup: (target) => target.params == 'queued-cover'
+            ? Future.value(_collectionPage('VLqueued'))
+            : pending.future,
+      );
+      final container = _container(source);
+      final category = _category('queued-cover');
+      await container.read(searchBrowseCategoryPageProvider(category).future);
+      final blockers = [
+        for (final id in ['block-a', 'block-b'])
+          container.listen(
+            searchBrowseCategoryPageProvider(_category(id)),
+            (_, _) {},
+          ),
+      ];
+      for (final blocker in blockers) {
+        addTearDown(blocker.close);
+      }
+      await container.pump();
+      expect(source.moodCalls, 3);
+
+      final cover = container.listen(
+        searchBrowseCategoryArtworkProvider(category),
+        (_, _) {},
+      );
+      await Future<void>.delayed(Duration.zero);
+      await container.pump();
+      expect(source.collectionCalls, isEmpty);
+      cover.close();
+      await container.pump();
+      pending.complete(InnerTubeMoodGenrePage(sections: []));
+      await container.pump();
+      await Future<void>.delayed(Duration.zero);
+      expect(source.collectionCalls, isEmpty);
+    },
+  );
+
+  test(
+    'a failed cover lookup falls back but can retry on the next visit',
+    () async {
+      final pending = Completer<List<InnerTubeSong>>();
+      final started = Completer<void>();
+      var attempts = 0;
+      final source = _FakeMoodGenreSearch(
+        sections: [],
+        moodPage: _collectionPage('VLretry'),
+        collectionLookup: (_) {
+          if (!started.isCompleted) started.complete();
+          return ++attempts == 1
+              ? pending.future
+              : Future.value([_song('retry000001', 'Recovered')]);
+        },
+      );
+      final container = _container(source);
+      final category = _category('retry-cover');
+      final provider = searchBrowseCategoryArtworkProvider(category);
+      final first = container.listen(provider, (_, _) {});
+      final initial = container.read(provider.future);
+      await started.future.timeout(const Duration(seconds: 5));
+      expect(source.collectionCalls, ['VLretry']);
+      first.close();
+      await container.pump();
+      pending.completeError(StateError('temporary collection failure'));
+      expect(await initial, 'https://img.test/VLretry.jpg');
+      await container.pump();
+
+      final next = container.listen(provider, (_, _) {});
+      addTearDown(next.close);
+      expect(
+        await container.read(provider.future),
+        'https://img.test/retry000001.jpg',
+      );
+      expect(source.moodCalls, 1, reason: 'the successful page stays cached');
+      expect(source.collectionCalls, ['VLretry', 'VLretry']);
+    },
+  );
+
   test('keeps localized YouTube categories and their opaque targets', () async {
     final source = _FakeMoodGenreSearch(
       sections: <InnerTubeMoodGenreSection>[
@@ -70,9 +391,156 @@ void main() {
     );
     expect(
       catalog.categories.any((item) => item.id == 'party'),
-      isTrue,
-      reason: 'curated cards fill sparse regional responses',
+      isFalse,
+      reason: 'a valid YouTube catalog does not mix in generic search cards',
     );
+    expect(
+      await (container.read(searchBrowseCatalogCacheProvider)
+              as _MemorySearchBrowseCatalogCache)
+          .read('es'),
+      isNotNull,
+    );
+  });
+
+  test(
+    'restores the last live category catalog without network discovery',
+    () async {
+      const cachedCategory = SearchBrowseCategorySnapshot(
+        id: 'yt:focus',
+        title: 'ConcentraciÃ³n',
+        searchQuery: 'ConcentraciÃ³n',
+        browseId: 'FEmusic_moods_and_genres_category',
+        params: 'focus-target',
+      );
+      final catalogCache = _MemorySearchBrowseCatalogCache(
+        SearchBrowseCatalogSnapshot(
+          categories: [cachedCategory],
+          usesLiveYouTubeMusicCategories: true,
+        ),
+      );
+      final source = _FakeMoodGenreSearch(
+        sections: [],
+        moodsError: StateError('should not be called'),
+      );
+      final container = _container(source, catalogCache: catalogCache);
+
+      final catalog = await container.read(
+        searchBrowseCachedCatalogProvider.future,
+      );
+
+      expect(catalog?.categories.single.title, 'ConcentraciÃ³n');
+      expect(catalog?.categories.single.target?.params, 'focus-target');
+      expect(source.moodCalls, 0);
+    },
+  );
+
+  test(
+    'category page preserves shelves and shares one lookup with its cover',
+    () async {
+      const category = SearchBrowseCategory(
+        id: 'focus',
+        title: 'Concentración',
+        searchQuery: 'focus',
+        target: InnerTubeBrowseTarget(
+          browseId: 'FEmusic_moods_and_genres_category',
+          params: 'focus',
+        ),
+      );
+      const playlist = InnerTubeHomeCollection(
+        title: 'Lo-fi Loft',
+        browseId: 'VLlofi',
+        kind: InnerTubeHomeCollectionKind.playlist,
+        thumbnailUrl: 'https://img.test/lofi.jpg',
+      );
+      final page = InnerTubeMoodGenrePage(
+        sections: [
+          InnerTubeHomeSection(title: 'Flotando', items: [playlist]),
+          InnerTubeHomeSection(
+            title: 'Música clásica',
+            songs: [_song('classical01', 'Piano')],
+          ),
+        ],
+        continuation: 'more-focus',
+      );
+      final source = _FakeMoodGenreSearch(
+        sections: [],
+        moodPage: page,
+        collectionSongs: {
+          'VLlofi': [_song('firstsong01', 'Primera canción')],
+        },
+      );
+      final container = _container(source);
+      final artworkCache =
+          container.read(searchBrowseCategoryArtworkCacheProvider)
+              as _MemorySearchBrowseCategoryArtworkCache;
+      final detail = container.listen(
+        searchBrowseCategoryPageProvider(category),
+        (_, _) {},
+      );
+      addTearDown(detail.close);
+      expect(
+        await container.read(searchBrowseCategoryPageProvider(category).future),
+        same(page),
+      );
+      expect(source.collectionCalls, isEmpty);
+      final cover = container.listen(
+        searchBrowseCategoryArtworkProvider(category),
+        (_, _) {},
+      );
+      addTearDown(cover.close);
+      expect(
+        await container.read(
+          searchBrowseCategoryArtworkProvider(category).future,
+        ),
+        'https://img.test/firstsong01.jpg',
+      );
+      expect(source.moodCalls, 1);
+      expect(source.collectionCalls, ['VLlofi']);
+      expect(source.collectionLimits, [1]);
+      expect(source.continuationCalls, 0);
+      expect(source.trackLookupCalls, isEmpty);
+      expect(
+        await artworkCache.read(category.id),
+        'https://img.test/firstsong01.jpg',
+      );
+    },
+  );
+
+  test('direct song covers need no playlist or duration lookup', () async {
+    const category = SearchBrowseCategory(
+      id: 'direct',
+      title: 'Directa',
+      searchQuery: 'direct',
+      target: InnerTubeBrowseTarget(
+        browseId: 'FEmusic_moods_and_genres_category',
+        params: 'direct',
+      ),
+    );
+    final source = _FakeMoodGenreSearch(
+      sections: [],
+      moodPage: InnerTubeMoodGenrePage(
+        sections: [
+          InnerTubeHomeSection(
+            title: 'Canciones',
+            songs: [_song('direct00001', 'Directa')],
+          ),
+        ],
+      ),
+    );
+    final container = _container(source);
+    final subscription = container.listen(
+      searchBrowseCategoryArtworkProvider(category),
+      (_, _) {},
+    );
+    addTearDown(subscription.close);
+    expect(
+      await container.read(
+        searchBrowseCategoryArtworkProvider(category).future,
+      ),
+      'https://img.test/direct00001.jpg',
+    );
+    expect(source.collectionCalls, isEmpty);
+    expect(source.trackLookupCalls, isEmpty);
   });
 
   test('returns the complete curated catalog when discovery fails', () async {
@@ -320,6 +788,57 @@ void main() {
   );
 
   test(
+    'leaving the category cancels the paced duration batches after initial rows',
+    () async {
+      const target = InnerTubeBrowseTarget(
+        browseId: 'FEmusic_moods_and_genres_category',
+        params: 'opaque-paced-duration',
+      );
+      final songs = <InnerTubeSong>[
+        for (var index = 0; index < 16; index++)
+          _song(
+            'paced${index.toString().padLeft(6, '0')}',
+            'Song $index',
+            duration: null,
+          ),
+      ];
+      final source = _FakeMoodGenreSearch(
+        sections: const <InnerTubeMoodGenreSection>[],
+        moodPage: InnerTubeMoodGenrePage(
+          sections: <InnerTubeHomeSection>[
+            InnerTubeHomeSection(title: 'Songs', songs: songs),
+          ],
+        ),
+        durationLookup: (_) async => const Duration(minutes: 3),
+      );
+      final container = ProviderContainer(
+        overrides: [youtubeMusicSearchProvider.overrideWithValue(source)],
+      );
+      const category = SearchBrowseCategory(
+        id: 'paced-duration',
+        title: 'Durations',
+        searchQuery: 'paced durations',
+        target: target,
+      );
+      final initialRows = await _waitForTracks(
+        container,
+        searchBrowseCategoryTracksProvider(category),
+        (tracks) => tracks.where((track) => track.duration != null).length == 8,
+      );
+      expect(
+        initialRows.map((track) => track.id),
+        songs.map((song) => song.videoId),
+      );
+      container.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      expect(
+        source.trackLookupCalls,
+        songs.take(8).map((song) => song.videoId),
+      );
+    },
+  );
+
+  test(
     'stops duration enrichment after the active batch is disposed',
     () async {
       const target = InnerTubeBrowseTarget(
@@ -414,17 +933,66 @@ Future<List<TrackInfo>> _waitForTracks(
   }
 }
 
-ProviderContainer _container(_FakeMoodGenreSearch source) {
+ProviderContainer _container(
+  _FakeMoodGenreSearch source, {
+  _MemorySearchBrowseCatalogCache? catalogCache,
+  Duration? remoteCacheDuration,
+}) {
+  final artworkCache = _MemorySearchBrowseCategoryArtworkCache();
   final container = ProviderContainer(
     overrides: [
       appStringsProvider.overrideWithValue(
         const AppStrings(AppLanguage.spanish),
       ),
       youtubeMusicSearchProvider.overrideWithValue(source),
+      searchBrowseCatalogCacheProvider.overrideWithValue(
+        catalogCache ?? _MemorySearchBrowseCatalogCache(),
+      ),
+      searchBrowseCategoryArtworkCacheProvider.overrideWithValue(artworkCache),
+      if (remoteCacheDuration != null)
+        remoteDetailTracksCacheDurationProvider.overrideWithValue(
+          remoteCacheDuration,
+        ),
     ],
   );
   addTearDown(container.dispose);
   return container;
+}
+
+final class _MemorySearchBrowseCatalogCache
+    implements SearchBrowseCatalogCache {
+  _MemorySearchBrowseCatalogCache([this.snapshot]);
+
+  SearchBrowseCatalogSnapshot? snapshot;
+
+  @override
+  Future<SearchBrowseCatalogSnapshot?> read(String languageCode) async =>
+      snapshot;
+
+  @override
+  Future<void> write(
+    String languageCode,
+    SearchBrowseCatalogSnapshot catalog,
+  ) async {
+    snapshot = catalog;
+  }
+}
+
+final class _MemorySearchBrowseCategoryArtworkCache
+    implements SearchBrowseCategoryArtworkCache {
+  final _values = <String, String>{};
+
+  @override
+  Future<String?> read(String categoryId) async => _values[categoryId];
+
+  @override
+  Future<void> write(String categoryId, String? artworkUrl) async {
+    if (artworkUrl == null) {
+      _values.remove(categoryId);
+    } else {
+      _values[categoryId] = artworkUrl;
+    }
+  }
 }
 
 InnerTubeSong _song(
@@ -438,6 +1006,33 @@ InnerTubeSong _song(
   duration: duration,
   thumbnailUrl: 'https://img.test/$videoId.jpg',
 );
+
+SearchBrowseCategory _category(String id) => SearchBrowseCategory(
+  id: id,
+  title: id,
+  searchQuery: id,
+  target: InnerTubeBrowseTarget(
+    browseId: 'FEmusic_moods_and_genres_category',
+    params: id,
+  ),
+);
+
+InnerTubeMoodGenrePage _collectionPage(String browseId) =>
+    InnerTubeMoodGenrePage(
+      sections: [
+        InnerTubeHomeSection(
+          title: 'Collections',
+          items: [
+            InnerTubeHomeCollection(
+              title: browseId,
+              browseId: browseId,
+              kind: InnerTubeHomeCollectionKind.playlist,
+              thumbnailUrl: 'https://img.test/$browseId.jpg',
+            ),
+          ],
+        ),
+      ],
+    );
 
 final class _FakeMoodGenreSearch
     implements
@@ -456,6 +1051,8 @@ final class _FakeMoodGenreSearch
     this.lookupSongs = const <String, InnerTubeSong>{},
     this.lookupFailures = const <String>{},
     this.durationLookup,
+    this.moodLookup,
+    this.collectionLookup,
   });
 
   final List<InnerTubeMoodGenreSection> sections;
@@ -467,10 +1064,15 @@ final class _FakeMoodGenreSearch
   final Map<String, InnerTubeSong> lookupSongs;
   final Set<String> lookupFailures;
   final Future<Duration?> Function(String videoId)? durationLookup;
+  final Future<InnerTubeMoodGenrePage> Function(InnerTubeBrowseTarget)?
+  moodLookup;
+  final Future<List<InnerTubeSong>> Function(String browseId)? collectionLookup;
   final List<String> collectionCalls = <String>[];
+  final List<int> collectionLimits = <int>[];
   final List<String> trackLookupCalls = <String>[];
   final List<String> songLookupCalls = <String>[];
   int continuationCalls = 0;
+  int moodCalls = 0;
 
   @override
   Future<List<InnerTubeMoodGenreSection>> getMoodsAndGenres({
@@ -487,7 +1089,11 @@ final class _FakeMoodGenreSearch
     InnerTubeBrowseTarget target, {
     int maxSections = 6,
     int maxItemsPerSection = 20,
-  }) async => moodPage ?? InnerTubeMoodGenrePage(sections: const []);
+  }) async {
+    moodCalls++;
+    if (moodLookup != null) return moodLookup!(target);
+    return moodPage ?? InnerTubeMoodGenrePage(sections: const []);
+  }
 
   @override
   Future<InnerTubeMoodGenrePage> getMoodOrGenreContinuation(
@@ -505,6 +1111,8 @@ final class _FakeMoodGenreSearch
     int limit = innerTubeDetailResultLimit,
   }) async {
     collectionCalls.add(browseId);
+    collectionLimits.add(limit);
+    if (collectionLookup != null) return collectionLookup!(browseId);
     return collectionSongs[browseId] ?? const <InnerTubeSong>[];
   }
 

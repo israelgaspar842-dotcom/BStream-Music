@@ -26,7 +26,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
-class MainActivity : AudioServiceActivity() {
+class MainActivity : AudioServiceActivity(), BStreamHomeWidgetEnginePlugin.ActionRelay {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingFileExportResult: MethodChannel.Result? = null
     private var pendingFileExportSourcePath: String? = null
@@ -39,6 +39,8 @@ class MainActivity : AudioServiceActivity() {
     private var externalAudioChannel: MethodChannel? = null
     private val pendingExternalAudioEvents = ArrayDeque<Map<String, Any?>>()
     private var appActivationChannel: MethodChannel? = null
+    private var homeWidgetBridge: BStreamHomeWidgetEnginePlugin? = null
+    private var pendingHomeWidgetAction: String? = null
     private var pendingAppActivation: Map<String, Any>? = null
     private var pendingExternalAudioPermissionRequest: ExternalAudioRequest? = null
     private var audioPermissionRequestInFlight = false
@@ -48,6 +50,8 @@ class MainActivity : AudioServiceActivity() {
     private var statusBarHidden = false
     private var previousSystemUiVisibility: Int? = null
     private var previousSystemBarsBehavior: Int? = null
+    private var audioOutputPlugin: AudioOutputPlugin? = null
+    private var localAudioQualityPlugin: LocalAudioQualityPlugin? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,7 +63,8 @@ class MainActivity : AudioServiceActivity() {
             window.decorView.importantForAutofill =
                 View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
         }
-        if (!handleExternalAudioIntent(intent)) {
+        if (!IncomingCsvFileBridge.accept(this, intent) &&
+            !handleHomeWidgetActionIntent(intent) && !handleExternalAudioIntent(intent)) {
             handleAppActivationIntent(intent)
             requestNotificationPermissionIfNeeded()
         }
@@ -67,6 +72,21 @@ class MainActivity : AudioServiceActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        IncomingCsvFileBridge.attach(flutterEngine.dartExecutor.binaryMessenger)
+
+        audioOutputPlugin?.dispose()
+        audioOutputPlugin = AudioOutputPlugin(this, flutterEngine.dartExecutor.binaryMessenger)
+        localAudioQualityPlugin?.dispose()
+        localAudioQualityPlugin = LocalAudioQualityPlugin(
+            this, flutterEngine.dartExecutor.binaryMessenger,
+        )
+        if (!flutterEngine.plugins.has(BStreamCastEnginePlugin::class.java)) {
+            flutterEngine.plugins.add(BStreamCastEnginePlugin())
+        }
+
+        homeWidgetBridge = BStreamHomeWidgetEnginePlugin.registerWith(flutterEngine).also {
+            it.attachActionRelay(this)
+        }
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -148,9 +168,35 @@ class MainActivity : AudioServiceActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (!handleExternalAudioIntent(intent)) {
+        if (!IncomingCsvFileBridge.accept(this, intent) &&
+            !handleHomeWidgetActionIntent(intent) && !handleExternalAudioIntent(intent)) {
             handleAppActivationIntent(intent)
         }
+    }
+
+    private fun handleHomeWidgetActionIntent(intent: Intent?): Boolean {
+        if (intent?.action != ACTION_HOME_WIDGET_CONTROL) return false
+        val action = intent.getStringExtra(EXTRA_HOME_WIDGET_ACTION)
+            ?.takeIf(::isValidHomeWidgetAction)
+            ?: return false
+        pendingHomeWidgetAction = action
+        homeWidgetBridge?.sendAction(action) {
+            if (pendingHomeWidgetAction == action) pendingHomeWidgetAction = null
+        }
+        return true
+    }
+
+    override fun consumePendingAction(): String? {
+        val action = pendingHomeWidgetAction
+        pendingHomeWidgetAction = null
+        return action
+    }
+
+    private fun isValidHomeWidgetAction(action: String): Boolean {
+        if (action in HOME_WIDGET_ACTIONS) return true
+        if (!action.startsWith(HOME_WIDGET_QUEUE_PREFIX)) return false
+        val index = action.removePrefix(HOME_WIDGET_QUEUE_PREFIX).toIntOrNull() ?: return false
+        return index >= 0
     }
 
     override fun onRequestPermissionsResult(
@@ -191,8 +237,12 @@ class MainActivity : AudioServiceActivity() {
     }
 
     override fun onDestroy() {
+        audioOutputPlugin?.dispose()
+        localAudioQualityPlugin?.dispose()
         externalAudioExecutor.shutdownNow()
         localArtworkExecutor.shutdownNow()
+        homeWidgetBridge?.detachActionRelay(this)
+        homeWidgetBridge = null
         pendingLocalAudioPermissionResult?.error(
             "activity_destroyed",
             "The Android activity was closed before audio permission completed.",
@@ -683,6 +733,10 @@ class MainActivity : AudioServiceActivity() {
     }
 
     companion object {
+        const val ACTION_HOME_WIDGET_CONTROL = "com.bstream.bstream_music.HOME_WIDGET_CONTROL"
+        const val EXTRA_HOME_WIDGET_ACTION = "home_widget_action"
+        const val HOME_WIDGET_QUEUE_PREFIX = "queue:"
+        private val HOME_WIDGET_ACTIONS = setOf("repeat", "favorite")
         private const val FILE_EXPORT_CHANNEL = "bstream_music/file_export"
         private const val SCREEN_CHANNEL = "bstream_music/screen"
         private const val SUPPORTED_LINKS_SETTINGS_CHANNEL =

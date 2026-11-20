@@ -1,6 +1,5 @@
 package com.bstream.bstream_music
 
-import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
 import android.content.Context
@@ -19,7 +18,6 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.widget.RemoteViews
-import es.antonborri.home_widget.HomeWidgetBackgroundIntent
 import es.antonborri.home_widget.HomeWidgetLaunchIntent
 import es.antonborri.home_widget.HomeWidgetProvider
 import java.io.File
@@ -58,17 +56,13 @@ class MusicWidgetProvider : HomeWidgetProvider() {
             return
         }
         try {
-            // The relay is the authoritative control: home_widget dispatches its
-            // Dart callback in an isolated engine with no plugin registrant, so no
-            // audio plugin is reachable from there on Android. A queue tap jumps
-            // that many tracks forward.
+            // Legacy taps from widget instances drawn by an older build. Current
+            // buttons go straight to BStreamWidgetPlaybackReceiver, which talks to
+            // the media session and can jump to an exact queue item.
             action.keyCodes.forEach { keyCode -> sendMediaButton(context, keyCode) }
         } catch (error: Throwable) {
             Log.w(TAG, "Could not relay ${action.name} to the media session", error)
         }
-        // Mirror the tap into home_widget's background pipeline so the Dart
-        // callback observes the same URI the button was bound to. Never fatal.
-        forwardToDart(context, action.uri)
     }
 
     /**
@@ -156,44 +150,56 @@ class MusicWidgetProvider : HomeWidgetProvider() {
         guarded("intent PREVIOUS") {
             views.setOnClickPendingIntent(
                 R.id.btn_prev,
-                transportPendingIntent(context, WidgetAction.PREVIOUS),
+                BStreamWidgetPlaybackReceiver.mediaButton(context, KeyEvent.KEYCODE_MEDIA_PREVIOUS),
             )
         }
         guarded("intent PLAY_PAUSE") {
             views.setOnClickPendingIntent(
                 R.id.btn_play,
-                transportPendingIntent(context, WidgetAction.PLAY_PAUSE),
+                BStreamWidgetPlaybackReceiver.mediaButton(context, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE),
             )
         }
         guarded("intent NEXT") {
             views.setOnClickPendingIntent(
                 R.id.btn_next,
-                transportPendingIntent(context, WidgetAction.NEXT),
+                BStreamWidgetPlaybackReceiver.mediaButton(context, KeyEvent.KEYCODE_MEDIA_NEXT),
             )
         }
         guarded("intent QUEUE_1") {
-            views.setOnClickPendingIntent(
-                R.id.row_queue_1,
-                transportPendingIntent(context, WidgetAction.QUEUE_1),
-            )
+            val queueIndex = widgetData.getInt("queue1Index", -1)
+            if (queueIndex >= 0) {
+                views.setOnClickPendingIntent(
+                    R.id.row_queue_1,
+                    BStreamWidgetPlaybackReceiver.queueItem(context, 1, queueIndex),
+                )
+            }
         }
         guarded("intent QUEUE_2") {
-            views.setOnClickPendingIntent(
-                R.id.row_queue_2,
-                transportPendingIntent(context, WidgetAction.QUEUE_2),
-            )
+            val queueIndex = widgetData.getInt("queue2Index", -1)
+            if (queueIndex >= 0) {
+                views.setOnClickPendingIntent(
+                    R.id.row_queue_2,
+                    BStreamWidgetPlaybackReceiver.queueItem(context, 2, queueIndex),
+                )
+            }
         }
         guarded("intent QUEUE_3") {
-            views.setOnClickPendingIntent(
-                R.id.row_queue_3,
-                transportPendingIntent(context, WidgetAction.QUEUE_3),
-            )
+            val queueIndex = widgetData.getInt("queue3Index", -1)
+            if (queueIndex >= 0) {
+                views.setOnClickPendingIntent(
+                    R.id.row_queue_3,
+                    BStreamWidgetPlaybackReceiver.queueItem(context, 3, queueIndex),
+                )
+            }
         }
         guarded("intent QUEUE_4") {
-            views.setOnClickPendingIntent(
-                R.id.row_queue_4,
-                transportPendingIntent(context, WidgetAction.QUEUE_4),
-            )
+            val queueIndex = widgetData.getInt("queue4Index", -1)
+            if (queueIndex >= 0) {
+                views.setOnClickPendingIntent(
+                    R.id.row_queue_4,
+                    BStreamWidgetPlaybackReceiver.queueItem(context, 4, queueIndex),
+                )
+            }
         }
 
         guarded("open app") {
@@ -220,31 +226,6 @@ class MusicWidgetProvider : HomeWidgetProvider() {
             putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         }
         context.sendBroadcast(mediaButtonIntent)
-    }
-
-    private fun forwardToDart(context: Context, uri: String) {
-        try {
-            HomeWidgetBackgroundIntent.getBroadcast(context, Uri.parse(uri)).send()
-        } catch (error: Throwable) {
-            Log.w(TAG, "Could not forward the widget tap to Dart", error)
-        }
-    }
-
-    private fun transportPendingIntent(
-        context: Context,
-        action: WidgetAction,
-    ): PendingIntent {
-        // `data` keeps every intent distinct, so FLAG_UPDATE_CURRENT refreshes
-        // the matching PendingIntent instead of stacking copies.
-        return PendingIntent.getBroadcast(
-            context,
-            action.requestCode,
-            Intent(context, MusicWidgetProvider::class.java).apply {
-                this.action = action.action
-                data = Uri.parse(action.uri)
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
     }
 
     private fun bindQueueRow(

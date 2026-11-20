@@ -6,12 +6,148 @@ import 'package:bstream_music/features/music/domain/entities/local_track.dart';
 import 'package:bstream_music/features/music/domain/entities/track_info.dart';
 import 'package:bstream_music/services/player/just_audio_player_service.dart';
 import 'package:bstream_music/services/player/notification_artwork_service.dart';
+import 'package:bstream_music/services/player/player_equalizer.dart';
 import 'package:bstream_music/services/player/player_service.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_audio/just_audio.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  _androidEqualizerTests();
+
+  group('restored playback position', () {
+    for (final sourceType in [
+      'remote',
+      'remote source',
+      'local',
+      'local queue',
+    ]) {
+      test('$sourceType loads at its saved position before playing', () async {
+        final fixture = await _Fixture.create();
+        final backend = fixture.backend..blockNextSourceLoad = true;
+        const position = Duration(seconds: 42, milliseconds: 250);
+        final positionsAtPlay = <Duration>[];
+        backend.onPlay = () => positionsAtPlay.add(backend.position);
+        try {
+          final Future<void> play;
+          switch (sourceType) {
+            case 'remote':
+              play = fixture.service.playRemote(
+                _remoteSource('restored').track,
+                initialPosition: position,
+              );
+            case 'remote source':
+              play = fixture.service.playRemoteSource(
+                _remoteSource('restored'),
+                initialPosition: position,
+              );
+            case 'local':
+              play = fixture.service.playLocal(
+                _localTrack('restored'),
+                initialPosition: position,
+              );
+            case 'local queue':
+              play = fixture.service.playLocalQueue(
+                [_localTrack('previous'), _localTrack('restored')],
+                1,
+                initialPosition: position,
+              );
+            default:
+              throw StateError('Unknown source type');
+          }
+          await _waitUntil(() => backend.sourceLoadCalls.isNotEmpty);
+          expect(backend.sourceLoadCalls.single.initialPosition, position);
+          expect(backend.playCalls, 0);
+          expect(fixture.service.currentSnapshot.position, position);
+          backend.completeSourceLoad(0);
+          await play;
+          await _drainEvents();
+          expect(positionsAtPlay, [position]);
+          expect(backend.seekCalls, 0);
+          expect(fixture.service.currentSnapshot.position, position);
+          if (sourceType == 'local queue') expect(backend.currentIndex, 1);
+        } finally {
+          await fixture.dispose();
+        }
+      });
+    }
+
+    test(
+      'an existing local queue seeks before restarting the selected item',
+      () async {
+        final fixture = await _Fixture.create();
+        final backend = fixture.backend;
+        final queue = [_localTrack('first'), _localTrack('second')];
+        const position = Duration(seconds: 23);
+        try {
+          await fixture.service.playLocalQueue(queue, 0);
+          await fixture.service.pause();
+          final positionsAtPlay = <Duration>[];
+          backend.onPlay = () => positionsAtPlay.add(backend.position);
+          await fixture.service.playLocalQueue(
+            queue,
+            1,
+            initialPosition: position,
+          );
+          await _drainEvents();
+          expect(backend.sourceLoadCalls, hasLength(1));
+          expect(backend.currentIndex, 1);
+          expect(positionsAtPlay, [position]);
+          expect(fixture.service.currentSnapshot.position, position);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'an obsolete restored load cannot seek or play over a newer source',
+      () async {
+        final fixture = await _Fixture.create();
+        final backend = fixture.backend..blockNextSourceLoad = true;
+        final positionsAtPlay = <Duration>[];
+        backend.onPlay = () => positionsAtPlay.add(backend.position);
+        try {
+          final previous = fixture.service.playRemoteSource(
+            _remoteSource('obsolete'),
+            initialPosition: const Duration(seconds: 42),
+          );
+          await _waitUntil(() => backend.sourceLoadCalls.length == 1);
+          await fixture.service.playRemoteSource(_remoteSource('selected'));
+          await previous;
+          backend.completeSourceLoad(0);
+          await _drainEvents();
+          expect(positionsAtPlay, [Duration.zero]);
+          expect(backend.seekCalls, 0);
+          expect(fixture.service.currentSnapshot.trackId, 'selected');
+          expect(fixture.service.currentSnapshot.position, Duration.zero);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'invalid negative positions use the normal beginning of the source',
+      () async {
+        final fixture = await _Fixture.create();
+        try {
+          await fixture.service.playLocal(
+            _localTrack('negative'),
+            initialPosition: const Duration(seconds: -1),
+          );
+          expect(
+            fixture.backend.sourceLoadCalls.single.initialPosition,
+            Duration.zero,
+          );
+          expect(fixture.backend.position, Duration.zero);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+  });
 
   MediaItem remoteItem(String id, String queueEntryId) {
     return MediaItem(
@@ -136,6 +272,288 @@ void main() {
   });
 
   test(
+    'background position snapshots are coalesced without hiding seeks',
+    () async {
+      final fixture = await _Fixture.create();
+      final positions = <Duration>[];
+      final subscription = fixture.service.snapshotStream.listen(
+        (snapshot) => positions.add(snapshot.position),
+      );
+      try {
+        fixture.backend.emitPosition(const Duration(milliseconds: 250));
+        await _drainEvents();
+        expect(positions.last, const Duration(milliseconds: 250));
+
+        fixture.service.didChangeAppLifecycleState(AppLifecycleState.paused);
+        fixture.backend.emitPosition(const Duration(milliseconds: 500));
+        fixture.backend.emitPosition(const Duration(milliseconds: 900));
+        await _drainEvents();
+        expect(positions, [const Duration(milliseconds: 250)]);
+
+        fixture.backend.emitPosition(const Duration(milliseconds: 1250));
+        await _drainEvents();
+        expect(positions.last, const Duration(milliseconds: 1250));
+        expect(positions.length, 2);
+
+        fixture.backend.emitPosition(const Duration(seconds: 5));
+        await _drainEvents();
+        expect(positions.last, const Duration(seconds: 5));
+        expect(positions.length, 3);
+
+        fixture.backend.emitPosition(const Duration(milliseconds: 400));
+        await _drainEvents();
+        expect(positions.last, const Duration(milliseconds: 400));
+        expect(positions.length, 4);
+
+        fixture.backend.emitPosition(const Duration(milliseconds: 700));
+        await _drainEvents();
+        expect(positions.length, 4);
+        fixture.service.didChangeAppLifecycleState(AppLifecycleState.resumed);
+        await _drainEvents();
+        expect(positions.last, const Duration(milliseconds: 700));
+        expect(positions.length, 5);
+      } finally {
+        await subscription.cancel();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  for (final kind in ['remote', 'local', 'queue']) {
+    test('pause while $kind source loads prevents a late auto-start', () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend..blockNextSourceLoad = true;
+      try {
+        final load = switch (kind) {
+          'remote' => fixture.service.playRemoteSource(
+            _remoteSource('pending'),
+          ),
+          'local' => fixture.service.playLocal(_localTrack('pending')),
+          _ => fixture.service.playLocalQueue([_localTrack('pending')], 0),
+        };
+        await _waitUntil(() => backend.sourceLoadCalls.length == 1);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+
+        await fixture.service.pause();
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+        backend.completeSourceLoad(0);
+        await load;
+        await _drainEvents();
+
+        expect(backend.playCalls, 0);
+        expect(backend.playing, isFalse);
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.paused);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+
+        await fixture.service.resume();
+        await _drainEvents();
+        expect(backend.playCalls, 1);
+        expect(backend.playing, isTrue);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+      } finally {
+        await fixture.dispose();
+      }
+    });
+  }
+
+  test(
+    'resume during a pending load waits for that source, not the old one',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('old'));
+        backend.blockNextSourceLoad = true;
+        final load = fixture.service.playRemoteSource(_remoteSource('new'));
+        await _waitUntil(() => backend.sourceLoadCalls.length == 2);
+
+        await fixture.service.pause();
+        final callsBeforeResume = backend.playCalls;
+        await fixture.service.resume();
+        expect(backend.playCalls, callsBeforeResume);
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.loading);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+
+        backend.completeSourceLoad(1);
+        await load;
+        await _drainEvents();
+        expect(backend.playCalls, callsBeforeResume + 1);
+        expect(_queueEntryId(backend), 'remote:new');
+        expect(backend.playing, isTrue);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'native interruption during replacement load prevents late restart',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('old'));
+        backend.blockNextSourceLoad = true;
+        final load = fixture.service.playRemoteSource(_remoteSource('new'));
+        await _waitUntil(() => backend.sourceLoadCalls.length == 2);
+
+        // just_audio handles audio-focus loss and interruptions on its own.
+        await backend.pause();
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+        final callsBeforeReady = backend.playCalls;
+        backend.completeSourceLoad(1);
+        await load;
+        await _drainEvents();
+
+        expect(backend.playCalls, callsBeforeReady);
+        expect(backend.playing, isFalse);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'late play failure after explicit pause cannot fail the paused song',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend
+        ..blockNextPlay = true
+        ..failBlockedPlay = true;
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('pending-play'));
+        await backend.playStarted.future;
+        await fixture.service.pause();
+        backend.releasePlay.complete();
+        await _drainEvents();
+
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.paused);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+        expect(backend.playing, isFalse);
+      } finally {
+        if (!backend.releasePlay.isCompleted) backend.releasePlay.complete();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'queue reconciliation cannot restore intent captured before pause',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      try {
+        final tracks = [_localTrack('a'), _localTrack('b')];
+        await fixture.service.playLocalQueue(tracks, 0);
+        backend.blockMoves = true;
+        final replace = fixture.service.replaceLocalQueue(
+          tracks.reversed.toList(),
+          1,
+        );
+        await backend.moveStarted.future;
+        await fixture.service.pause();
+        final callsBeforeReady = backend.playCalls;
+        backend.releaseMove.complete();
+        await replace;
+        await _drainEvents();
+
+        expect(backend.playCalls, callsBeforeReady);
+        expect(backend.playing, isFalse);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test('pause during load option writes still prevents auto-start', () async {
+    final fixture = await _Fixture.create();
+    final backend = fixture.backend..blockNextLoopMode = true;
+    try {
+      final load = fixture.service.playRemoteSource(_remoteSource('pending'));
+      await backend.loopModeWriteStarted.future;
+      await fixture.service.pause();
+      backend.releaseLoopModeWrite.complete();
+      await load;
+      await _drainEvents();
+
+      expect(backend.playCalls, 0);
+      expect(backend.playing, isFalse);
+      expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  test(
+    'a permitted native interruption resume restores playback intent',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('current'));
+        await backend.pause();
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+        await backend.play();
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.playing);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'native pause while rebuffering is a pause, not continuing recovery',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('current'));
+        backend.emitBuffering();
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+        backend.emitBuffering(playing: false);
+
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.paused);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+        final callsBeforeReady = backend.playCalls;
+        backend.emitReady();
+        await _drainEvents();
+        expect(backend.playCalls, callsBeforeReady);
+        expect(backend.playing, isFalse);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'a late pause acknowledgement cannot overwrite a later resume',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('current'));
+        backend.blockNextPause = true;
+        final pause = fixture.service.pause();
+        await backend.pauseStarted.future;
+        await fixture.service.resume();
+        backend.releasePause.complete();
+        await pause;
+        await _drainEvents();
+
+        expect(backend.playing, isTrue);
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.playing);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+      } finally {
+        if (!backend.releasePause.isCompleted) backend.releasePause.complete();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
     'hung source A cannot block B or overwrite it when A completes late',
     () async {
       final fixture = await _Fixture.create();
@@ -191,6 +609,69 @@ void main() {
         expect(backend.sequence, isEmpty);
         expect(backend.playing, isFalse);
         expect(fixture.service.currentSnapshot.status, PlayerStatus.stopped);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'an interrupted old load cannot fail the replacement at its reused index',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend..blockNextSourceLoad = true;
+      final snapshots = <PlayerSnapshot>[];
+      final subscription = fixture.service.snapshotStream.listen(snapshots.add);
+      try {
+        final load = fixture.service.playRemoteSource(
+          _remoteSource('selected'),
+        );
+        await _waitUntil(() => backend.sourceLoadCalls.length == 1);
+        // The SDK publishes the replacement's index/tags before its load Future
+        // completes, then Android reports cancellation of the previous load.
+        backend.publishPendingSourceSequence(0);
+        expect(_queueEntryId(backend), 'remote:selected');
+        backend.emitError(PlayerException(10000000, 'Connection aborted', 0));
+        await _drainEvents();
+        expect(
+          snapshots.any((snapshot) => snapshot.status == PlayerStatus.failed),
+          isFalse,
+        );
+        backend.completeSourceLoad(0);
+        await load;
+        await _drainEvents();
+        expect(backend.setAudioSourcesCalls, 1);
+        expect(backend.playCalls, 1);
+        expect(backend.playing, isTrue);
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.playing);
+        expect(fixture.service.currentSnapshot.errorMessage, isNull);
+        expect(
+          snapshots.any((snapshot) => snapshot.status == PlayerStatus.failed),
+          isFalse,
+        );
+      } finally {
+        await subscription.cancel();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'a genuine HTTP failure at the same current index still fails playback',
+    () async {
+      final fixture = await _Fixture.create();
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('selected'));
+        expect(_queueEntryId(fixture.backend), 'remote:selected');
+        fixture.backend.emitError(
+          PlayerException(403, 'HTTP 403 forbidden', 0),
+        );
+        await _drainEvents();
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.failed);
+        expect(
+          fixture.service.currentSnapshot.errorMessage,
+          'HTTP 403 forbidden',
+        );
       } finally {
         await fixture.dispose();
       }
@@ -317,6 +798,54 @@ void main() {
   );
 
   test(
+    'a native queue transition publishes the new item and clock together',
+    () async {
+      final fixture = await _Fixture.create();
+      final backend = fixture.backend;
+      final snapshots = <PlayerSnapshot>[];
+      final subscription = fixture.service.snapshotStream.listen(snapshots.add);
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('quick-pick-a'));
+        await fixture.service.updateRemoteQueue([
+          _remoteSource('quick-pick-b'),
+        ]);
+        backend.emitPosition(const Duration(seconds: 10));
+        await _drainEvents();
+        expect(
+          fixture.service.currentSnapshot.position,
+          const Duration(seconds: 10),
+        );
+        snapshots.clear();
+
+        // The native index and clock change in one event, before the next
+        // periodic position sample reaches the service.
+        backend.emitSequenceState(
+          currentIndex: 1,
+          position: const Duration(milliseconds: 125),
+        );
+        await _drainEvents();
+
+        final successorSnapshots = snapshots.where(
+          (snapshot) => snapshot.trackId == 'quick-pick-b',
+        );
+        expect(successorSnapshots, isNotEmpty);
+        expect(
+          successorSnapshots.map((snapshot) => snapshot.position),
+          everyElement(const Duration(milliseconds: 125)),
+          reason: 'New track metadata must never carry the previous clock.',
+        );
+        expect(
+          fixture.service.currentSnapshot.position,
+          const Duration(milliseconds: 125),
+        );
+      } finally {
+        await subscription.cancel();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
     'source deadline interrupts the native load before late completion',
     () async {
       final deadline = Completer<void>();
@@ -335,6 +864,82 @@ void main() {
         await _drainEvents();
         expect(backend.sequence, isEmpty);
         expect(fixture.service.currentSnapshot.status, PlayerStatus.failed);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'background timeout teardown keeps intent for bounded source recovery',
+    () async {
+      final deadline = Completer<void>();
+      var deadlineCalls = 0;
+      final fixture = await _Fixture.create(
+        operationDeadline: (_) =>
+            deadlineCalls++ == 0 ? deadline.future : Completer<void>().future,
+      );
+      final backend = fixture.backend..blockNextSourceLoad = true;
+      final snapshots = <PlayerSnapshot>[];
+      final subscription = fixture.service.snapshotStream.listen(snapshots.add);
+      try {
+        fixture.service.didChangeAppLifecycleState(AppLifecycleState.paused);
+        final play = fixture.service.playRemoteSource(
+          _remoteSource('timed-out'),
+        );
+        await _waitUntil(() => backend.sourceLoadCalls.length == 1);
+        deadline.complete();
+        await expectLater(play, throwsA(isA<TimeoutException>()));
+        await _drainEvents();
+
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.failed);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+        expect(
+          snapshots.any((snapshot) => snapshot.status == PlayerStatus.paused),
+          isFalse,
+        );
+        expect(snapshots.every((snapshot) => snapshot.wantsToPlay), isTrue);
+
+        // The timed-out native load can finish late, but must not interrupt the
+        // source selected by the controller's bounded recovery cycle.
+        await fixture.service.playRemoteSource(_remoteSource('recovered'));
+        backend.completeSourceLoad(0);
+        await _drainEvents();
+        expect(_queueEntryId(backend), 'remote:recovered');
+        expect(backend.playing, isTrue);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isTrue);
+
+        await fixture.service.stop();
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
+      } finally {
+        await subscription.cancel();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  test(
+    'explicit pause after source timeout still releases recovery intent',
+    () async {
+      final deadline = Completer<void>();
+      final fixture = await _Fixture.create(
+        operationDeadline: (_) => deadline.future,
+      );
+      final backend = fixture.backend..blockNextSourceLoad = true;
+      try {
+        final play = fixture.service.playRemoteSource(
+          _remoteSource('timed-out'),
+        );
+        await _waitUntil(() => backend.sourceLoadCalls.length == 1);
+        deadline.complete();
+        await expectLater(play, throwsA(isA<TimeoutException>()));
+
+        await fixture.service.pause();
+        backend.completeSourceLoad(0);
+        await _drainEvents();
+        expect(backend.playing, isFalse);
+        expect(fixture.service.currentSnapshot.status, PlayerStatus.paused);
+        expect(fixture.service.currentSnapshot.wantsToPlay, isFalse);
       } finally {
         await fixture.dispose();
       }
@@ -441,7 +1046,250 @@ void main() {
     },
   );
 
+  group('same-recording source upgrades', () {
+    test('realigns after a muted decoder takes time to start', () async {
+      final fixture = await _CrossfadeFixture.create();
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('current'));
+        fixture.primary
+          ..emitDuration(const Duration(minutes: 3))
+          ..emitPosition(const Duration(seconds: 41));
+        await _drainEvents();
+        fixture.standby.onPlay = () {
+          fixture.primary.emitPosition(const Duration(seconds: 44));
+        };
+        expect(
+          await fixture.service.upgradeRemoteSource(_upgradeSource()),
+          isTrue,
+        );
+        expect(fixture.standby.position, const Duration(seconds: 44));
+        expect(
+          fixture.service.currentSnapshot.position,
+          const Duration(seconds: 44),
+        );
+        expect(fixture.primary.seekCalls, 0);
+        expect(fixture.primary.setAudioSourcesCalls, 1);
+      } finally {
+        await fixture.dispose();
+      }
+    });
+
+    test(
+      'prepares muted, keeps playback, and retains the native future queue',
+      () async {
+        final fixture = await _CrossfadeFixture.create();
+        try {
+          await fixture.service.playRemoteSource(_remoteSource('current'));
+          await fixture.service.updateRemoteQueue([
+            _remoteSource('next'),
+            _remoteSource('third'),
+          ]);
+          await fixture.service.setVolume(.65);
+          fixture.primary
+            ..emitDuration(const Duration(minutes: 3))
+            ..emitPosition(const Duration(seconds: 41));
+          await _drainEvents();
+          final snapshots = <PlayerSnapshot>[];
+          final subscription = fixture.service.snapshotStream.listen(
+            snapshots.add,
+          );
+          fixture.standby.blockNextSourceLoad = true;
+          final upgrade = fixture.service.upgradeRemoteSource(_upgradeSource());
+          await _waitUntil(() => fixture.standby.sourceLoadCalls.isNotEmpty);
+          expect(fixture.primary.playing, isTrue);
+          expect(fixture.primary.stopCalls, 0);
+          expect(fixture.standby.playCalls, 0);
+          expect(
+            fixture.standby.volumeCalls.every((value) => value == 0),
+            isTrue,
+          );
+          fixture.primary.emitPosition(const Duration(seconds: 43));
+          fixture.standby.completeSourceLoad(0);
+          expect(await upgrade, isTrue);
+          expect(fixture.service.crossfadeEnabled, isFalse);
+          expect(
+            fixture.service.currentSnapshot.queueEntryId,
+            'remote:current',
+          );
+          expect(
+            fixture.service.currentSnapshot.position,
+            const Duration(seconds: 43),
+          );
+          expect(fixture.service.currentSnapshot.volume, .65);
+          expect(fixture.standby.sequence, hasLength(3));
+          expect(_queueEntryId(fixture.standby), 'remote:current');
+          expect(
+            (fixture.standby.sequence[0] as UriAudioSource).uri.host,
+            'quality.example',
+          );
+          expect((fixture.standby.sequence[1].tag as MediaItem).id, 'next');
+          expect((fixture.standby.sequence[2].tag as MediaItem).id, 'third');
+          expect(fixture.primary.setAudioSourcesCalls, 1);
+          expect(fixture.primary.seekCalls, 0);
+          expect(fixture.standby.playCalls, 1);
+          expect(
+            snapshots.every(
+              (snapshot) => snapshot.status == PlayerStatus.playing,
+            ),
+            isTrue,
+          );
+          expect(
+            snapshots.every(
+              (snapshot) => snapshot.queueEntryId == 'remote:current',
+            ),
+            isTrue,
+          );
+          await fixture.service.updateRemoteQueue([_remoteSource('last')]);
+          expect(fixture.standby.setAudioSourcesCalls, 1);
+          expect((fixture.standby.sequence.last.tag as MediaItem).id, 'last');
+          await subscription.cancel();
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    for (final action in ['pause', 'seek', 'volume', 'next', 'stale']) {
+      test(
+        '$action cancels a preparing upgrade without starting its deck',
+        () async {
+          final fixture = await _CrossfadeFixture.create();
+          try {
+            await fixture.service.playRemoteSource(_remoteSource('current'));
+            await fixture.service.updateRemoteQueue([_remoteSource('next')]);
+            fixture.primary
+              ..emitDuration(const Duration(minutes: 3))
+              ..emitPosition(const Duration(seconds: 41));
+            await _drainEvents();
+            var current = true;
+            fixture.standby.blockNextSourceLoad = true;
+            final upgrade = fixture.service.upgradeRemoteSource(
+              _upgradeSource(),
+              shouldContinue: () => current,
+            );
+            await _waitUntil(() => fixture.standby.sourceLoadCalls.isNotEmpty);
+            switch (action) {
+              case 'pause':
+                await fixture.service.pause();
+              case 'seek':
+                await fixture.service.seek(const Duration(seconds: 72));
+              case 'volume':
+                await fixture.service.setVolume(.2);
+              case 'next':
+                fixture.primary.emitSequenceState(currentIndex: 1);
+                await _drainEvents();
+              case 'stale':
+                current = false;
+            }
+            if (!fixture.standby.sourceLoadCalls.single.completer.isCompleted) {
+              fixture.standby.completeSourceLoad(0);
+            }
+            expect(await upgrade, isFalse);
+            expect(fixture.standby.playCalls, 0);
+            expect(fixture.primary.stopCalls, 0);
+            expect(
+              fixture.service.currentSnapshot.queueEntryId,
+              action == 'next' ? 'remote:next' : 'remote:current',
+            );
+            if (action == 'pause') {
+              expect(
+                fixture.service.currentSnapshot.status,
+                PlayerStatus.paused,
+              );
+            }
+            if (action == 'seek') {
+              expect(
+                fixture.service.currentSnapshot.position,
+                const Duration(seconds: 72),
+              );
+            }
+            if (action == 'volume') {
+              expect(fixture.service.currentSnapshot.volume, .2);
+            }
+          } finally {
+            await fixture.dispose();
+          }
+        },
+      );
+    }
+
+    test(
+      'an invalid upgrade keeps the original and never restarts it',
+      () async {
+        final fixture = await _CrossfadeFixture.create();
+        try {
+          await fixture.service.playRemoteSource(_remoteSource('current'));
+          fixture.primary.emitDuration(const Duration(minutes: 3));
+          await _drainEvents();
+          fixture.standby.failNextSourceLoad = PlayerException(
+            1,
+            'bad source',
+            0,
+          );
+          expect(
+            await fixture.service.upgradeRemoteSource(_upgradeSource()),
+            isFalse,
+          );
+          expect(fixture.primary.playing, isTrue);
+          expect(fixture.primary.setAudioSourcesCalls, 1);
+          expect(fixture.primary.stopCalls, 0);
+          expect(
+            fixture.service.currentSnapshot.queueEntryId,
+            'remote:current',
+          );
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test('near the next track no upgrade decoder is opened', () async {
+      final fixture = await _CrossfadeFixture.create();
+      try {
+        await fixture.service.playRemoteSource(_remoteSource('current'));
+        fixture.primary
+          ..emitDuration(const Duration(minutes: 3))
+          ..emitPosition(const Duration(seconds: 178));
+        await _drainEvents();
+        expect(
+          await fixture.service.upgradeRemoteSource(_upgradeSource()),
+          isFalse,
+        );
+        expect(fixture.standby.setAudioSourcesCalls, 0);
+      } finally {
+        await fixture.dispose();
+      }
+    });
+  });
+
   group('dual-deck crossfade', () {
+    test(
+      'background snapshot throttling keeps crossfade timing precise',
+      () async {
+        final fixture = await _CrossfadeFixture.create();
+        try {
+          await fixture.playAndPrepare(
+            masterVolume: 0.7,
+            crossfadeDuration: const Duration(seconds: 2),
+            trackDuration: const Duration(seconds: 10),
+          );
+          fixture.service.didChangeAppLifecycleState(AppLifecycleState.paused);
+          fixture.primary.emitPosition(const Duration(milliseconds: 7900));
+          expect(fixture.standby.playCalls, 0);
+
+          fixture.primary.emitPosition(const Duration(seconds: 8));
+          expect(
+            fixture.service.currentSnapshot.position,
+            const Duration(milliseconds: 7900),
+            reason: 'The 100 ms UI update may be suppressed in the background.',
+          );
+          await _waitUntil(() => fixture.standby.playCalls > 0);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
     test(
       'skip silence stays synchronized across an active crossfade',
       () async {
@@ -1744,6 +2592,494 @@ void main() {
   });
 }
 
+void _androidEqualizerTests() {
+  group('Mobile BStream PCM processing', () {
+    const curve = EqualizerSettings(
+      enabled: true,
+      gainsDb: [6, 4, 2, 0, -2, -1, 1, 2, 1, 0],
+    );
+    const alternate = EqualizerSettings(
+      enabled: true,
+      gainsDb: [-3, 1.5, 3.5, 2, -1, 1, 2, 1, 0, -1],
+    );
+
+    test(
+      'Darwin asset capability changes retain the skip target and playback',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        final snapshots = <PlayerSnapshot>[];
+        final subscription = fixture.service.snapshotStream.listen(
+          snapshots.add,
+        );
+        try {
+          final effect = fixture.equalizers[fixture.primary]!;
+          await fixture.service.configureSkipSilence(enabled: true);
+          expect(fixture.service.supportsSkipSilence, isTrue);
+          effect.skipSilenceSupported = false;
+          await effect.emitNativeStatus();
+          await _drainEvents();
+          expect(fixture.service.supportsSkipSilence, isFalse);
+          expect(fixture.service.supportsEqualizer, isTrue);
+          expect(snapshots, isNotEmpty);
+
+          await fixture.service.configureSkipSilence(enabled: false);
+          await fixture.service.configureSkipSilence(enabled: true);
+          expect(fixture.primary.skipSilenceCalls.last, isTrue);
+          expect(fixture.service.skipSilenceEnabled, isTrue);
+          expect(fixture.primary.stopCalls, 0);
+          expect(fixture.primary.seekCalls, 0);
+          final writesBeforeRecovery = fixture.primary.skipSilenceCalls.length;
+          effect.skipSilenceSupported = true;
+          await effect.emitNativeStatus();
+          await _waitUntil(
+            () =>
+                fixture.primary.skipSilenceCalls.length > writesBeforeRecovery,
+          );
+          expect(fixture.service.supportsSkipSilence, isTrue);
+          expect(fixture.primary.skipSilenceCalls.last, isTrue);
+        } finally {
+          await subscription.cancel();
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'a temporarily unsupported asset does not block a prepared crossfade',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.playCurrent(masterVolume: .72);
+          await fixture.service.configureSkipSilence(enabled: true);
+          final effect = fixture.equalizers[fixture.primary]!;
+          effect.skipSilenceSupported = false;
+          await effect.emitNativeStatus();
+          await fixture.service.prepareCrossfade(
+            RemoteCrossfadePlaybackSource(_remoteSource('next')),
+          );
+          expect(fixture.service.supportsSkipSilence, isFalse);
+          expect(fixture.standby.setAudioSourcesCalls, greaterThan(0));
+          fixture.primary.emitPosition(const Duration(milliseconds: 500));
+          await _waitUntil(() => fixture.standby.playCalls > 0);
+          expect(fixture.service.crossfadeEnabled, isTrue);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'a backend without native support stores preferences without writes',
+      () async {
+        final fixture = await _CrossfadeFixture.create(
+          equalizer: true,
+          supportsSkipSilence: false,
+        );
+        try {
+          await fixture.service.configureSkipSilence(enabled: true);
+          expect(fixture.service.skipSilenceEnabled, isTrue);
+          expect(fixture.service.supportsSkipSilence, isFalse);
+          expect(fixture.primary.skipSilenceCalls, isEmpty);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'stores one complete curve before the first source is loaded',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          final effect = fixture.equalizers[fixture.primary]!;
+          await fixture.service.configureEqualizer(curve);
+          expect(effect.configureCalls, [curve]);
+          expect(effect.nativeSettings, curve);
+          expect(effect.configured, isFalse);
+          expect(fixture.primary.setAudioSourcesCalls, 0);
+          expect(fixture.primary.volumeCalls, isEmpty);
+          fixture.primary.onPlay = () {
+            expect(effect.nativeSettings, curve);
+            expect(effect.enabled, isTrue);
+            expect(fixture.primary.volumeCalls.last, 1);
+          };
+
+          await fixture.service.playRemoteSource(_remoteSource('current'));
+          await _drainEvents();
+
+          expect(fixture.primary.playCalls, 1);
+          expect(fixture.service.currentSnapshot.volume, 1);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'sends exact ten-band gains without device interpolation or quantization',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        const exact = EqualizerSettings(
+          enabled: true,
+          gainsDb: [12, 3.5, -4.25, 8, -12, 1, -1.5, 2.25, -3.75, 4.5],
+        );
+        try {
+          await fixture.service.configureEqualizer(exact);
+          final effect = fixture.equalizers[fixture.primary]!;
+          final status = await effect.readStatus();
+          expect(status.engine, 'bstream-dsp');
+          expect(
+            status.parameters.bands.map((band) => band.centerFrequency),
+            equalizerBandFrequencies,
+          );
+          expect(
+            status.parameters.bands.map((band) => band.gain),
+            exact.gainsDb,
+          );
+          expect(status.preampDb, exact.preampDb);
+          expect(effect.configureCalls, [exact]);
+
+          await fixture.service.configureEqualizer(exact);
+          expect(effect.configureCalls, [exact]);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'latest aggregate wins and queued intermediate curves are skipped',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          final effect = fixture.equalizers[fixture.primary]!;
+          effect.blockNextConfiguration = true;
+          final first = fixture.service.configureEqualizer(curve);
+          await effect.writeStarted.future;
+          final skipped = fixture.service.configureEqualizer(
+            const EqualizerSettings(
+              enabled: true,
+              gainsDb: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            ),
+          );
+          final latest = fixture.service.configureEqualizer(alternate);
+          effect.releaseWrite.complete();
+          await Future.wait([first, skipped, latest]);
+
+          expect(effect.configureCalls, [curve, alternate]);
+          expect(effect.nativeSettings, alternate);
+          expect(effect.enabled, isTrue);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'returning to the previous preset overwrites a stale blocked aggregate',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.service.configureEqualizer(curve);
+          final effect = fixture.equalizers[fixture.primary]!;
+          effect.blockNextConfiguration = true;
+          final interim = fixture.service.configureEqualizer(alternate);
+          await effect.writeStarted.future;
+          final restore = fixture.service.configureEqualizer(curve);
+          effect.releaseWrite.complete();
+          await Future.wait([interim, restore]);
+
+          expect(effect.configureCalls, [curve, alternate, curve]);
+          expect(effect.nativeSettings, curve);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'failed configuration bypasses DSP without changing playback or master gain',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.playCurrent(masterVolume: .7);
+          fixture.primary.emitPosition(const Duration(milliseconds: 123));
+          await _drainEvents();
+          final effect = fixture.equalizers[fixture.primary]!;
+          final volumeWrites = fixture.primary.volumeCalls.length;
+          final loads = fixture.primary.setAudioSourcesCalls;
+          effect.failNextConfiguration = true;
+
+          await expectLater(
+            fixture.service.configureEqualizer(curve),
+            throwsStateError,
+          );
+
+          expect(effect.configureCalls.last.enabled, isFalse);
+          expect(effect.nativeSettings.enabled, isFalse);
+          expect(fixture.primary.volumeCalls.length, volumeWrites);
+          expect(fixture.primary.volumeCalls.last, closeTo(.7, 1e-9));
+          expect(fixture.primary.setAudioSourcesCalls, loads);
+          expect(
+            fixture.service.currentSnapshot.position,
+            const Duration(milliseconds: 123),
+          );
+          expect(fixture.service.currentSnapshot.volume, .7);
+          expect(fixture.service.currentSnapshot.status, PlayerStatus.playing);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test('a failed aggregate can be retried with the same values', () async {
+      final fixture = await _CrossfadeFixture.create(equalizer: true);
+      try {
+        final effect = fixture.equalizers[fixture.primary]!;
+        effect.failNextConfiguration = true;
+        await expectLater(
+          fixture.service.configureEqualizer(curve),
+          throwsStateError,
+        );
+        final writes = effect.configureCalls.length;
+
+        await fixture.service.configureEqualizer(curve);
+
+        expect(effect.configureCalls.length, writes + 1);
+        expect(effect.nativeSettings, curve);
+        expect(effect.enabled, isTrue);
+      } finally {
+        await fixture.dispose();
+      }
+    });
+
+    for (final badAck in [
+      'engine',
+      'enabled',
+      'preamp',
+      'gain',
+      'center',
+      'bands',
+    ]) {
+      test(
+        'rejects wrong native $badAck ACK and retries the same curve',
+        () async {
+          final fixture = await _CrossfadeFixture.create(equalizer: true);
+          try {
+            await fixture.playCurrent(masterVolume: .7);
+            final effect = fixture.equalizers[fixture.primary]!;
+            effect.nextBadAcknowledgement = badAck;
+            await expectLater(
+              fixture.service.configureEqualizer(curve),
+              throwsStateError,
+            );
+            expect(effect.enabled, isFalse);
+            final writes = effect.configureCalls.length;
+
+            await fixture.service.configureEqualizer(curve);
+
+            expect(effect.configureCalls.length, writes + 1);
+            expect(effect.nativeSettings, curve);
+            expect(effect.enabled, isTrue);
+            expect(fixture.primary.volumeCalls.last, closeTo(.7, 1e-9));
+            expect(fixture.service.currentSnapshot.volume, .7);
+          } finally {
+            await fixture.dispose();
+          }
+        },
+      );
+    }
+
+    test('retrying bypass resends a rejected aggregate disable', () async {
+      final fixture = await _CrossfadeFixture.create(equalizer: true);
+      try {
+        await fixture.playCurrent(masterVolume: .7);
+        await fixture.service.configureEqualizer(curve);
+        final effect = fixture.equalizers[fixture.primary]!;
+        effect.disableFailures = 2;
+        await expectLater(
+          fixture.service.configureEqualizer(const EqualizerSettings()),
+          throwsStateError,
+        );
+        expect(effect.enabled, isTrue);
+
+        await fixture.service.configureEqualizer(const EqualizerSettings());
+
+        expect(effect.enabled, isFalse);
+        expect(fixture.primary.volumeCalls.last, closeTo(.7, 1e-9));
+        expect(fixture.service.currentSnapshot.volume, .7);
+      } finally {
+        await fixture.dispose();
+      }
+    });
+
+    test(
+      'unsupported DSP is reportable and supported status resumes its stored curve',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.playCurrent(masterVolume: .7);
+          final effect = fixture.equalizers[fixture.primary]!;
+          effect.nativeSupported = false;
+
+          await expectLater(
+            fixture.service.configureEqualizer(curve),
+            throwsStateError,
+          );
+
+          expect(fixture.service.supportsEqualizer, isFalse);
+          expect(effect.enabled, isFalse);
+          expect(fixture.primary.volumeCalls.last, closeTo(.7, 1e-9));
+          effect.nativeSupported = true;
+          await effect.emitNativeStatus();
+          await _waitUntil(
+            () => fixture.service.supportsEqualizer && effect.enabled,
+          );
+
+          expect(effect.nativeSettings, curve);
+          expect(fixture.service.currentSnapshot.volume, .7);
+          expect(fixture.service.currentSnapshot.status, PlayerStatus.playing);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'status notifications recover availability without polling on playback ticks',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.playCurrent(masterVolume: .7);
+          await fixture.service.configureEqualizer(curve);
+          final effect = fixture.equalizers[fixture.primary]!;
+          final reads = effect.statusReadCalls;
+          final writes = effect.configureCalls.length;
+          for (var index = 0; index < 12; index++) {
+            fixture.primary.emitPosition(Duration(milliseconds: index * 10));
+          }
+          await _drainEvents();
+          expect(effect.statusReadCalls, reads);
+          expect(effect.configureCalls.length, writes);
+
+          effect.nativeSupported = false;
+          effect.nativeSettings = const EqualizerSettings();
+          await effect.emitNativeStatus();
+          expect(fixture.service.supportsEqualizer, isFalse);
+          effect.nativeSupported = true;
+          await effect.emitNativeStatus();
+          await _waitUntil(
+            () => fixture.service.supportsEqualizer && effect.enabled,
+          );
+
+          expect(effect.nativeSettings, curve);
+          expect(fixture.primary.volumeCalls.last, closeTo(.7, 1e-9));
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'standby and promoted deck preserve aggregate EQ while gains remain master times fade',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.service.configureEqualizer(curve);
+          await fixture.playAndPrepare(masterVolume: .72);
+          final incomingEffect = fixture.equalizers[fixture.standby]!;
+          expect(incomingEffect.nativeSettings, curve);
+          expect(
+            fixture.standby.volumeCalls.every((gain) => gain == 0),
+            isTrue,
+          );
+          fixture.standby.onPlay = () {
+            expect(incomingEffect.nativeSettings, curve);
+            expect(incomingEffect.enabled, isTrue);
+          };
+          final primaryStart = fixture.primary.volumeCalls.length;
+          final standbyStart = fixture.standby.volumeCalls.length;
+          fixture.primary.emitPosition(const Duration(milliseconds: 400));
+          await _waitUntil(
+            () => fixture.service.currentSnapshot.queueEntryId == 'remote:next',
+            attempts: 700,
+          );
+
+          for (final volume in [
+            ...fixture.primary.volumeCalls.skip(primaryStart),
+            ...fixture.standby.volumeCalls.skip(standbyStart),
+          ]) {
+            expect(volume, inInclusiveRange(0, .72 + 1e-9));
+          }
+          expect(fixture.standby.volumeCalls.last, closeTo(.72, 1e-9));
+          expect(fixture.service.currentSnapshot.volume, .72);
+          await fixture.service.configureEqualizer(const EqualizerSettings());
+          expect(incomingEffect.enabled, isFalse);
+          expect(fixture.standby.volumeCalls.last, closeTo(.72, 1e-9));
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'stop, idle changes and resume retain aggregate tuning and user gain',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.playCurrent(masterVolume: .7);
+          await fixture.service.stop();
+          await fixture.service.configureEqualizer(curve);
+          await fixture.service.resume();
+          await _drainEvents();
+
+          expect(fixture.equalizers[fixture.primary]!.nativeSettings, curve);
+          expect(fixture.equalizers[fixture.primary]!.enabled, isTrue);
+          expect(fixture.primary.volumeCalls.last, closeTo(.7, 1e-9));
+          expect(fixture.service.currentSnapshot.volume, .7);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+
+    test(
+      'quality replacement has the same aggregate before becoming audible',
+      () async {
+        final fixture = await _CrossfadeFixture.create(equalizer: true);
+        try {
+          await fixture.service.configureEqualizer(curve);
+          await fixture.service.playRemoteSource(_remoteSource('current'));
+          await fixture.service.setVolume(.7);
+          fixture.primary
+            ..emitDuration(const Duration(minutes: 3))
+            ..emitPosition(const Duration(seconds: 41));
+          await _drainEvents();
+          fixture.standby.onPlay = () {
+            final effect = fixture.equalizers[fixture.standby]!;
+            expect(effect.enabled, isTrue);
+            expect(effect.nativeSettings, curve);
+          };
+
+          expect(
+            await fixture.service.upgradeRemoteSource(_upgradeSource()),
+            isTrue,
+          );
+
+          expect(fixture.standby.volumeCalls.last, closeTo(.7, 1e-9));
+          expect(
+            fixture.service.currentSnapshot.position,
+            const Duration(seconds: 41),
+          );
+          expect(fixture.service.currentSnapshot.volume, .7);
+        } finally {
+          await fixture.dispose();
+        }
+      },
+    );
+  });
+}
+
 RemotePlaybackSource _remoteSource(String id) => RemotePlaybackSource(
   track: TrackInfo(
     id: id,
@@ -1756,6 +3092,20 @@ RemotePlaybackSource _remoteSource(String id) => RemotePlaybackSource(
   uri: Uri.parse('https://media.example/$id.webm'),
   queueEntryId: 'remote:$id',
 );
+
+RemotePlaybackSource _upgradeSource() {
+  final original = _remoteSource('current');
+  return RemotePlaybackSource(
+    track: original.track.copyWith(
+      streamUrl: 'https://quality.example/current.m4a',
+      streamExtension: 'm4a',
+      streamBitrate: 320000,
+      streamCodec: 'aac',
+    ),
+    uri: Uri.parse('https://quality.example/current.m4a'),
+    queueEntryId: original.queueEntryId,
+  );
+}
 
 String? _queueEntryId(_BlockingAudioPlayer backend) {
   if (backend.sequence.isEmpty) return null;
@@ -1828,6 +3178,7 @@ class _CrossfadeFixture {
     this.standby,
     this.factoryPlayers,
     this.service,
+    this.equalizers,
   );
 
   final Directory directory;
@@ -1836,10 +3187,13 @@ class _CrossfadeFixture {
   final _BlockingAudioPlayer standby;
   final List<_BlockingAudioPlayer> factoryPlayers;
   final JustAudioPlayerService service;
+  final Map<AudioPlayer, _TestBStreamEqualizer> equalizers;
 
   static Future<_CrossfadeFixture> create({
     Duration skipSilenceWriteTimeout = const Duration(seconds: 2),
     JustAudioRemoteDiagnosticProbe? remoteDiagnosticProbe,
+    bool equalizer = false,
+    bool supportsSkipSilence = true,
   }) async {
     final directory = await Directory.systemTemp.createTemp(
       'bstream_just_audio_crossfade_',
@@ -1850,10 +3204,15 @@ class _CrossfadeFixture {
     final primary = _BlockingAudioPlayer();
     final standby = _BlockingAudioPlayer();
     final factoryPlayers = <_BlockingAudioPlayer>[];
+    final equalizers = <AudioPlayer, _TestBStreamEqualizer>{};
+    _TestBStreamEqualizer effectFor(AudioPlayer player) =>
+        equalizers.putIfAbsent(player, () => _TestBStreamEqualizer());
     final service = JustAudioPlayerService(
       audioPlayer: primary,
       crossfadeAudioPlayer: standby,
-      supportsSkipSilence: true,
+      supportsSkipSilence: supportsSkipSilence,
+      supportsEqualizer: equalizer,
+      bstreamEqualizerForPlayer: equalizer ? effectFor : null,
       skipSilenceWriteTimeout: skipSilenceWriteTimeout,
       remoteDiagnosticProbe: remoteDiagnosticProbe,
       crossfadePlayerFactory: () {
@@ -1871,6 +3230,7 @@ class _CrossfadeFixture {
       standby,
       factoryPlayers,
       service,
+      equalizers,
     );
   }
 
@@ -1908,6 +3268,9 @@ class _CrossfadeFixture {
   Future<void> dispose({bool serviceAlreadyDisposed = false}) async {
     if (!primary.releaseMove.isCompleted) primary.releaseMove.complete();
     if (!standby.releaseMove.isCompleted) standby.releaseMove.complete();
+    for (final effect in equalizers.values) {
+      if (!effect.releaseWrite.isCompleted) effect.releaseWrite.complete();
+    }
     for (final backend in [primary, standby, ...factoryPlayers]) {
       if (!backend.releasePlay.isCompleted) backend.releasePlay.complete();
       for (final call in backend.sourceLoadCalls) {
@@ -1915,6 +3278,9 @@ class _CrossfadeFixture {
       }
     }
     if (!serviceAlreadyDisposed) await service.dispose();
+    for (final effect in equalizers.values) {
+      await effect.statusEvents.close();
+    }
     for (final player in factoryPlayers) {
       if (player.disposeCalls == 0) {
         await player.dispose();
@@ -1941,6 +3307,20 @@ class _BlockingAudioPlayer extends AudioPlayer {
   final _durations = StreamController<Duration?>.broadcast(sync: true);
   final _positions = StreamController<Duration>.broadcast(sync: true);
   final _volumes = StreamController<double>.broadcast(sync: true);
+  final _sessions = StreamController<int?>.broadcast(sync: true);
+  int? _nativeSession;
+
+  @override
+  Stream<int?> get androidAudioSessionIdStream => _sessions.stream;
+
+  @override
+  int? get androidAudioSessionId => _nativeSession;
+
+  void emitAndroidSession(int session) {
+    _nativeSession = session;
+    _sessions.add(session);
+  }
+
   final _sequenceStates = StreamController<SequenceState>.broadcast(sync: true);
   final List<AudioSource> _sources = [];
   final List<_SourceLoadCall> sourceLoadCalls = [];
@@ -1955,6 +3335,7 @@ class _BlockingAudioPlayer extends AudioPlayer {
   bool blockNextLoopMode = false;
   bool blockNextSkipSilence = false;
   bool blockNextPlay = false;
+  bool blockNextPause = false;
   bool failBlockedPlay = false;
   Object? blockedPlayFailure;
   int skipSilenceFailuresRemaining = 0;
@@ -1989,8 +3370,11 @@ class _BlockingAudioPlayer extends AudioPlayer {
   Completer<void>? _queuedSkipSilenceWriteRelease;
   final Completer<void> playStarted = Completer<void>();
   final Completer<void> releasePlay = Completer<void>();
+  final Completer<void> pauseStarted = Completer<void>();
+  final Completer<void> releasePause = Completer<void>();
   void Function(Duration position)? onUnindexedSeek;
   void Function(double volume)? onSetVolume;
+  void Function()? onPlay;
 
   @override
   Stream<Duration> createPositionStream({
@@ -2170,6 +3554,15 @@ class _BlockingAudioPlayer extends AudioPlayer {
   void completeSourceLoad(int index) =>
       sourceLoadCalls[index].completer.complete();
 
+  void publishPendingSourceSequence(int index) {
+    final call = sourceLoadCalls[index];
+    _sources
+      ..clear()
+      ..addAll(call.sources);
+    _currentIndex = call.initialIndex ?? 0;
+    emitSequenceState();
+  }
+
   void emitError(PlayerException error) => _errors.add(error);
 
   void emitDuration(Duration? duration) => _durations.add(duration);
@@ -2184,7 +3577,8 @@ class _BlockingAudioPlayer extends AudioPlayer {
     _states.add(PlayerState(_playing, _processingState));
   }
 
-  void emitBuffering() {
+  void emitBuffering({bool? playing}) {
+    if (playing != null) _playing = playing;
     _processingState = ProcessingState.buffering;
     _states.add(PlayerState(_playing, _processingState));
   }
@@ -2194,9 +3588,12 @@ class _BlockingAudioPlayer extends AudioPlayer {
     _states.add(PlayerState(_playing, _processingState));
   }
 
-  void emitSequenceState({int? currentIndex}) {
+  void emitSequenceState({int? currentIndex, Duration? position}) {
     if (currentIndex != null) {
       _currentIndex = currentIndex;
+    }
+    if (position != null) {
+      _position = position;
     }
     _sequenceStates.add(sequenceState);
   }
@@ -2297,6 +3694,7 @@ class _BlockingAudioPlayer extends AudioPlayer {
   Future<void> play() async {
     playCalls++;
     _playing = true;
+    onPlay?.call();
     emitReady();
     if (blockNextPlay) {
       blockNextPlay = false;
@@ -2317,6 +3715,11 @@ class _BlockingAudioPlayer extends AudioPlayer {
   Future<void> pause() async {
     _playing = false;
     emitReady();
+    if (blockNextPause) {
+      blockNextPause = false;
+      if (!pauseStarted.isCompleted) pauseStarted.complete();
+      await releasePause.future;
+    }
   }
 
   @override
@@ -2373,10 +3776,114 @@ class _BlockingAudioPlayer extends AudioPlayer {
     await _durations.close();
     await _positions.close();
     await _volumes.close();
+    await _sessions.close();
     await _sequenceStates.close();
     await super.dispose();
     await _errors.close();
     await _states.close();
+  }
+}
+
+class _TestBStreamEqualizer extends BStreamEqualizer {
+  final configureCalls = <EqualizerSettings>[];
+  EqualizerSettings nativeSettings = const EqualizerSettings();
+  bool nativeSupported = true;
+  bool? skipSilenceSupported;
+  bool configured = false;
+  bool failNextConfiguration = false;
+  bool blockNextConfiguration = false;
+  int disableFailures = 0;
+  String? nextBadAcknowledgement;
+  int statusReadCalls = 0;
+  final writeStarted = Completer<void>();
+  final releaseWrite = Completer<void>();
+  final statusEvents = StreamController<BStreamEqualizerStatus>.broadcast(
+    sync: true,
+  );
+
+  @override
+  bool get supported => nativeSupported;
+
+  @override
+  bool get enabled =>
+      nativeSupported && nativeSettings.enabled && !nativeSettings.isFlat;
+
+  @override
+  Stream<BStreamEqualizerStatus> get statusStream => statusEvents.stream;
+
+  @override
+  Future<BStreamEqualizerStatus> configure({
+    required bool enabled,
+    required List<double> gainsDb,
+  }) async {
+    final settings = EqualizerSettings(
+      enabled: enabled,
+      gainsDb: gainsDb,
+    ).normalized;
+    configureCalls.add(settings);
+    if (blockNextConfiguration) {
+      blockNextConfiguration = false;
+      if (!writeStarted.isCompleted) writeStarted.complete();
+      await releaseWrite.future;
+    }
+    if (failNextConfiguration) {
+      failNextConfiguration = false;
+      throw StateError('Native PCM aggregate rejected');
+    }
+    if (!enabled && disableFailures > 0) {
+      disableFailures--;
+      throw StateError('Native PCM bypass rejected');
+    }
+    nativeSettings = settings;
+    final badAck = nextBadAcknowledgement;
+    nextBadAcknowledgement = null;
+    return _status(badAck: badAck);
+  }
+
+  BStreamEqualizerStatus _status({String? badAck}) {
+    final active = enabled;
+    final bands = [
+      for (final (index, frequency) in equalizerBandFrequencies.indexed)
+        BStreamEqualizerBand(
+          index: index,
+          centerFrequency:
+              frequency + (badAck == 'center' && index == 0 ? 10 : 0),
+          gain:
+              nativeSettings.gainsDb[index] +
+              (badAck == 'gain' && index == 0 ? 1 : 0),
+        ),
+    ];
+    if (badAck == 'bands') bands.removeLast();
+    return BStreamEqualizerStatus(
+      supported: nativeSupported,
+      enabled: badAck == 'enabled' ? !active : active,
+      configured: configured,
+      skipSilenceSupported: skipSilenceSupported,
+      engine: badAck == 'engine' ? 'system-equalizer' : 'bstream-dsp',
+      preampDb:
+          (active ? nativeSettings.preampDb : 0.0) +
+          (badAck == 'preamp' ? 1.0 : 0.0),
+      parameters: BStreamEqualizerParameters(
+        minDecibels: -12,
+        maxDecibels: 12,
+        bands: bands,
+      ),
+    );
+  }
+
+  @override
+  Future<BStreamEqualizerStatus> readStatus() async {
+    statusReadCalls++;
+    return _status();
+  }
+
+  Future<void> emitNativeStatus() async {
+    statusEvents.add(await readStatus());
+  }
+
+  @override
+  Future<void> setEnabled(bool enabled) async {
+    await configure(enabled: enabled, gainsDb: nativeSettings.gainsDb);
   }
 }
 

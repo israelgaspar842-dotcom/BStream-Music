@@ -3,8 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:home_widget/home_widget.dart';
-import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import 'core/constants/app_constants.dart';
 import 'core/platform/app_platform.dart';
@@ -12,52 +10,15 @@ import 'core/startup/app_startup_coordinator.dart';
 import 'core/theme/app_colors.dart';
 import 'core/theme/app_theme.dart';
 import 'core/widgets/liquid_glass_surface.dart';
+import 'core/widgets/desktop_window_shortcuts.dart';
 import 'features/music/presentation/pages/home_page.dart';
 import 'features/music/presentation/providers/music_providers.dart';
 import 'services/player/notification_artwork_service.dart';
+import 'services/player/artwork_video_rendering.dart';
 import 'services/media_session/audio_service_desktop_media_session.dart';
-
-final sharedCsvMessengerKey = GlobalKey<ScaffoldMessengerState>();
 
 void main() {
   launchBStreamMusicApp();
-}
-
-/// Receives the widget taps that home_widget forwards to Dart.
-///
-/// The URI actions are the ones `MusicWidgetProvider` binds to its transport
-/// buttons, and they are mirrored into home_widget's background pipeline by
-/// `onReceive` (see the `HomeWidgetBackgroundReceiver` declared in the Android
-/// manifest).
-///
-/// The transport commands themselves are *not* executed here. home_widget
-/// 0.10.0 dispatches this callback in an isolated `FlutterEngine` built
-/// without a plugin registrant, so no platform plugin is reachable from it:
-/// audio_service, just_audio and the app's Riverpod container are all out of
-/// reach, which makes `skipToPrevious`/`skipToNext`/play-pause uncallable from
-/// this isolate. Each tap is therefore relayed natively by
-/// `MusicWidgetProvider.onReceive` into the audio_service media session, the
-/// same route the lock screen buttons and Bluetooth headsets take. This hook
-/// stays as the entry point for the widget work that must still be decided on
-/// the Dart side.
-@pragma('vm:entry-point')
-Future<void> widgetBackgroundCallback(Uri? uri) async {
-  final host = uri?.host;
-  if (host == null) {
-    return;
-  }
-  switch (host) {
-    case 'playpause':
-    case 'previous':
-    case 'next':
-    case 'playqueue1':
-    case 'playqueue2':
-    case 'playqueue3':
-    case 'playqueue4':
-      debugPrint('Widget transport relayed natively: $host');
-    default:
-      debugPrint('Widget background callback: $uri');
-  }
 }
 
 typedef AppStartupScheduler = void Function(VoidCallback callback);
@@ -101,24 +62,7 @@ AppStartupCoordinator launchBStreamMusicApp({
   AppStartupScheduler? scheduleStartup,
 }) {
   WidgetsFlutterBinding.ensureInitialized();
-  // Widget taps that home_widget decides to forward to Dart. Android only:
-  // the receiver and the SharedPreferences handles are Android specific, and
-  // the guard also keeps the widget tests, which run on the host, from
-  // touching a plugin channel.
-  if (AppPlatform.isAndroid) {
-    unawaited(() async {
-      try {
-        // registerBackgroundCallback is the deprecated alias of this method
-        // in home_widget 0.10.0; use the current entry point.
-        await HomeWidget.registerInteractivityCallback(
-          widgetBackgroundCallback,
-        );
-      } catch (error, stackTrace) {
-        debugPrint('Widget background callback registration failed: $error');
-        debugPrintStack(stackTrace: stackTrace);
-      }
-    }());
-  }
+  configureArtworkVideoRendering();
   // Keep artwork memory bounded across long sessions with many searches and
   // queue transitions. The default Flutter image cache allows 100 MiB and
   // 1,000 entries, which is excessive for music thumbnails.
@@ -260,6 +204,7 @@ class BStreamMusicApp extends ConsumerWidget {
     // Keep the Android home screen widget in sync with the track that is
     // playing. The bridge is alive for as long as the app shell watches it.
     ref.watch(musicWidgetBridgeProvider);
+    ref.watch(homeScreenWidgetSyncProvider);
     // Keep the per-track lyrics offset synchronized even while its route is
     // closed, without rebuilding the app when the offset itself changes.
     ref.watch(lyricsOffsetControllerProvider.select((_) => null));
@@ -271,6 +216,7 @@ class BStreamMusicApp extends ConsumerWidget {
           accent: value?.accent ?? AppAccent.white,
           surfaceBackgroundMode:
               value?.surfaceBackgroundMode ?? SurfaceBackgroundMode.accent,
+          playerFont: value?.playerFont ?? defaultPlayerFont,
           themeMode: value?.themeMode.materialMode ?? ThemeMode.system,
         );
       }),
@@ -278,6 +224,7 @@ class BStreamMusicApp extends ConsumerWidget {
     final language = appearance.language;
     final accent = appearance.accent;
     final surfaceBackgroundMode = appearance.surfaceBackgroundMode;
+    final playerFont = appearance.playerFont;
     final themeMode = appearance.themeMode;
     final isDesktop = AppPlatform.isDesktop;
     final iconButtonSize = isDesktop ? 52.0 : 48.0;
@@ -287,7 +234,15 @@ class BStreamMusicApp extends ConsumerWidget {
       debugShowCheckedModeBanner: false,
       title: AppConstants.appName,
       locale: Locale(language.code),
-      supportedLocales: const [Locale('es'), Locale('en')],
+      supportedLocales: const [
+        Locale('es'),
+        Locale('en'),
+        Locale('pt'),
+        Locale('fr'),
+        Locale('ko'),
+        Locale('zh'),
+        Locale('ja'),
+      ],
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -297,6 +252,7 @@ class BStreamMusicApp extends ConsumerWidget {
       theme: _buildLightTheme(
         accent: accent,
         surfaceBackgroundMode: surfaceBackgroundMode,
+        playerFont: playerFont,
         isDesktop: isDesktop,
         iconButtonSize: iconButtonSize,
         textButtonHeight: textButtonHeight,
@@ -304,164 +260,25 @@ class BStreamMusicApp extends ConsumerWidget {
       darkTheme: _buildDarkTheme(
         accent: accent,
         surfaceBackgroundMode: surfaceBackgroundMode,
+        playerFont: playerFont,
         isDesktop: isDesktop,
         iconButtonSize: iconButtonSize,
         textButtonHeight: textButtonHeight,
       ),
-      builder: (context, child) =>
-          ScrollNotificationObserver(child: child ?? const SizedBox.shrink()),
-      scaffoldMessengerKey: sharedCsvMessengerKey,
-      home: _SharedCsvImportListener(
-        child: HomePage(checkForUpdatesOnStartup: checkForUpdatesOnStartup),
-      ),
-    );
-  }
-}
-
-/// Intercepts CSV files shared from other Android apps (e.g. WhatsApp).
-///
-/// Configured for both delivery paths:
-/// * cold start via [ReceiveSharingIntent.getInitialMedia], and
-/// * while-running via [ReceiveSharingIntent.getMediaStream].
-///
-/// On a valid CSV it reuses the existing [LibraryCsvTransferController]
-/// import pipeline so behavior matches the in-app importer.
-class _SharedCsvImportListener extends ConsumerStatefulWidget {
-  const _SharedCsvImportListener({required this.child});
-
-  final Widget child;
-
-  @override
-  ConsumerState<_SharedCsvImportListener> createState() =>
-      _SharedCsvImportListenerState();
-}
-
-class _SharedCsvImportListenerState
-    extends ConsumerState<_SharedCsvImportListener> {
-  StreamSubscription<List<SharedMediaFile>>? _mediaStreamSubscription;
-  String? _lastSharedPath;
-  DateTime? _lastSharedAt;
-
-  @override
-  void initState() {
-    super.initState();
-    if (!(AppPlatform.isAndroid || AppPlatform.isIOS)) {
-      return;
-    }
-    unawaited(
-      ReceiveSharingIntent.instance
-          .getInitialMedia()
-          .then(
-            _handleSharedMedia,
-            onError: (Object error, StackTrace stack) {
-              debugPrint('Could not read the initial shared file: $error');
-              debugPrintStack(stackTrace: stack);
-            },
-          ),
-    );
-    _mediaStreamSubscription = ReceiveSharingIntent.instance
-        .getMediaStream()
-        .listen(
-          _handleSharedMedia,
-          onError: (Object error, StackTrace stack) {
-            debugPrint('Shared file stream failed: $error');
-            debugPrintStack(stackTrace: stack);
-          },
-        );
-  }
-
-  @override
-  void dispose() {
-    unawaited(_mediaStreamSubscription?.cancel());
-    _mediaStreamSubscription = null;
-    super.dispose();
-  }
-
-  void _handleSharedMedia(List<SharedMediaFile>? files) {
-    if (files == null || files.isEmpty) {
-      return;
-    }
-    final csv = files.where((file) {
-      final mime = file.mimeType?.toLowerCase() ?? '';
-      final path = file.path.toLowerCase();
-      return path.endsWith('.csv') ||
-          path.endsWith('.tsv') ||
-          mime.contains('csv') ||
-          mime.contains('comma-separated') ||
-          mime.contains('ms-excel');
-    }).toList(growable: false);
-    if (csv.isEmpty) {
-      return;
-    }
-    final path = csv.first.path;
-    // Some Android versions deliver the same share through both the initial
-    // intent and the stream. Coalesce identical paths observed back to back.
-    final now = DateTime.now();
-    final isDuplicate =
-        path == _lastSharedPath &&
-        _lastSharedAt != null &&
-        now.difference(_lastSharedAt!) < const Duration(seconds: 3);
-    if (isDuplicate) {
-      return;
-    }
-    _lastSharedPath = path;
-    _lastSharedAt = now;
-    unawaited(ReceiveSharingIntent.instance.reset());
-    unawaited(_importCsv(path));
-  }
-
-  Future<void> _importCsv(String path) async {
-    final strings = ref.read(appStringsProvider);
-    final notifier = ref.read(libraryCsvTransferControllerProvider.notifier);
-    final currentState = ref.read(libraryCsvTransferControllerProvider);
-    if (currentState.isBusy) {
-      _showSnack(
-        strings.choose(
-          'Hay una importación en curso. Inténtalo de nuevo.',
-          'An import is already in progress. Try again.',
+      builder: (context, child) => DesktopWindowShortcuts(
+        child: ScrollNotificationObserver(
+          child: child ?? const SizedBox.shrink(),
         ),
-      );
-      return;
-    }
-    _showSnack(
-      strings.choose(
-        'Importando lista desde el archivo compartido…',
-        'Importing playlist from the shared file…',
       ),
-    );
-    try {
-      final document = await notifier.preview(path);
-      await notifier.importDocument(document);
-      _showSnack(
-        strings.choose('Importación completada.', 'Import complete.'),
-      );
-    } catch (e, stack) {
-      // The full error is logged for diagnostics while the user gets a
-      // localized message instead of a raw exception.
-      debugPrint('Shared CSV import failed: $e');
-      debugPrintStack(stackTrace: stack);
-      sharedCsvMessengerKey.currentState?.showSnackBar(
-        SnackBar(content: Text(strings.csvImportFailed)),
-      );
-    } finally {
-      // Leave the controller idle so the Settings importer starts clean.
-      notifier.reset();
-    }
-  }
-
-  void _showSnack(String message) {
-    sharedCsvMessengerKey.currentState?.showSnackBar(
-      SnackBar(content: Text(message)),
+      home: HomePage(checkForUpdatesOnStartup: checkForUpdatesOnStartup),
     );
   }
-
-  @override
-  Widget build(BuildContext context) => widget.child;
 }
 
 ThemeData _buildDarkTheme({
   required AppAccent accent,
   required SurfaceBackgroundMode surfaceBackgroundMode,
+  required PlayerFont playerFont,
   required bool isDesktop,
   required double iconButtonSize,
   required double textButtonHeight,
@@ -489,8 +306,11 @@ ThemeData _buildDarkTheme({
 
   return ThemeData(
     useMaterial3: true,
-    fontFamily: AppPlatform.isLinux ? 'Roboto' : null,
-    fontFamilyFallback: AppPlatform.isLinux ? const [] : null,
+    fontFamily:
+        playerFont.fontFamily ?? (AppPlatform.isLinux ? 'Roboto' : null),
+    fontFamilyFallback: AppPlatform.isLinux && playerFont == PlayerFont.current
+        ? const []
+        : null,
     brightness: Brightness.dark,
     colorScheme: scheme,
     extensions: [
@@ -590,6 +410,7 @@ ThemeData _buildDarkTheme({
 ThemeData _buildLightTheme({
   required AppAccent accent,
   required SurfaceBackgroundMode surfaceBackgroundMode,
+  required PlayerFont playerFont,
   required bool isDesktop,
   required double iconButtonSize,
   required double textButtonHeight,
@@ -615,8 +436,11 @@ ThemeData _buildLightTheme({
 
   return ThemeData(
     useMaterial3: true,
-    fontFamily: AppPlatform.isLinux ? 'Roboto' : null,
-    fontFamilyFallback: AppPlatform.isLinux ? const [] : null,
+    fontFamily:
+        playerFont.fontFamily ?? (AppPlatform.isLinux ? 'Roboto' : null),
+    fontFamilyFallback: AppPlatform.isLinux && playerFont == PlayerFont.current
+        ? const []
+        : null,
     brightness: Brightness.light,
     colorScheme: scheme,
     extensions: [

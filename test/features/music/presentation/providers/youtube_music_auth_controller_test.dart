@@ -5,6 +5,8 @@ import 'package:bstream_music/services/youtube_music/auth/youtube_music_account_
 import 'package:bstream_music/services/youtube_music/auth/youtube_music_auth_models.dart';
 import 'package:bstream_music/services/youtube_music/auth/youtube_music_session_store.dart';
 import 'package:bstream_music/services/youtube_music/auth/youtube_music_web_auth_port.dart';
+import 'package:bstream_music/services/youtube_music/account/youtube_music_account.dart'
+    as account;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -51,6 +53,343 @@ void main() {
       container.read(youtubeMusicAuthControllerProvider).phase,
       YouTubeMusicAuthPhase.anonymous,
     );
+  });
+
+  test(
+    'refreshes stale saved profile without repeating login or channels',
+    () async {
+      final stored = _credential(
+        'stored-channel',
+        validatedAt: DateTime.utc(2026, 8, 21),
+      );
+      final freshProfile = YouTubeMusicAccountProfile(
+        channelId: 'stored-channel',
+        displayName: 'Updated channel name',
+        handle: '@updated',
+        avatarUrl: Uri.parse('https://yt3.googleusercontent.com/new-avatar'),
+      );
+      final store = _FakeSessionStore(value: stored);
+      final client = _FakeAccountClient(profile: freshProfile);
+      final container = _container(store: store, client: client);
+      addTearDown(container.dispose);
+
+      container.read(youtubeMusicAuthControllerProvider);
+      await _settle();
+
+      final state = container.read(youtubeMusicAuthControllerProvider);
+      expect(state.isAuthenticated, isTrue);
+      expect(state.profile, same(freshProfile));
+      expect(client.validationCalls, 1);
+      expect(client.channelCalls, 0);
+      expect(client.lastAuthData?.identity.toJson(), stored.identity.toJson());
+      expect(store.writes.single.profile, same(freshProfile));
+      expect(store.writes.single.cookieHeader, stored.cookieHeader);
+      expect(store.writes.single.validatedAt, DateTime.utc(2026, 8, 22, 0, 2));
+    },
+  );
+
+  test(
+    'fresh profile skips automatic refresh and preserves public state',
+    () async {
+      var now = DateTime.utc(2026, 8, 22);
+      final stored = _credential('stored-channel');
+      final client = _FakeAccountClient(profile: _profile('stored-channel'));
+      final container = _container(
+        store: _FakeSessionStore(value: stored),
+        client: client,
+        clock: () => now,
+      );
+      addTearDown(container.dispose);
+      container.read(youtubeMusicAuthControllerProvider);
+      await _settle();
+      final controller = container.read(
+        youtubeMusicAuthControllerProvider.notifier,
+      );
+      final before = container.read(youtubeMusicAuthControllerProvider);
+
+      await controller.refreshProfile();
+      expect(client.validationCalls, 0);
+      await controller.refreshProfile(force: true);
+      expect(client.validationCalls, 0);
+      now = now.add(YouTubeMusicAuthController.profileRefreshRetryInterval);
+      await controller.refreshProfile(force: true);
+      expect(client.validationCalls, 1);
+      expect(container.read(youtubeMusicAuthControllerProvider), same(before));
+      await controller.refreshProfile(force: true);
+      expect(client.validationCalls, 1);
+    },
+  );
+
+  test(
+    'concurrent refresh events share one request and respect cooldown',
+    () async {
+      var now = DateTime.utc(2026, 8, 22, 0, 2);
+      final validation = Completer<YouTubeMusicAccountProfile>();
+      final client = _FakeAccountClient(validationGate: validation);
+      final container = _container(
+        store: _FakeSessionStore(value: _credential('stored-channel')),
+        client: client,
+        clock: () => now,
+      );
+      addTearDown(container.dispose);
+      container.read(youtubeMusicAuthControllerProvider);
+      await _settle();
+      final controller = container.read(
+        youtubeMusicAuthControllerProvider.notifier,
+      );
+
+      final first = controller.refreshProfile(force: true);
+      final second = controller.refreshProfile(force: true);
+      expect(second, same(first));
+      expect(client.validationCalls, 1);
+      validation.complete(_profile('stored-channel'));
+      await first;
+      await controller.refreshProfile();
+      await controller.refreshProfile(force: true);
+      expect(client.validationCalls, 1);
+
+      now = now.add(YouTubeMusicAuthController.profileRefreshInterval);
+      await controller.refreshProfile();
+      expect(client.validationCalls, 2);
+    },
+  );
+
+  test(
+    'automatic foreground refresh reuses six-hour persisted freshness',
+    () async {
+      var now = DateTime.utc(2026, 8, 22);
+      final store = _FakeSessionStore(value: _credential('stored-channel'));
+      final client = _FakeAccountClient(profile: _profile('stored-channel'));
+      final container = _container(
+        store: store,
+        client: client,
+        clock: () => now,
+      );
+      addTearDown(container.dispose);
+      container.read(youtubeMusicAuthControllerProvider);
+      await _settle();
+      final controller = container.read(
+        youtubeMusicAuthControllerProvider.notifier,
+      );
+
+      now = now.add(const Duration(hours: 5, minutes: 59));
+      await controller.refreshProfile();
+      await controller.refreshProfile();
+      expect(client.validationCalls, 0);
+
+      now = now.add(const Duration(minutes: 1));
+      await controller.refreshProfile();
+      expect(client.validationCalls, 1);
+      expect(store.value?.validatedAt, now);
+
+      final restarted = _container(
+        store: store,
+        client: client,
+        clock: () => now,
+      );
+      addTearDown(restarted.dispose);
+      restarted.read(youtubeMusicAuthControllerProvider);
+      await _settle();
+      await restarted
+          .read(youtubeMusicAuthControllerProvider.notifier)
+          .refreshProfile();
+      expect(client.validationCalls, 1);
+      expect(store.writes, hasLength(1));
+    },
+  );
+
+  test('failed metadata refresh retains session and backs off retry', () async {
+    var now = DateTime.utc(2026, 8, 22, 0, 2);
+    final stored = _credential('stored-channel');
+    final client = _FakeAccountClient(
+      validationError: const YouTubeMusicAccountException(
+        YouTubeMusicAccountFailureKind.transient,
+        'Temporary network failure',
+      ),
+    );
+    final store = _FakeSessionStore(value: stored);
+    final container = _container(
+      store: store,
+      client: client,
+      clock: () => now,
+    );
+    addTearDown(container.dispose);
+    container.read(youtubeMusicAuthControllerProvider);
+    await _settle();
+    final controller = container.read(
+      youtubeMusicAuthControllerProvider.notifier,
+    );
+
+    await controller.refreshProfile(force: true);
+    await controller.refreshProfile(force: true);
+    expect(client.validationCalls, 1);
+    expect(
+      container.read(youtubeMusicAuthControllerProvider).isAuthenticated,
+      isTrue,
+    );
+    expect(controller.credentialForAuthenticatedRequests, same(stored));
+    expect(store.writes, isEmpty);
+    expect(store.deleteCount, 0);
+
+    now = now.add(YouTubeMusicAuthController.profileRefreshRetryInterval);
+    await controller.refreshProfile(force: true);
+    expect(client.validationCalls, 2);
+  });
+
+  test('profile refresh cannot silently switch the selected channel', () async {
+    final stored = _credential('stored-channel');
+    final store = _FakeSessionStore(value: stored);
+    final container = _container(
+      store: store,
+      client: _FakeAccountClient(profile: _profile('different-channel')),
+    );
+    addTearDown(container.dispose);
+    container.read(youtubeMusicAuthControllerProvider);
+    await _settle();
+    final controller = container.read(
+      youtubeMusicAuthControllerProvider.notifier,
+    );
+
+    await controller.refreshProfile(force: true);
+
+    expect(
+      container.read(youtubeMusicAuthControllerProvider).profile?.channelId,
+      'stored-channel',
+    );
+    expect(controller.credentialForAuthenticatedRequests, same(stored));
+    expect(store.writes, isEmpty);
+  });
+
+  test(
+    'metadata updates keep authenticated gateway and session identity stable',
+    () async {
+      final client = _FakeAccountClient(
+        profile: const YouTubeMusicAccountProfile(
+          channelId: 'stored-channel',
+          displayName: 'Updated display name',
+        ),
+      );
+      final container = _container(
+        store: _FakeSessionStore(value: _credential('stored-channel')),
+        client: client,
+      );
+      addTearDown(container.dispose);
+      container.read(youtubeMusicAuthControllerProvider);
+      await _settle();
+      final gateway = container.read(
+        youtubeMusicAuthenticatedAccountGatewayProvider,
+      );
+      final session = container.read(youtubeMusicAuthSessionIdentityProvider);
+
+      await container
+          .read(youtubeMusicAuthControllerProvider.notifier)
+          .refreshProfile(force: true);
+
+      expect(
+        container.read(youtubeMusicAuthControllerProvider).profile?.displayName,
+        'Updated display name',
+      );
+      expect(
+        container.read(youtubeMusicAuthenticatedAccountGatewayProvider),
+        same(gateway),
+      );
+      expect(container.read(youtubeMusicAuthSessionIdentityProvider), session);
+    },
+  );
+
+  test('logout discards a late metadata response', () async {
+    final validation = Completer<YouTubeMusicAccountProfile>();
+    final store = _FakeSessionStore(value: _credential('stored-channel'));
+    final client = _FakeAccountClient(validationGate: validation);
+    final container = _container(store: store, client: client);
+    addTearDown(container.dispose);
+    container.read(youtubeMusicAuthControllerProvider);
+    await _settle();
+    final controller = container.read(
+      youtubeMusicAuthControllerProvider.notifier,
+    );
+
+    final refresh = controller.refreshProfile(force: true);
+    await _waitUntil(() => client.validationCalls == 1);
+    await controller.logout();
+    validation.complete(_profile('stored-channel'));
+    await refresh;
+
+    expect(
+      container.read(youtubeMusicAuthControllerProvider).phase,
+      YouTubeMusicAuthPhase.anonymous,
+    );
+    expect(store.writes, isEmpty);
+    expect(store.value, isNull);
+  });
+
+  test('an old account gateway cannot send a replacement session', () async {
+    final transport = _RecordingAccountTransport();
+    addTearDown(transport.close);
+    final client = _FakeAccountClient(profile: _profile('new-channel'));
+    final container = _container(
+      store: _FakeSessionStore(value: _credential('stored-channel')),
+      client: client,
+      transport: transport,
+    );
+    addTearDown(container.dispose);
+    container.read(youtubeMusicAuthControllerProvider);
+    await _settle();
+    final oldGateway = container.read(
+      youtubeMusicAuthenticatedAccountGatewayProvider,
+    )!;
+    final controller = container.read(
+      youtubeMusicAuthControllerProvider.notifier,
+    );
+    controller.beginLogin();
+    await controller.submitWebAuthentication(_authData());
+
+    await expectLater(
+      oldGateway.getProfile(),
+      throwsA(
+        isA<account.YouTubeMusicAccountException>().having(
+          (error) => error.statusCode,
+          'statusCode',
+          401,
+        ),
+      ),
+    );
+    expect(transport.requests, isEmpty);
+    expect(
+      container.read(youtubeMusicAuthControllerProvider).profile?.channelId,
+      'new-channel',
+    );
+  });
+
+  test('logout compensates for metadata secure write finishing late', () async {
+    final writeGate = Completer<void>();
+    final store = _FakeSessionStore(
+      value: _credential('stored-channel'),
+      writeGate: writeGate,
+    );
+    final container = _container(
+      store: store,
+      client: _FakeAccountClient(profile: _profile('stored-channel')),
+    );
+    addTearDown(container.dispose);
+    container.read(youtubeMusicAuthControllerProvider);
+    await _settle();
+    final controller = container.read(
+      youtubeMusicAuthControllerProvider.notifier,
+    );
+
+    final refresh = controller.refreshProfile(force: true);
+    await _waitUntil(() => store.writeStarted);
+    await controller.logout();
+    writeGate.complete();
+    await refresh;
+
+    expect(
+      container.read(youtubeMusicAuthControllerProvider).phase,
+      YouTubeMusicAuthPhase.anonymous,
+    );
+    expect(store.value, isNull);
+    expect(store.deleteCount, 2);
   });
 
   test(
@@ -340,12 +679,32 @@ void main() {
 ProviderContainer _container({
   required YouTubeMusicSessionStore store,
   required YouTubeMusicAccountClient client,
+  DateTime Function()? clock,
+  account.IoYouTubeMusicAccountTransport? transport,
 }) => ProviderContainer(
   overrides: [
     youtubeMusicSessionStoreProvider.overrideWithValue(store),
     youtubeMusicAccountClientProvider.overrideWithValue(client),
+    if (transport != null)
+      youtubeMusicAccountTransportProvider.overrideWithValue(transport),
+    youtubeMusicAuthClockProvider.overrideWithValue(
+      clock ?? () => DateTime.utc(2026, 8, 22, 0, 2),
+    ),
   ],
 );
+
+class _RecordingAccountTransport
+    extends account.IoYouTubeMusicAccountTransport {
+  final requests = <account.YouTubeMusicAccountRequest>[];
+
+  @override
+  Future<account.YouTubeMusicAccountResponse> send(
+    account.YouTubeMusicAccountRequest request,
+  ) async {
+    requests.add(request);
+    return account.YouTubeMusicAccountResponse(statusCode: 200, body: const {});
+  }
+}
 
 Future<void> _settle() async {
   for (var index = 0; index < 5; index++) {
@@ -408,12 +767,15 @@ class _FakeAccountClient implements YouTubeMusicAccountClient {
     this.channels = const <YouTubeMusicAccountChannel>[],
     this.validationGate,
     this.channelError,
+    this.validationError,
   });
 
   YouTubeMusicAccountProfile? profile;
   final List<YouTubeMusicAccountChannel> channels;
   final Completer<YouTubeMusicAccountProfile>? validationGate;
   final Object? channelError;
+  final Object? validationError;
+  YouTubeMusicWebAuthData? lastAuthData;
   var validationCalls = 0;
   var channelCalls = 0;
 
@@ -422,6 +784,9 @@ class _FakeAccountClient implements YouTubeMusicAccountClient {
     YouTubeMusicWebAuthData authData,
   ) async {
     validationCalls += 1;
+    lastAuthData = authData;
+    final error = validationError;
+    if (error != null) throw error;
     final gate = validationGate;
     if (gate != null) return gate.future;
     return profile ?? _profile('default-channel');
@@ -495,16 +860,18 @@ YouTubeMusicAccountProfile _profile(String channelId) =>
       displayName: 'Account $channelId',
     );
 
-YouTubeMusicSessionCredential _credential(String channelId) =>
-    YouTubeMusicSessionCredential(
-      cookieHeader: 'SAPISID=test-session-value',
-      identity: const YouTubeMusicAuthIdentity(
-        visitorData: 'test-visitor-data',
-        authUser: '0',
-      ),
-      profile: _profile(channelId),
-      validatedAt: DateTime.utc(2026, 8, 22),
-      apiKey: 'test_api_key',
-      clientVersion: '1.20260822.00.00',
-      clientName: 'WEB_REMIX',
-    );
+YouTubeMusicSessionCredential _credential(
+  String channelId, {
+  DateTime? validatedAt,
+}) => YouTubeMusicSessionCredential(
+  cookieHeader: 'SAPISID=test-session-value',
+  identity: const YouTubeMusicAuthIdentity(
+    visitorData: 'test-visitor-data',
+    authUser: '0',
+  ),
+  profile: _profile(channelId),
+  validatedAt: validatedAt ?? DateTime.utc(2026, 8, 22),
+  apiKey: 'test_api_key',
+  clientVersion: '1.20260822.00.00',
+  clientName: 'WEB_REMIX',
+);

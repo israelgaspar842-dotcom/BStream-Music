@@ -3,54 +3,77 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:crypto/crypto.dart';
 import 'package:home_widget/home_widget.dart';
 import 'package:image/image.dart' as image;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../../../core/errors/app_exception.dart';
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/platform/app_platform.dart';
+import '../../../../services/player/cast_aware_player_service.dart';
+import 'audio_route_providers.dart';
+import 'audio_source_providers.dart';
 import '../../../../core/theme/app_theme.dart';
+import '../../../../core/utils/background_work.dart';
 import '../../../../core/utils/bounded_byte_stream.dart';
 import '../../../../core/utils/cached_artwork_image_provider.dart';
 import '../../../../core/utils/image_source.dart';
 import '../../../../core/utils/safe_file_name.dart';
 import '../../../../services/downloader/audio_stream_resolver.dart';
 import '../../../../services/downloader/downloader_service.dart';
+import '../../../../services/downloader/download_audio_metadata_service.dart';
 import '../../../../services/downloader/innertube_audio_resolver.dart';
 import '../../../../services/downloader/innertube_download_service.dart';
+import '../../../../services/audio_sources/audio_source_policy.dart';
+import '../../../../services/audio_sources/audio_format_details.dart';
 import '../../../../services/live/tiktok_live_command_service.dart';
 import '../../../../services/lyrics/lyrics_service.dart';
+import '../../../../services/lyrics/better_lyrics_service.dart';
+import '../../../../services/lyrics/fallback_lyrics_service.dart';
+import '../../../../services/lyrics/youlyplus_lyrics_service.dart';
 import '../../../../services/lyrics/lyrics_romanization_service.dart';
+import '../../../../services/lyrics/lyrics_translation_service.dart';
 import '../../../../services/media_session/desktop_media_session.dart';
 import '../../../../services/media_session/desktop_media_session_binding.dart';
 import '../../../../services/media_session/desktop_media_session_factory.dart';
 import '../../../../services/player/just_audio_player_service.dart';
 import '../../../../services/player/media_kit_player_service.dart';
 import '../../../../services/player/player_service.dart';
+import '../../../../services/player/playback_session_store.dart';
+import '../../../../services/player/player_equalizer.dart';
+import 'equalizer_profiles.dart';
+import 'equalizer_providers.dart';
 import '../../../../services/recommendations/recommendations.dart';
 import '../../../../services/sharing/bstream_track_link.dart';
+import '../../../../services/sharing/incoming_csv_file_service.dart';
 import '../../../../services/sharing/incoming_track_link_service.dart';
+import '../../../../services/sharing/lyrics_share_photo_service.dart';
 import '../../../../services/sharing/track_share_service.dart';
+import '../../../../services/sharing/playlist_csv_share_service.dart';
 import '../../../../services/sharing/youtube_music_playlist_share_service.dart';
 import '../../../../services/sharing/youtube_music_link.dart';
 import '../../../../services/storage/backup_service.dart';
+import '../../../../services/storage/app_background_image_service.dart';
 import '../../../../services/storage/library_csv_import_service.dart';
 import '../../../../services/storage/library_csv_service.dart';
 import '../../../../services/storage/library_operation_coordinator.dart';
 import '../../../../services/storage/local_database_service.dart';
 import '../../../../services/storage/local_database_shutdown_coordinator.dart';
 import '../../../../services/storage/local_library_reconciler.dart';
+import '../../../../services/widgets/home_screen_widget_sync.dart';
 import '../../../../services/youtube_music/innertube_search_service.dart';
+import '../../../../services/youtube_music/search_browse_catalog_cache.dart';
+import '../../../../services/youtube_music/search_browse_artwork_cache.dart';
 import '../../../../services/youtube_music/shared_preferences_visitor_data_store.dart';
 import '../../../../services/youtube_music/playback/playback.dart';
 import '../../../../services/youtube_music/account/youtube_music_account.dart'
@@ -76,6 +99,7 @@ import '../../domain/entities/catalog_track.dart';
 import '../../domain/entities/playlist_entry.dart';
 import '../../domain/entities/local_track.dart';
 import '../../domain/entities/lyrics.dart';
+import '../../domain/entities/lyrics_provider.dart';
 import '../../domain/entities/playlist.dart';
 import '../../domain/entities/track_info.dart';
 import '../../domain/entities/search_result.dart';
@@ -89,11 +113,18 @@ import '../../domain/usecases/get_playlists.dart';
 import '../../domain/usecases/get_track_info.dart';
 import '../../domain/usecases/search_tracks.dart';
 import 'app_strings.dart';
+import 'home_feed_activity_provider.dart';
+import 'local_audio_availability.dart';
+import 'local_audio_quality_provider.dart';
 import 'lyrics_animation_style.dart';
+import 'lyrics_background_style.dart';
+import 'live_widget_style.dart';
 import 'mini_player_background_mode.dart';
 import 'mini_player_mode.dart';
 import 'player_artwork_style.dart';
 import 'player_style.dart';
+import 'player_font.dart';
+import 'playlist_artwork_providers.dart';
 import 'youtube_music_auth_controller.dart';
 import 'player/catalog_playback_item.dart';
 import 'player/catalog_playlist_playback.dart';
@@ -105,11 +136,17 @@ import 'player/remote_prefetch_coordinator.dart';
 import 'player/remote_playback_retry_coordinator.dart';
 
 export 'app_strings.dart';
+export '../../../../services/player/player_equalizer.dart';
+export 'equalizer_profiles.dart';
+export 'home_feed_activity_provider.dart';
 export 'lyrics_animation_style.dart';
+export 'lyrics_background_style.dart';
+export 'live_widget_style.dart';
 export 'mini_player_background_mode.dart';
 export 'mini_player_mode.dart';
 export 'player_artwork_style.dart';
 export 'player_style.dart';
+export 'player_font.dart';
 export 'player/catalog_playback_item.dart';
 export 'player/catalog_playlist_playback.dart';
 export 'player/playback_identity.dart';
@@ -119,15 +156,20 @@ export 'player/remote_playback_source_factory.dart';
 export 'player/remote_prefetch_coordinator.dart';
 export 'player/remote_playback_retry_coordinator.dart';
 export '../../domain/entities/lyrics_romanization_language.dart';
+export '../../domain/entities/lyrics_provider.dart';
 
 part 'app_strings_provider.dart';
 part 'download_controller.dart';
+part 'audio_quality_upgrade_coordinator.dart';
+part 'player/downloaded_audio_playback.dart';
+part 'download_metadata_refresh_controller.dart';
 part 'download_directory_migrator.dart';
 part 'local_track_download_helper.dart';
 part 'library_csv_transfer_controller.dart';
 part 'lyrics_offset_controller.dart';
 part 'playback_history_tracker.dart';
 part 'player/player_queue_components.dart';
+part 'player/playback_session_controller.dart';
 part 'player/player_playback_coordinators.dart';
 part 'player/playback_history_track_factory.dart';
 part 'player_controller.dart';
@@ -140,6 +182,131 @@ part 'settings_controller.dart';
 part 'sleep_timer_controller.dart';
 part 'tiktok_live_controller.dart';
 part 'youtube_music_playlist_sync_controller.dart';
+
+final homeScreenWidgetSyncProvider = Provider<void>((ref) {
+  if (!AppPlatform.isMobile) return;
+  final supportsQueue = AppPlatform.isAndroid;
+  final widgetSync = HomeScreenWidgetSync(
+    supportsQueue: supportsQueue,
+    onAction: (action) async {
+      await ref.read(playerControllerProvider.future);
+      final player = ref.read(playerControllerProvider.notifier);
+      final queueSelection = RegExp(r'^queue:(\d+)$').firstMatch(action);
+      if (queueSelection != null) {
+        final index = int.tryParse(queueSelection.group(1)!);
+        if (index != null) await player.playQueueIndex(index);
+        return;
+      }
+      switch (action) {
+        case 'toggle':
+          await player.togglePlayPause();
+        case 'next':
+          await player.playNext();
+        case 'previous':
+          await player.playPrevious();
+        case 'repeat':
+          player.cycleRepeatMode();
+        case 'favorite':
+          await player.toggleCurrentFavorite();
+      }
+    },
+  );
+
+  void publish() {
+    final playback = ref.read(playerControllerProvider);
+    // A cold launch restores persisted metadata asynchronously. Keep the
+    // complete native widget snapshot until that restore can publish its song
+    // and queue together instead of replacing it with an empty loading state.
+    if (playback.isLoading) return;
+    final snapshot = playback.value;
+    final accent =
+        ref.read(settingsControllerProvider).value?.accent ?? AppAccent.white;
+    final language =
+        ref.read(settingsControllerProvider).value?.language ??
+        AppLanguage.spanish;
+    final hasTrack =
+        snapshot?.trackId != null || (snapshot?.title?.isNotEmpty ?? false);
+    final currentTrackId = snapshot?.trackId;
+    final isFavorite =
+        currentTrackId != null &&
+        ref.read(favoriteTrackIdsProvider).contains(currentTrackId);
+    final playbackQueue = supportsQueue
+        ? ref.read(playbackQueueProvider)
+        : null;
+    var currentQueueIndex = playbackQueue?.currentIndex ?? -1;
+    final focusedEntry =
+        playbackQueue != null &&
+            currentQueueIndex >= 0 &&
+            currentQueueIndex < playbackQueue.entries.length
+        ? playbackQueue.entries[currentQueueIndex]
+        : null;
+    if (playbackQueue != null &&
+        currentTrackId != null &&
+        focusedEntry?.id != currentTrackId) {
+      final snapshotIndex = playbackQueue.entries.indexWhere(
+        (entry) => entry.id == currentTrackId,
+      );
+      if (snapshotIndex >= 0) currentQueueIndex = snapshotIndex;
+    }
+    widgetSync.publish(
+      trackId: hasTrack ? snapshot?.trackId : null,
+      title: hasTrack ? snapshot?.title : null,
+      artist: hasTrack ? snapshot?.artist : null,
+      artworkUrl: hasTrack ? snapshot?.thumbnailUrl : null,
+      isPlaying: snapshot?.status == PlayerStatus.playing,
+      isLoading: hasTrack && snapshot?.status == PlayerStatus.loading,
+      loadingLabel: AppStrings(language).playbackLoading,
+      isFavorite: isFavorite,
+      repeatMode: snapshot?.repeatMode.name ?? 'off',
+      accentColor: accent.seedColor.toARGB32(),
+      languageCode: language.code,
+      queue: playbackQueue == null
+          ? const []
+          : Iterable.generate(playbackQueue.entries.length, (index) {
+              final entry = playbackQueue.entries[index];
+              final logicalId = entry.logicalEntryId?.trim();
+              final artwork = entry.thumbnailUrl?.trim();
+              return <String, String>{
+                'id': logicalId != null && logicalId.isNotEmpty
+                    ? logicalId
+                    : entry.id,
+                'title': entry.title,
+                'artist': entry.artist,
+                if (artwork != null && artwork.isNotEmpty)
+                  'artworkUrl': artwork,
+              };
+            }),
+      currentQueueIndex: currentQueueIndex,
+    );
+  }
+
+  ref.listen(
+    playerControllerProvider.select((value) {
+      final snapshot = value.value;
+      return (
+        trackId: snapshot?.trackId,
+        title: snapshot?.title,
+        artist: snapshot?.artist,
+        artworkUrl: snapshot?.thumbnailUrl,
+        status: snapshot?.status,
+        repeatMode: snapshot?.repeatMode,
+      );
+    }),
+    (_, _) => publish(),
+    fireImmediately: true,
+  );
+  ref.listen(
+    settingsControllerProvider.select(
+      (value) => (accent: value.value?.accent, language: value.value?.language),
+    ),
+    (_, _) => publish(),
+  );
+  ref.listen(favoriteTrackIdsProvider, (_, _) => publish());
+  if (supportsQueue) {
+    ref.listen(playbackQueueProvider, (_, _) => publish());
+  }
+  ref.onDispose(widgetSync.dispose);
+});
 
 String _innerTubeDeviceRegion() {
   final country = PlatformDispatcher.instance.locale.countryCode
@@ -173,9 +340,29 @@ final innerTubePlaybackServiceProvider = Provider<InnerTubePlaybackService>((
 });
 
 final downloaderServiceProvider = Provider<DownloaderService>((ref) {
-  final service = InnerTubeDownloadService(
+  late final InnerTubeDownloadService service;
+  service = InnerTubeDownloadService(
     playback: ref.watch(innerTubePlaybackServiceProvider),
     catalog: ref.watch(youtubeMusicSearchProvider),
+    audioUpgrade: (url, metadata, baseline, shouldContinue) async {
+      bool canUpgrade() {
+        if (!shouldContinue()) return false;
+        final settings = ref.read(settingsControllerProvider).value;
+        return settings != null &&
+            settings.jioSaavnEnabled &&
+            settings.downloadAudioQuality == AudioQualityProfile.high;
+      }
+
+      if (!canUpgrade()) return null;
+      final track = metadata ?? await service.getInfo(url);
+      if (!canUpgrade()) return null;
+      final upgrade = await ref.read(audioSourceUpgradeLookupProvider)(
+        track,
+        currentBitrate: baseline.bitrate,
+        shouldContinue: canUpgrade,
+      );
+      return canUpgrade() ? upgrade : null;
+    },
   );
   ref.onDispose(() => unawaited(service.dispose()));
   return service;
@@ -186,15 +373,52 @@ final downloaderWarmupProvider = FutureProvider<void>((ref) async {
 });
 
 final playerServiceProvider = Provider<PlayerService>((ref) {
-  final PlayerService service = AppPlatform.isDesktop
+  final PlayerService local = AppPlatform.isDesktop
       ? MediaKitPlayerService()
       : JustAudioPlayerService();
+  // Preserve desktop's native queue/crossfade contract; mobile audio output
+  // uses the OS, and Google Cast/DLNA take over only on explicit selection.
+  final PlayerService service = AppPlatform.isMobile
+      ? CastAwarePlayerService(
+          local: local,
+          cast: ref.watch(castCoordinatorProvider),
+        )
+      : local;
   ref.onDispose(service.dispose);
   return service;
 });
 
 final skipSilenceSupportedProvider = Provider<bool>(
   (ref) => AppPlatform.supportsSkipSilence,
+);
+
+bool _skipSilenceAvailableOn(PlayerService service) =>
+    service is SkipSilenceCapablePlayer &&
+    (service as SkipSilenceCapablePlayer).supportsSkipSilence &&
+    (service is! CastAwarePlayerService || !service.isCasting);
+
+final skipSilenceRouteAvailabilityProvider = StreamProvider.autoDispose<bool>((
+  ref,
+) {
+  final service = ref.watch(playerServiceProvider);
+  if (service is! SkipSilenceCapablePlayer) {
+    return Stream<bool>.value(false);
+  }
+  return Stream<bool>.multi((controller) {
+    final subscription = service.snapshotStream.listen(
+      (_) => controller.add(_skipSilenceAvailableOn(service)),
+      onError: controller.addError,
+      onDone: controller.close,
+    );
+    controller.add(_skipSilenceAvailableOn(service));
+    controller.onCancel = subscription.cancel;
+  }).distinct();
+});
+
+final skipSilenceAvailableProvider = Provider.autoDispose<bool>(
+  (ref) =>
+      ref.watch(skipSilenceRouteAvailabilityProvider).asData?.value ??
+      _skipSilenceAvailableOn(ref.watch(playerServiceProvider)),
 );
 
 final trackShareServiceProvider = Provider<TrackShareService>((ref) {
@@ -206,10 +430,26 @@ final youtubeMusicPlaylistShareServiceProvider =
       return const SharePlusYouTubeMusicPlaylistShareService();
     });
 
+final playlistCsvShareServiceProvider = Provider<PlaylistCsvShareService>((
+  ref,
+) {
+  return const SharePlusPlaylistCsvShareService();
+});
+
 final incomingTrackLinkServiceProvider = Provider<IncomingTrackLinkService>((
   ref,
 ) {
   return AppLinksIncomingTrackLinkService();
+});
+
+final incomingCsvFileServiceProvider = Provider<IncomingCsvFileService>((ref) {
+  final service = NativeIncomingCsvFileService();
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final incomingCsvFileProvider = StreamProvider<IncomingCsvFile>((ref) {
+  return ref.watch(incomingCsvFileServiceProvider).files;
 });
 
 final bstreamTrackLinkCodecProvider = Provider<BStreamTrackLinkCodec>((ref) {
@@ -277,16 +517,75 @@ final incomingYouTubeMusicLinkProvider = StreamProvider<YouTubeMusicLink>((
   }
 });
 
-final lyricsServiceProvider = Provider<LyricsService>((ref) {
+const _lyricsUserAgent =
+    '${AppConstants.appName}/${AppConstants.appVersion} '
+    '(https://github.com/BryamContreras/BStream-Music)';
+
+int _lyricsProviderMask(SettingsState settings) => settings
+    .enabledLyricsProviders
+    .fold<int>(0, (mask, value) => mask | (1 << value.index));
+
+// Wait for persisted settings without querying defaults first. The selected
+// Future stays stable when alignment, romanization or another setting changes.
+final _lyricsProviderConfiguration = settingsControllerProvider.selectAsync(
+  _lyricsProviderMask,
+);
+
+// A small value signature avoids restarting lyrics/network work when an
+// unrelated setting (alignment, romanization, theme, etc.) changes.
+final _enabledLyricsProvidersMaskProvider = Provider<int?>((ref) {
+  return ref.watch(
+    settingsControllerProvider.select((settings) {
+      final value = settings.value;
+      return value == null ? null : _lyricsProviderMask(value);
+    }),
+  );
+});
+
+final lrclibLyricsServiceProvider = Provider.autoDispose<LyricsService>((ref) {
   final service = LrclibLyricsService(
-    userAgent:
-        '${AppConstants.appName}/${AppConstants.appVersion} '
-        '(https://github.com/BryamContreras/BStream-Music)',
-    // This short cache exists only in RAM. It avoids querying LRCLIB again when
-    // returning to the lyrics screen, keeps only a small recent working set,
-    // and is discarded when the app closes.
+    userAgent: _lyricsUserAgent,
+    // Recent documents remain in RAM while this provider is enabled. Disabling
+    // it disposes its client and cancels pending network work too.
     cacheTtl: const Duration(minutes: 15),
     maxCacheEntries: 24,
+  );
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final youLyPlusLyricsServiceProvider = Provider.autoDispose<LyricsService>((
+  ref,
+) {
+  final service = YouLyPlusLyricsService(userAgent: _lyricsUserAgent);
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final betterLyricsServiceProvider = Provider.autoDispose<LyricsService>((ref) {
+  final service = BetterLyricsService(userAgent: _lyricsUserAgent);
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final lyricsServiceProvider = Provider<LyricsService>((ref) {
+  final mask = ref.watch(_enabledLyricsProvidersMaskProvider) ?? 0;
+  final providers = <LyricsService>[];
+  // Declaration order is the priority, not the order in which toggles were
+  // selected. Inactive providers are neither constructed nor queried.
+  for (final provider in LyricsProvider.values) {
+    if (mask & (1 << provider.index) == 0) continue;
+    providers.add(switch (provider) {
+      LyricsProvider.lrclib => ref.watch(lrclibLyricsServiceProvider),
+      LyricsProvider.youLyPlus => ref.watch(youLyPlusLyricsServiceProvider),
+      LyricsProvider.betterLyrics => ref.watch(betterLyricsServiceProvider),
+    });
+  }
+  final service = FallbackLyricsService(
+    providers: providers,
+    // Riverpod owns the clients, keeping enabled providers' small caches alive
+    // across selection changes without retaining disabled clients.
+    disposeProviders: false,
   );
   ref.onDispose(service.dispose);
   return service;
@@ -299,6 +598,48 @@ final lyricsRomanizationServiceProvider = Provider<LyricsRomanizationService>((
   ref.onDispose(service.dispose);
   return service;
 });
+
+final lyricsTranslationServiceProvider = Provider<LyricsTranslationService>((
+  ref,
+) {
+  final service = LyricsTranslationService();
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final currentLyricsDocumentProvider = Provider.autoDispose<LyricsDocument?>((
+  ref,
+) {
+  final selected = ref.watch(selectedLyricsControllerProvider);
+  if (selected != null) return selected;
+  final lookup = ref.watch(currentLyricsLookupProvider);
+  return lookup == null
+      ? null
+      : ref.watch(lyricsProvider(lookup)).asData?.value;
+});
+
+final currentLyricsTranslationProvider =
+    FutureProvider.autoDispose<TranslatedLyricsView?>((ref) {
+      final mode = ref.watch(
+        settingsControllerProvider.select(
+          (settings) => (
+            enabled: settings.value?.lyricsTranslationEnabled == true,
+            language: settings.value?.language ?? AppLanguage.spanish,
+          ),
+        ),
+      );
+      if (!mode.enabled) return null;
+      ref.watch(currentLyricsLookupProvider);
+      final lyrics = ref.watch(currentLyricsDocumentProvider);
+      if (lyrics == null || lyrics.instrumental || !lyrics.hasContent) {
+        return null;
+      }
+      final request = ref
+          .watch(lyricsTranslationServiceProvider)
+          .translateDocument(lyrics, targetLanguage: mode.language.code);
+      ref.onDispose(request.cancel);
+      return request.result;
+    }, retry: (_, _) => null);
 
 final currentLyricsLookupProvider = playerControllerProvider.select((player) {
   final snapshot = player.value;
@@ -328,23 +669,29 @@ final currentPlaybackPositionProvider = playerControllerProvider.select(
 );
 
 final lyricsProvider = FutureProvider.autoDispose
-    .family<LyricsDocument?, LyricsLookup>((ref, lookup) {
+    .family<LyricsDocument?, LyricsLookup>((ref, lookup) async {
+      await ref.watch(_lyricsProviderConfiguration);
+      if (!ref.mounted) return null;
       return ref.watch(lyricsServiceProvider).findLyrics(lookup);
-    });
+    }, retry: (_, _) => null);
 
 final similarLyricsProvider = FutureProvider.autoDispose
-    .family<List<LyricsCandidate>, LyricsLookup>((ref, lookup) {
+    .family<List<LyricsCandidate>, LyricsLookup>((ref, lookup) async {
+      await ref.watch(_lyricsProviderConfiguration);
+      if (!ref.mounted) return const [];
       return ref.watch(lyricsServiceProvider).findSimilarLyrics(lookup);
-    });
+    }, retry: (_, _) => null);
 
 typedef ManualLyricsSearch = ({String title, LyricsLookup context});
 
 final manualLyricsSearchProvider = FutureProvider.autoDispose
-    .family<List<LyricsCandidate>, ManualLyricsSearch>((ref, request) {
+    .family<List<LyricsCandidate>, ManualLyricsSearch>((ref, request) async {
+      await ref.watch(_lyricsProviderConfiguration);
+      if (!ref.mounted) return const [];
       return ref
           .watch(lyricsServiceProvider)
           .searchLyricsByTitle(request.title, context: request.context);
-    });
+    }, retry: (_, _) => null);
 
 final _currentLyricsSelectionIdentityProvider = playerControllerProvider.select(
   (player) {
@@ -362,7 +709,7 @@ final _currentLyricsSelectionIdentityProvider = playerControllerProvider.select(
   },
 );
 
-/// Keeps an explicitly chosen LRCLIB result only for the current song and
+/// Keeps an explicitly chosen provider result only for the current song and
 /// only in memory. It survives closing/reopening the lyrics route, while a
 /// track change immediately discards it.
 final selectedLyricsControllerProvider =
@@ -393,6 +740,11 @@ class SelectedLyricsController extends Notifier<LyricsDocument?> {
         state = null;
       }
     });
+    ref.listen<int?>(_enabledLyricsProvidersMaskProvider, (previous, next) {
+      // A manual result must not bypass a newly disabled provider. Recompute
+      // against the new selection, even when the current song stays the same.
+      if (next != null && previous != next && state != null) state = null;
+    });
     return null;
   }
 
@@ -422,6 +774,7 @@ final desktopMediaSessionProvider = Provider<DesktopMediaSession?>((ref) {
 
   PlayerSnapshot? latestSnapshot;
   var latestQueue = const PlaybackQueueState();
+  var sessionQueue = DesktopMediaQueue(const <DesktopMediaQueueItem>[]);
 
   Duration relativeSeekPosition(Duration offset) {
     final snapshot = latestSnapshot;
@@ -439,27 +792,45 @@ final desktopMediaSessionProvider = Provider<DesktopMediaSession?>((ref) {
     return Duration(milliseconds: milliseconds.toInt());
   }
 
+  Future<void> withReadyPlayer(
+    FutureOr<void> Function(PlayerController player) action,
+  ) async {
+    // Media buttons can arrive while a cold process is restoring its queue.
+    // Resolve the same controller future as the app/widget action path before
+    // selecting, seeking or resuming its persisted song.
+    try {
+      await ref.read(playerControllerProvider.future);
+    } catch (_) {
+      if (!ref.mounted) return;
+      rethrow;
+    }
+    if (ref.mounted) {
+      await action(ref.read(playerControllerProvider.notifier));
+    }
+  }
+
   final callbacks = DesktopMediaSessionCallbacks(
-    play: () => ref.read(playerControllerProvider.notifier).resume(),
-    pause: () => ref.read(playerControllerProvider.notifier).pause(),
+    play: () => withReadyPlayer((player) => player.resume()),
+    pause: () => withReadyPlayer((player) => player.pause()),
     togglePlayPause: () =>
-        ref.read(playerControllerProvider.notifier).togglePlayPause(),
-    next: () => ref.read(playerControllerProvider.notifier).playNext(),
-    previous: () => ref.read(playerControllerProvider.notifier).playPrevious(),
-    stop: () => ref.read(playerControllerProvider.notifier).stop(),
-    seek: (position) =>
-        ref.read(playerControllerProvider.notifier).seek(position),
-    seekBy: (offset) => ref
-        .read(playerControllerProvider.notifier)
-        .seek(relativeSeekPosition(offset)),
-    setShuffleEnabled: (enabled) async {
-      ref.read(playerControllerProvider.notifier).setShuffleEnabled(enabled);
-    },
-    setRepeatMode: (mode) async {
-      ref.read(playerControllerProvider.notifier).setRepeatMode(mode);
-    },
+        withReadyPlayer((player) => player.togglePlayPause()),
+    next: () => withReadyPlayer((player) => player.playNext()),
+    previous: () => withReadyPlayer((player) => player.playPrevious()),
+    stop: () => withReadyPlayer((player) => player.stop()),
+    seek: (position) => withReadyPlayer((player) => player.seek(position)),
+    seekBy: (offset) =>
+        withReadyPlayer((player) => player.seek(relativeSeekPosition(offset))),
+    setShuffleEnabled: (enabled) =>
+        withReadyPlayer((player) => player.setShuffleEnabled(enabled)),
+    setRepeatMode: (mode) =>
+        withReadyPlayer((player) => player.setRepeatMode(mode)),
+    cycleRepeatMode: () =>
+        withReadyPlayer((player) => player.cycleRepeatMode()),
+    toggleFavorite: () => withReadyPlayer((player) async {
+      await player.toggleCurrentFavorite();
+    }),
     playQueueIndex: (index) =>
-        ref.read(playerControllerProvider.notifier).playQueueIndex(index),
+        withReadyPlayer((player) => player.playQueueIndex(index)),
   );
   final binding = DesktopMediaSessionBinding(
     session,
@@ -473,22 +844,23 @@ final desktopMediaSessionProvider = Provider<DesktopMediaSession?>((ref) {
       return;
     }
     final queue = latestQueue;
+    final strings = ref.read(appStringsProvider);
     unawaited(
       binding.update(
-        DesktopMediaSessionState(
+        DesktopMediaSessionState.withQueue(
           snapshot: snapshot,
-          queue: queue.entries
-              .map(
-                (entry) => DesktopMediaQueueItem(
-                  id: entry.id,
-                  title: entry.title,
-                  artist: entry.artist,
-                  album: entry.album,
-                  thumbnailUrl: entry.thumbnailUrl,
-                ),
-              )
-              .toList(growable: false),
+          queue: sessionQueue,
           currentIndex: queue.currentIndex,
+          isFavorite: ref
+              .read(favoriteTrackIdsProvider)
+              .contains(snapshot.trackId),
+          controlLabels: DesktopMediaControlLabels(
+            repeatQueue: strings.repeatQueue,
+            repeatOne: strings.repeatOne,
+            disableRepeat: strings.disableRepeat,
+            addToFavorites: strings.addToFavorites,
+            removeFromFavorites: strings.removeFromFavorites,
+          ),
         ),
       ),
     );
@@ -502,9 +874,24 @@ final desktopMediaSessionProvider = Provider<DesktopMediaSession?>((ref) {
     }
   }, fireImmediately: true);
   ref.listen<PlaybackQueueState>(playbackQueueProvider, (_, next) {
+    if (!identical(latestQueue.entries, next.entries)) {
+      sessionQueue = DesktopMediaQueue(
+        next.entries.map(
+          (entry) => DesktopMediaQueueItem(
+            id: entry.id,
+            title: entry.title,
+            artist: entry.artist,
+            album: entry.album,
+            thumbnailUrl: entry.thumbnailUrl,
+          ),
+        ),
+      );
+    }
     latestQueue = next;
     publishState();
   }, fireImmediately: true);
+  ref.listen(favoriteTrackIdsProvider, (_, _) => publishState());
+  ref.listen(appStringsProvider, (_, _) => publishState());
 
   binding.start();
   ref.onDispose(() {
@@ -552,27 +939,6 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
   DateTime? lastArtworkAttemptAt;
   var publishInFlight = false;
   var publishQueued = false;
-
-  Future<void> publish() async {
-    // A tick can arrive while the previous batch is still writing; coalesce
-    // them instead of letting platform-channel calls interleave.
-    if (publishInFlight) {
-      publishQueued = true;
-      return;
-    }
-    publishInFlight = true;
-    try {
-      do {
-        publishQueued = false;
-        await publishOnce();
-      } while (publishQueued);
-    } catch (error, stackTrace) {
-      debugPrint('Music widget publish failed: $error');
-      debugPrintStack(stackTrace: stackTrace);
-    } finally {
-      publishInFlight = false;
-    }
-  }
 
   Future<void> publishOnce() async {
     final snapshot = latestSnapshot;
@@ -632,6 +998,12 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
         if (currentIndex >= 0 && currentIndex + offset < entries.length)
           entries[currentIndex + offset],
     ];
+    // Absolute playback-queue indices of those rows, so a tap on the widget
+    // jumps straight to that song instead of pressing "next" several times.
+    final queueIndices = <int>[
+      for (var index = 0; index < widgetQueueSize; index++)
+        index < upcoming.length ? currentIndex + index + 1 : -1,
+    ];
 
     final elapsed = _formatWidgetClock(snapshot.position);
     final remaining = _formatWidgetClock(_remainingDuration(snapshot));
@@ -663,6 +1035,7 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
       lastResolvedCoverPath ?? '',
       ...queue,
       ...queueDurations,
+      ...queueIndices.map((index) => '$index'),
     ].join('\u0000');
     final timeSignature = '$progress\u0000$elapsed\u0000$remaining';
     final baseChanged = baseSignature != lastBaseSignature;
@@ -697,6 +1070,10 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
           'queue${index + 1}Duration',
           queueDurations[index],
         );
+        await HomeWidget.saveWidgetData<int>(
+          'queue${index + 1}Index',
+          queueIndices[index],
+        );
       }
       await HomeWidget.updateWidget(name: 'MusicWidgetProvider');
       // Only remember the payload after a successful write: a transient
@@ -707,6 +1084,27 @@ final musicWidgetBridgeProvider = Provider<void>((ref) {
     } catch (error, stackTrace) {
       debugPrint('Music widget sync failed: $error');
       debugPrintStack(stackTrace: stackTrace);
+    }
+  }
+
+  Future<void> publish() async {
+    // A tick can arrive while the previous batch is still writing; coalesce
+    // them instead of letting platform-channel calls interleave.
+    if (publishInFlight) {
+      publishQueued = true;
+      return;
+    }
+    publishInFlight = true;
+    try {
+      do {
+        publishQueued = false;
+        await publishOnce();
+      } while (publishQueued);
+    } catch (error, stackTrace) {
+      debugPrint('Music widget publish failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    } finally {
+      publishInFlight = false;
     }
   }
 
@@ -918,6 +1316,14 @@ final youtubeMusicSearchProvider = Provider<YouTubeMusicSearch>((ref) {
   ref.onDispose(service.dispose);
   return service;
 });
+
+final youtubeMusicSearchSuggestionsProvider =
+    Provider<YouTubeMusicSearchSuggestions?>((ref) {
+      final search = ref.watch(youtubeMusicSearchProvider);
+      return search is YouTubeMusicSearchSuggestions
+          ? search as YouTubeMusicSearchSuggestions
+          : null;
+    });
 
 sealed class HomeRecommendationItem {
   const HomeRecommendationItem();
@@ -1972,6 +2378,7 @@ class HomeRecommendationsController
   bool _inFlightForcesNetwork = false;
   bool _inFlightRefreshesYouTube = false;
   int _buildEpoch = 0;
+  bool _deferredAutomaticRefresh = false;
 
   @override
   Future<List<HomeRecommendationSection>> build() async {
@@ -1985,6 +2392,18 @@ class HomeRecommendationsController
       ),
     );
     final epoch = ++_buildEpoch;
+    _deferredAutomaticRefresh = false;
+    ref.listen(homeFeedActivityProvider, (_, visible) {
+      if (!visible || !_deferredAutomaticRefresh || !ref.mounted) return;
+      _deferredAutomaticRefresh = false;
+      unawaited(
+        _refresh(
+          forceNetwork: false,
+          refreshYouTube: false,
+          expectedEpoch: epoch,
+        ),
+      );
+    });
     // A dependency rebuild supersedes any older refresh. Old results are
     // rejected by [epoch], while this build remains free to start a new one.
     _refreshInFlight = null;
@@ -1996,8 +2415,13 @@ class HomeRecommendationsController
     _historyArtistSection = null;
     _hasQualifiedArtistHistory = false;
 
-    final youtubeState = ref.read(youtubeMusicHomeRecommendationsProvider);
-    _youtubeMusic = youtubeState.value ?? const [];
+    // An invisible feed must not create a cold generic network provider.
+    if (ref.read(homeFeedActivityProvider)) {
+      final youtubeState = ref.read(youtubeMusicHomeRecommendationsProvider);
+      _youtubeMusic = youtubeState.value ?? const [];
+    } else {
+      _youtubeMusic = const [];
+    }
 
     final source = _personalizedSource;
     CachedPersonalizedRecommendationFeed? cached;
@@ -2016,7 +2440,7 @@ class HomeRecommendationsController
         ? const []
         : _homeSectionsFromPersonalizedFeed(cached.feed, strings);
     final artistSource = _artistSource;
-    if (artistSource != null) {
+    if (artistSource != null && ref.read(homeFeedActivityProvider)) {
       try {
         final result = await artistSource.load();
         _historyArtistSection = _homeArtistSectionFromHistory(
@@ -2043,6 +2467,10 @@ class HomeRecommendationsController
     // once; feed TTL must never pin an old Home after a new listen.
     Timer.run(() {
       if (!ref.mounted || epoch != _buildEpoch) {
+        return;
+      }
+      if (!ref.read(homeFeedActivityProvider)) {
+        _deferredAutomaticRefresh = true;
         return;
       }
       unawaited(
@@ -2134,6 +2562,10 @@ class HomeRecommendationsController
     if (!ref.mounted || expectedEpoch != _buildEpoch) {
       return;
     }
+    if (!forceNetwork && !ref.read(homeFeedActivityProvider)) {
+      _deferredAutomaticRefresh = true;
+      return;
+    }
     final strings = ref.read(appStringsProvider);
     final previous =
         state.asData?.value ??
@@ -2193,7 +2625,8 @@ class HomeRecommendationsController
     var refreshedHasQualifiedArtistHistory = false;
     var historyArtistRefreshSucceeded = false;
     final artistSource = _artistSource;
-    if (artistSource != null) {
+    if (artistSource != null &&
+        (forceNetwork || ref.read(homeFeedActivityProvider))) {
       try {
         final result = await artistSource.load(
           refresh: true,
@@ -2227,6 +2660,13 @@ class HomeRecommendationsController
       historyArtistSection: _historyArtistSection,
       hasQualifiedArtistHistory: _hasQualifiedArtistHistory,
     );
+    if (!forceNetwork && !ref.read(homeFeedActivityProvider)) {
+      // Keep fresh data cached, but do not resolve a shelf of new images in a
+      // maintained, invisible Home subtree. Recalculate from cache on return.
+      _deferredAutomaticRefresh = true;
+      state = AsyncData(previous);
+      return;
+    }
     final error = firstError;
     if (error == null) {
       state = AsyncData(combined);
@@ -2926,6 +3366,11 @@ final searchTracksProvider = Provider<SearchTracks>((ref) {
   return SearchTracks(ref.watch(musicRepositoryProvider));
 });
 
+final downloadAudioMetadataServiceProvider =
+    Provider<DownloadAudioMetadataService>((ref) {
+      return DownloadAudioMetadataService();
+    });
+
 final downloadAudioProvider = Provider<DownloadAudio>((ref) {
   return DownloadAudio(ref.watch(musicRepositoryProvider));
 });
@@ -2947,6 +3392,13 @@ typedef RemotePlaybackRetryDelay = Future<void> Function(Duration duration);
 final remotePlaybackRetryDelayProvider = Provider<RemotePlaybackRetryDelay>(
   (ref) =>
       (duration) => Future<void>.delayed(duration),
+);
+
+/// Mobile wake protection must be bounded while a source is being recovered.
+/// Desktop has no audio foreground service and retains its existing policy.
+/// Successful playback cancels it; another retry notice does not extend it.
+final playbackRecoveryTimeoutProvider = Provider<Duration?>(
+  (ref) => AppPlatform.isMobile ? const Duration(minutes: 3) : null,
 );
 
 final getLibraryTracksProvider = Provider<GetLibraryTracks>((ref) {

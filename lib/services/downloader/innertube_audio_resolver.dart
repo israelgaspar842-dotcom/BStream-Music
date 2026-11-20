@@ -72,6 +72,14 @@ final class InnerTubeAudioResolver
         videoId: resolved.videoId,
         formatId: resolved.format.itag.toString(),
         codec: resolved.codec,
+        // A muxed format's bitrate includes video, so it cannot be shown as
+        // the quality of its audio track.
+        bitrate:
+            resolved.format.isAudioOnly && resolved.format.effectiveBitrate > 0
+            ? resolved.format.effectiveBitrate
+            : null,
+        sampleRate: resolved.format.audioSampleRate,
+        channels: resolved.format.audioChannels,
         clientProfileKey: resolved.profile.key,
         expiresAt: resolved.expiresAt,
       );

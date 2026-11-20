@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'player_lyrics_icon.dart';
+import 'player_panel.dart' show showDesktopPlaybackQueue;
 import 'dart:math' as math;
 import 'dart:ui';
 
@@ -16,12 +18,13 @@ import '../../../../core/widgets/marquee_text.dart';
 import '../../../../core/widgets/liquid_glass_surface.dart';
 import '../../../../services/downloader/audio_stream_resolver.dart';
 import '../../../../services/player/player_service.dart';
-import '../../domain/entities/local_track.dart';
 import '../providers/music_providers.dart';
+import '../providers/playback_artwork_provider.dart';
 import '../providers/playback_visual_cache_provider.dart';
 import 'favorite_star_badge.dart';
+import 'decorative_progress_transition.dart';
 import 'playback_progress_line.dart';
-import 'playlist_artwork.dart';
+import 'playback_control_icon.dart';
 import 'source_image.dart';
 import 'track_change_transition.dart';
 
@@ -86,6 +89,7 @@ class MiniPlayer extends ConsumerWidget {
     this.backgroundMode = MiniPlayerBackgroundMode.artwork,
     this.liquidGlassBackdropGroupKey,
     this.liquidGlassBackdropMotion,
+    this.liquidGlassBackdropEnvelopeWidth,
     super.key,
   });
 
@@ -95,6 +99,10 @@ class MiniPlayer extends ConsumerWidget {
   final MiniPlayerBackgroundMode backgroundMode;
   final BackdropKey? liquidGlassBackdropGroupKey;
   final ValueListenable<bool>? liquidGlassBackdropMotion;
+
+  /// Stable horizontal filter extent while the visible capsule morphs.
+  /// Unsupported renderers and other background modes keep their native clip.
+  final double? liquidGlassBackdropEnvelopeWidth;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -123,18 +131,9 @@ class MiniPlayer extends ConsumerWidget {
       }),
     );
     final strings = ref.watch(appStringsProvider);
-    final localTracks =
-        ref.watch(libraryTracksProvider).value ?? const <LocalTrack>[];
-    final localTrack = _miniLocalTrackForSnapshot(
-      localTracks,
-      trackId: presentation.trackId,
-      sourceUrl: presentation.sourceUrl,
-    );
-    final localArtwork = localTrack == null
-        ? null
-        : preferredLocalTrackArtworkSource(localTrack);
-    final artworkSource = localArtwork?.source ?? presentation.thumbnailUrl;
-    final artworkFallbackSource = localArtwork?.fallbackSource;
+    final artwork = ref.watch(playbackArtworkProvider);
+    final artworkSource = artwork.source;
+    final artworkFallbackSource = artwork.fallback;
     final isFavorite = ref.watch(
       favoriteTrackIdsProvider.select(
         (ids) => ids.contains(presentation.trackId),
@@ -283,13 +282,11 @@ class MiniPlayer extends ConsumerWidget {
         iconSize: playIconSize,
         padding: EdgeInsets.zero,
         constraints: BoxConstraints.tight(Size.square(playControlSize)),
-        icon: Transform.translate(
-          offset: windowsLayout && !isPlaying
-              ? const Offset(1, 0)
-              : Offset.zero,
-          child: Icon(
-            isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-          ),
+        icon: PlaybackControlIcon(
+          isLoading: presentation.status == PlayerStatus.loading,
+          isPlaying: isPlaying,
+          loadingLabel: strings.playbackLoading,
+          playOffset: windowsLayout ? const Offset(1, 0) : Offset.zero,
         ),
         onPressed: () =>
             ref.read(playerControllerProvider.notifier).togglePlayPause(),
@@ -351,7 +348,14 @@ class MiniPlayer extends ConsumerWidget {
       key: const ValueKey('mini-player-lyrics-control'),
       tooltip: strings.lyrics,
       icon: Icons.lyrics_rounded,
+      customIcon: const PlayerLyricsIcon(),
       onPressed: onOpenLyrics,
+    );
+    final desktopQueue = _MiniTransportButton(
+      key: const ValueKey('mini-player-queue-control'),
+      tooltip: strings.playbackQueue,
+      icon: Icons.format_list_bulleted_rounded,
+      onPressed: () => showDesktopPlaybackQueue(context),
     );
     final swipeEnabled =
         compactMobile &&
@@ -410,6 +414,9 @@ class MiniPlayer extends ConsumerWidget {
             : BorderRadius.zero,
         backdropGroupKey: liquidGlassBackdropGroupKey,
         backdropMotion: liquidGlassBackdropMotion,
+        backdropEnvelopeWidth: liquidGlassBackdropEnvelopeWidth == null
+            ? null
+            : liquidGlassBackdropEnvelopeWidth! - capsuleMargin.horizontal,
         child: Material(
           key: const ValueKey('mini-player-frame'),
           color: Colors.transparent,
@@ -621,6 +628,8 @@ class MiniPlayer extends ConsumerWidget {
                                                 ),
                                               if (presentation.hasError)
                                                 const SizedBox(width: 12),
+                                              desktopQueue,
+                                              const SizedBox(width: 4),
                                               desktopLyrics,
                                               const SizedBox(width: 4),
                                               Flexible(child: desktopVolume),
@@ -852,6 +861,7 @@ class _MiniPlayerBackgroundFrame extends StatelessWidget {
     required this.borderRadius,
     required this.backdropGroupKey,
     required this.backdropMotion,
+    this.backdropEnvelopeWidth,
     required this.child,
   });
 
@@ -859,6 +869,7 @@ class _MiniPlayerBackgroundFrame extends StatelessWidget {
   final BorderRadius borderRadius;
   final BackdropKey? backdropGroupKey;
   final ValueListenable<bool>? backdropMotion;
+  final double? backdropEnvelopeWidth;
   final Widget child;
 
   @override
@@ -866,23 +877,52 @@ class _MiniPlayerBackgroundFrame extends StatelessWidget {
     if (!backgroundMode.isLiquidGlass) {
       return child;
     }
-    Widget glass(bool moving, Widget child) => LiquidGlassSurface(
-      key: const ValueKey('mini-player-liquid-glass-background'),
-      borderRadius: borderRadius,
-      blurSigma: 8,
-      intensity: 1,
-      backdropGroupKey: backdropGroupKey,
-      backdropMotion: moving,
-      child: child,
-    );
-    final motion = backdropMotion;
-    if (motion == null) {
-      return glass(false, child);
+    Widget glass(bool moving, Widget child, {Rect? envelope}) =>
+        LiquidGlassSurface(
+          key: const ValueKey('mini-player-liquid-glass-background'),
+          borderRadius: borderRadius,
+          blurSigma: 8,
+          intensity: LiquidGlassSurface.chromeIntensity,
+          materialOpacity: LiquidGlassSurface.chromeOpacity,
+          backdropGroupKey: backdropGroupKey,
+          backdropMotion: moving,
+          backdropEnvelope: envelope,
+          shadowClipInsets: envelope == null
+              ? null
+              : _miniPlayerMarginFor(context, MiniPlayerMode.capsule),
+          child: child,
+        );
+    Widget buildGlass({Rect? envelope}) {
+      final motion = backdropMotion;
+      if (motion == null) return glass(false, child, envelope: envelope);
+      return ValueListenableBuilder<bool>(
+        valueListenable: motion,
+        builder: (context, moving, child) =>
+            glass(moving, child!, envelope: envelope),
+        child: child,
+      );
     }
-    return ValueListenableBuilder<bool>(
-      valueListenable: motion,
-      builder: (context, moving, child) => glass(moving, child!),
-      child: child,
+
+    final envelopeWidth = backdropEnvelopeWidth;
+    if (envelopeWidth == null) return buildGlass();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (!constraints.biggest.isFinite ||
+            envelopeWidth < constraints.maxWidth) {
+          return buildGlass();
+        }
+        return SizedBox.fromSize(
+          size: constraints.biggest,
+          child: buildGlass(
+            envelope: Rect.fromLTWH(
+              (constraints.maxWidth - envelopeWidth) / 2,
+              0,
+              envelopeWidth,
+              constraints.maxHeight,
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -961,6 +1001,7 @@ class _MiniTransportButton extends StatelessWidget {
     this.dimension = 48,
     this.iconSize,
     this.color,
+    this.customIcon,
     super.key,
   });
 
@@ -970,6 +1011,7 @@ class _MiniTransportButton extends StatelessWidget {
   final double dimension;
   final double? iconSize;
   final Color? color;
+  final Widget? customIcon;
 
   @override
   Widget build(BuildContext context) {
@@ -977,7 +1019,7 @@ class _MiniTransportButton extends StatelessWidget {
       dimension: dimension,
       child: IconButton(
         tooltip: tooltip,
-        icon: Icon(icon),
+        icon: customIcon ?? Icon(icon),
         color: color ?? AppColors.playbackControlForegroundFor(context),
         iconSize: iconSize,
         padding: EdgeInsets.zero,
@@ -1039,7 +1081,7 @@ class _MiniVolumeControl extends ConsumerWidget {
             children: [
               Icon(
                 _miniVolumeIcon(normalizedVolume),
-                size: 22,
+                size: 22 * appVolumeIconScale,
                 color: AppColors.playbackControlForegroundFor(context),
               ),
               const SizedBox(width: 6),
@@ -1371,15 +1413,17 @@ class _MiniProgressState extends ConsumerState<_MiniProgress> {
 
   @override
   Widget build(BuildContext context) {
-    final timeline = ref.watch(
-      playerControllerProvider.select((player) {
-        final snapshot = player.value;
-        return (
-          position: snapshot?.position ?? Duration.zero,
-          duration: snapshot?.duration,
-        );
-      }),
-    );
+    final timelineProvider = playerControllerProvider.select((player) {
+      final snapshot = player.value;
+      return (
+        position: snapshot?.position ?? Duration.zero,
+        duration: snapshot?.duration,
+        isPlaying: snapshot?.status == PlayerStatus.playing,
+      );
+    });
+    final timeline = TickerMode.valuesOf(context).enabled
+        ? ref.watch(timelineProvider)
+        : ref.read(timelineProvider);
     final progressColor = AppColors.downloadAccentFor(context);
     final strings = ref.watch(appStringsProvider);
     final duration = timeline.duration;
@@ -1394,6 +1438,7 @@ class _MiniProgressState extends ConsumerState<_MiniProgress> {
       final line = PlaybackProgressLine(
         value: progress,
         color: progressColor,
+        animateProgress: timeline.isPlaying,
         height: widget.height,
         colorAnimationKey: const ValueKey('mini-progress-color-animation'),
         fillKey: const ValueKey('mini-progress-fill'),
@@ -1553,11 +1598,15 @@ class _MiniPositionText extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final seconds = ref.watch(
-      playerControllerProvider.select(
-        (player) => player.value?.position.inSeconds ?? 0,
-      ),
+    final positionProvider = playerControllerProvider.select(
+      (player) => player.value?.position.inSeconds ?? 0,
     );
+    // Retain the last view while the complete mini is offscreen, but do not
+    // rebuild hidden text for every native playback-position notification.
+    // TickerMode becoming active rebuilds this consumer with the latest time.
+    final seconds = TickerMode.valuesOf(context).enabled
+        ? ref.watch(positionProvider)
+        : ref.read(positionProvider);
     return _MiniTimeText(
       duration: Duration(seconds: seconds),
       alignment: Alignment.centerRight,
@@ -1647,29 +1696,35 @@ class _MiniArtworkProgressRing extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final progress = ref.watch(
-      playerControllerProvider.select((player) {
-        final snapshot = player.value;
-        return miniArtworkRingProgress(
+    final timelineProvider = playerControllerProvider.select((player) {
+      final snapshot = player.value;
+      return (
+        progress: miniArtworkRingProgress(
           snapshot?.position ?? Duration.zero,
           snapshot?.duration,
-        );
-      }),
-    );
-    return TweenAnimationBuilder<double>(
-      key: const ValueKey('mini-player-artwork-progress-animation'),
-      tween: Tween<double>(end: progress),
-      duration: const Duration(milliseconds: 160),
-      curve: Curves.easeOutCubic,
-      builder: (context, animatedProgress, _) => CircularProgressIndicator(
-        key: const ValueKey('mini-player-artwork-progress-ring'),
-        value: animatedProgress,
-        strokeWidth: 2,
-        strokeCap: StrokeCap.round,
-        color: AppColors.downloadAccentFor(context),
-        backgroundColor: AppColors.menuInactiveSliderFor(
-          context,
-        ).withValues(alpha: 0.55),
+        ),
+        isPlaying: snapshot?.status == PlayerStatus.playing,
+      );
+    });
+    final timeline = TickerMode.valuesOf(context).enabled
+        ? ref.watch(timelineProvider)
+        : ref.read(timelineProvider);
+    return RepaintBoundary(
+      child: DecorativeProgressTransition(
+        key: const ValueKey('mini-player-artwork-progress-animation'),
+        value: timeline.progress,
+        animateProgress: timeline.isPlaying,
+        duration: const Duration(milliseconds: 160),
+        builder: (context, animatedProgress, _) => CircularProgressIndicator(
+          key: const ValueKey('mini-player-artwork-progress-ring'),
+          value: animatedProgress,
+          strokeWidth: 2,
+          strokeCap: StrokeCap.round,
+          color: AppColors.downloadAccentFor(context),
+          backgroundColor: AppColors.menuInactiveSliderFor(
+            context,
+          ).withValues(alpha: 0.55),
+        ),
       ),
     );
   }
@@ -1702,30 +1757,4 @@ class _MiniArtworkImage extends StatelessWidget {
             ),
     );
   }
-}
-
-LocalTrack? _miniLocalTrackForSnapshot(
-  List<LocalTrack> tracks, {
-  required String? trackId,
-  required String? sourceUrl,
-}) {
-  final normalizedId = trackId?.trim();
-  if (normalizedId != null && normalizedId.isNotEmpty) {
-    for (final track in tracks) {
-      if (track.id == normalizedId) {
-        return track;
-      }
-    }
-  }
-
-  final normalizedSource = sourceUrl?.trim();
-  if (normalizedSource == null || normalizedSource.isEmpty) {
-    return null;
-  }
-  for (final track in tracks) {
-    if (track.sourceUrl?.trim() == normalizedSource) {
-      return track;
-    }
-  }
-  return null;
 }

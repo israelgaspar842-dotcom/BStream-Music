@@ -1,5 +1,91 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Audio Sources in Integrations, with mandatory YouTube Music and optional
+  JioSaavn enabled by default. Data saving offers one quality choice on desktop
+  and Wi-Fi/cellular profiles on mobile, also applied to downloads.
+- Background same-recording JioSaavn quality upgrades that reuse the existing
+  standby playback deck, retain queue/position/catalog metadata and fall back
+  to YouTube when no verified higher-quality recording is available.
+- Actual Low/Standard/High audio quality and current-track upgrade status in a
+  headphones capsule beside the playback times in all player styles, localized
+  in all seven languages.
+- Read JioSaavn's actual codec, declared bitrate, sample rate and channels with
+  the shared local MP4/AAC parser and a bounded, cached header lookup.
+- Embed title, artist, album and cached artwork in compatible M4A/audio MP4
+  (AAC/ALAC), MP3, FLAC, Ogg Opus/Vorbis, WAV and APE files, plus text tags in
+  audio-only WebM/Matroska Opus/Vorbis downloads. WebM artwork remains cached
+  separately, preserving its container and filename.
+- Detect metadata containers from file contents and share format-specific
+  comment/picture handling, bounded copying and validated atomic publication,
+  without transcoding the audio. Metadata is written in a bounded background
+  task before library publication, with atomic replacement and the original
+  file retained when tagging fails or a container layout is unsupported.
+- Update existing downloaded files from their saved library metadata through
+  the downloaded-songs menu, without new network requests.
+
+## 1.3.1+131 — 2026-11-12
+
+### Added
+
+- A 5-band equalizer is now available.
+- Support for higher quality audio whenever available.
+- Added the new Spotify Style player.
+- Added filtering options in the Local music tab.
+- Added support for word-synchronized lyrics when word timing is available,
+  with line-by-line synchronization retained as the fallback.
+- Custom artwork for saved playlists, including Favorites. Tapping the cover
+  offers Random or Custom, with gallery selection and the shared square crop
+  editor. Saved covers are reused by library rows, playlist headers, backgrounds
+  and playlist pickers, and remain available after media moves or ZIP restores.
+
+### Changed
+
+- Improved and optimized the layouts of the player styles.
+- Improved the design of the Settings tab.
+- Playback waves now share the artwork color extraction and cache used by
+  playback menus, retaining the app accent when artwork is unavailable.
+- Updated the minimum Flutter version and CI builds to stable 3.47.9.
+- Retained Liquid Glass filters and painted optics during navigation, with
+  full droplet growth and refraction reserved for dragging.
+- Shortened navigation droplet travel to 220 ms and retained its optical
+  subtree while moving between tabs.
+- Hidden the bottom menu and mini player while the software keyboard is
+  visible, retaining their state without painting or running animations.
+- Changed keyboard chrome transitions to a subtle 2% zoom and fade: 100 ms
+  to reappear and 80 ms to hide, starting immediately when visibility changes.
+- Resumed visible glass effects 50 ms after the last keyboard inset change.
+
+### Fixed
+
+- Prevented interrupted remote loads from restarting the newly selected song
+  after rapid skips.
+- Removed lower-edge seams from expanded animated artwork and Spotify Canvas
+  without adding video decoders or blur passes.
+- Preserved full-player artwork through its exit transition.
+
+## 1.2.9+129 — 2026-10-12
+
+### Added
+
+- Added desktop LIVE widget style selection with Classic and Wave previews.
+- Added a home-screen player widget.
+- Added custom app backgrounds using images selected from the gallery.
+- Added app-wide font customization.
+- Added multi-selection in albums, mixes, and search results, with actions to
+  add the selected songs to a playlist or download them.
+- Added Portuguese, French, Korean, Chinese, and Japanese language support.
+
+### Changed
+
+- Optimized animated artwork performance.
+- Improved interface performance and smoothness.
+- Album, mix, and artist backgrounds now inherit a subtle gradient from their
+  cover artwork.
+
 ## 1.2.8+128 — 2026-09-17
 
 ### Added

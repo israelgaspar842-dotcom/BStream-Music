@@ -67,9 +67,16 @@ class YouTubeMusicAuthCoordinator {
   Future<YouTubeMusicSessionCredential> validate(
     YouTubeMusicWebAuthData authData, {
     YouTubeMusicAccountChannel? expectedChannel,
+    bool refreshProfile = false,
   }) async {
     final normalized = normalize(authData);
-    final profile = await _accountClient.validateAccount(normalized);
+    final client = _accountClient;
+    final profile =
+        refreshProfile && client is YouTubeMusicAccountProfileRefresher
+        ? await (client as YouTubeMusicAccountProfileRefresher).refreshAccount(
+            normalized,
+          )
+        : await client.validateAccount(normalized);
     if (expectedChannel != null &&
         profile.channelId != expectedChannel.profile.channelId) {
       throw const YouTubeMusicAccountException(
@@ -92,6 +99,26 @@ class YouTubeMusicAuthCoordinator {
 
   Future<void> persist(YouTubeMusicSessionCredential credential) =>
       _sessionStore.write(credential);
+
+  /// Reads current metadata using the saved session without changing its
+  /// selected account/channel or reopening Google's sign-in page.
+  Future<YouTubeMusicSessionCredential> refreshProfile(
+    YouTubeMusicSessionCredential credential,
+  ) => validate(
+    YouTubeMusicWebAuthData(
+      cookieHeader: credential.cookieHeader,
+      identity: credential.identity,
+      apiKey: credential.apiKey,
+      clientVersion: credential.clientVersion,
+      clientName: credential.clientName,
+      region: credential.region,
+    ),
+    expectedChannel: YouTubeMusicAccountChannel(
+      profile: credential.profile,
+      isSelected: true,
+    ),
+    refreshProfile: true,
+  );
 
   Uri validateChannelSignInUrl(Uri uri) {
     if (navigationPolicy.evaluate(uri, isMainFrame: true) !=

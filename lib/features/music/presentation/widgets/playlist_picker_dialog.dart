@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_dialog.dart';
@@ -10,7 +11,7 @@ import '../../domain/entities/local_track.dart';
 import '../../domain/entities/playlist.dart';
 import '../providers/app_strings.dart';
 import 'playlist_artwork.dart';
-import 'source_image.dart';
+import 'playlist_artwork_mosaic.dart';
 
 /// The shared playlist-name form used by the Library and collection actions.
 /// An optional initial name is only a suggestion; the user can edit or clear
@@ -78,6 +79,11 @@ class PlaylistPickerDialog extends StatelessWidget {
     required this.playlists,
     required this.tracks,
     this.catalogPlaylists = const <CatalogPlaylist>[],
+    this.showCreateButton = false,
+    this.onCreatePlaylist,
+    this.createTooltip,
+    this.emptyMessage,
+    this.artworkRotationSeed,
     super.key,
   });
 
@@ -85,6 +91,11 @@ class PlaylistPickerDialog extends StatelessWidget {
   final List<Playlist> playlists;
   final List<LocalTrack> tracks;
   final List<CatalogPlaylist> catalogPlaylists;
+  final bool showCreateButton;
+  final VoidCallback? onCreatePlaylist;
+  final String? createTooltip;
+  final String? emptyMessage;
+  final int? artworkRotationSeed;
 
   @override
   Widget build(BuildContext context) {
@@ -97,9 +108,23 @@ class PlaylistPickerDialog extends StatelessWidget {
         .toList(growable: false);
 
     return AppAlertDialog(
-      title: Text(
-        title,
-        style: TextStyle(color: AppColors.contentHeadingFor(context)),
+      key: const ValueKey('playlist-picker-dialog'),
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              title,
+              style: TextStyle(color: AppColors.contentHeadingFor(context)),
+            ),
+          ),
+          if (showCreateButton)
+            IconButton(
+              key: const ValueKey('playlist-picker-create'),
+              tooltip: createTooltip,
+              icon: const Icon(Icons.add_rounded),
+              onPressed: onCreatePlaylist,
+            ),
+        ],
       ),
       contentPadding: const EdgeInsets.fromLTRB(4, 8, 4, 16),
       content: ConstrainedBox(
@@ -112,48 +137,58 @@ class PlaylistPickerDialog extends StatelessWidget {
           // provide intrinsic dimensions, so give the lazy list a finite width
           // while still allowing the dialog constraints to shrink it on mobile.
           width: 420,
-          child: ListView.builder(
-            shrinkWrap: true,
-            itemCount: selectablePlaylists.length,
-            itemBuilder: (context, index) {
-              final playlist = selectablePlaylists[index];
-              return SimpleDialogOption(
-                onPressed: () => Navigator.of(context).pop(playlist.id),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 20,
-                  vertical: 8,
+          child: selectablePlaylists.isEmpty && emptyMessage != null
+              ? Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Text(emptyMessage!),
+                )
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: selectablePlaylists.length,
+                  itemBuilder: (context, index) {
+                    final playlist = selectablePlaylists[index];
+                    return SimpleDialogOption(
+                      key: ValueKey('playlist-picker-option-${playlist.id}'),
+                      onPressed: () => Navigator.of(context).pop(playlist.id),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 8,
+                      ),
+                      child: _PlaylistOption(
+                        playlist: playlist,
+                        thumbnailSources: () => _playlistThumbnailSources(
+                          playlist,
+                          tracksById,
+                          catalog: catalogsById[playlist.id],
+                          rotationSeed: artworkRotationSeed,
+                        ),
+                      ),
+                    );
+                  },
                 ),
-                child: _PlaylistOption(
-                  playlist: playlist,
-                  thumbnailSources: _playlistThumbnailSources(
-                    playlist,
-                    tracksById,
-                    catalog: catalogsById[playlist.id],
-                  ),
-                ),
-              );
-            },
-          ),
         ),
       ),
     );
   }
 }
 
-class _PlaylistOption extends StatelessWidget {
+class _PlaylistOption extends ConsumerWidget {
   const _PlaylistOption({
     required this.playlist,
     required this.thumbnailSources,
   });
 
   final Playlist playlist;
-  final List<PlaylistArtworkSource> thumbnailSources;
+  final List<PlaylistArtworkSource> Function() thumbnailSources;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Row(
       children: [
-        _PlaylistOptionCover(sources: thumbnailSources),
+        PlaylistArtworkMosaic(
+          sources: playlistArtworkSourcesFor(ref, playlist, thumbnailSources),
+          size: 44,
+        ),
         const SizedBox(width: 12),
         Expanded(
           child: MarqueeText(
@@ -169,99 +204,11 @@ class _PlaylistOption extends StatelessWidget {
   }
 }
 
-class _PlaylistOptionCover extends StatelessWidget {
-  const _PlaylistOptionCover({required this.sources});
-
-  final List<PlaylistArtworkSource> sources;
-
-  @override
-  Widget build(BuildContext context) {
-    if (sources.isEmpty) {
-      return const _PlaylistOptionFallback();
-    }
-
-    final underlay = sources.skip(1).take(3).toList(growable: false);
-
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: SizedBox(
-        width: 44,
-        height: 44,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            _PlaylistOptionImage(artwork: sources.first, cacheWidth: 96),
-            if (underlay.isNotEmpty)
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                height: 16,
-                child: DecoratedBox(
-                  decoration: const BoxDecoration(color: Color(0xAA000000)),
-                  child: Row(
-                    children: [
-                      for (final artwork in underlay)
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.all(1),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(2),
-                              child: _PlaylistOptionImage(
-                                artwork: artwork,
-                                cacheWidth: 64,
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _PlaylistOptionImage extends StatelessWidget {
-  const _PlaylistOptionImage({required this.artwork, required this.cacheWidth});
-
-  final PlaylistArtworkSource artwork;
-  final int cacheWidth;
-
-  @override
-  Widget build(BuildContext context) {
-    return SourceImage(
-      source: artwork.source,
-      fallbackSource: artwork.fallbackSource,
-      cacheWidth: cacheWidth,
-      fallback: const _PlaylistOptionFallback(),
-    );
-  }
-}
-
-class _PlaylistOptionFallback extends StatelessWidget {
-  const _PlaylistOptionFallback();
-
-  @override
-  Widget build(BuildContext context) {
-    return const DecoratedBox(
-      decoration: BoxDecoration(color: Color(0xFF202520)),
-      child: SizedBox(
-        width: 44,
-        height: 44,
-        child: Icon(Icons.queue_music_rounded, size: 22),
-      ),
-    );
-  }
-}
-
 List<PlaylistArtworkSource> _playlistThumbnailSources(
   Playlist playlist,
   Map<String, LocalTrack> tracksById, {
   CatalogPlaylist? catalog,
+  int? rotationSeed,
 }) {
   final candidates = catalog == null
       ? playlist.trackIds
@@ -277,5 +224,6 @@ List<PlaylistArtworkSource> _playlistThumbnailSources(
   return rotatingPlaylistArtworkSources(
     playlistId: playlist.id,
     candidates: candidates,
+    rotationSeed: rotationSeed,
   );
 }

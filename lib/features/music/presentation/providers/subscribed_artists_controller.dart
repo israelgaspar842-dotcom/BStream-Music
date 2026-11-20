@@ -28,9 +28,9 @@ class SubscribedArtistsController
 
   @override
   Future<List<RemoteSubscribedArtist>> build() async {
-    final auth = ref.watch(youtubeMusicAuthControllerProvider);
+    final auth = ref.watch(youtubeMusicAuthSessionIdentityProvider);
     final nextSessionKey = auth.isAuthenticated
-        ? '${auth.generation}|${auth.profile?.channelId ?? ''}'
+        ? '${auth.generation}|${auth.accountKey ?? ''}'
         : null;
     if (_sessionKey != nextSessionKey) {
       _sessionKey = nextSessionKey;

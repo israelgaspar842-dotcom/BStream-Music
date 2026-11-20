@@ -1,21 +1,198 @@
 import 'dart:async';
 
-import 'package:bstream_music/core/theme/app_colors.dart';
 import 'package:bstream_music/core/theme/app_theme.dart';
-import 'package:bstream_music/core/widgets/liquid_glass_surface.dart';
 import 'package:bstream_music/features/music/domain/entities/track_info.dart';
+import 'package:bstream_music/features/music/domain/entities/playlist.dart';
 import 'package:bstream_music/features/music/presentation/pages/remote_collection_detail_page.dart';
 import 'package:bstream_music/features/music/presentation/providers/music_providers.dart';
+import 'package:bstream_music/features/music/presentation/widgets/artwork_detail_scaffold.dart';
 import 'package:bstream_music/features/music/presentation/widgets/playlist_picker_dialog.dart';
 import 'package:bstream_music/features/music/presentation/widgets/source_image.dart';
 import 'package:bstream_music/services/player/player_service.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bstream_music/features/music/presentation/widgets/mini_player.dart';
 
 void main() {
+  testWidgets(
+    'album selection adds only marked songs and survives picker cancellation',
+    (tester) async {
+      tester.view.physicalSize = const Size(320, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      final player = _RecordingPlayerController();
+      final playlists = _PickerPlaylistsController();
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playlistsControllerProvider.overrideWith(() => playlists),
+            libraryTracksProvider.overrideWith((ref) async => []),
+            catalogPlaylistsProvider.overrideWith((ref) async => []),
+          ],
+          child: _detailApp(
+            player: player,
+            tracksProvider: FutureProvider((ref) async => _tracks),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.longPress(find.text('Primera cancion'));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('collection-selection-toolbar')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('track-result-play-song-1')),
+        findsNothing,
+      );
+      await tester.tap(find.text('Segunda cancion'));
+      await tester.pumpAndSettle();
+      final checkboxes = tester.widgetList<Checkbox>(find.byType(Checkbox));
+      expect(checkboxes.every((checkbox) => checkbox.value == true), isTrue);
+      await tester.tap(find.text('Primera cancion'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('collection-selection-add-to-playlist')),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('playlist-picker-create')),
+        findsOneWidget,
+      );
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('collection-selection-toolbar')),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .widget<Checkbox>(
+              find.byKey(const ValueKey('track-result-selection-song-2')),
+            )
+            .value,
+        isTrue,
+      );
+      await tester.tap(
+        find.byKey(const ValueKey('collection-selection-add-to-playlist')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('playlist-picker-option-existing')),
+      );
+      await tester.pumpAndSettle();
+      expect(playlists.receivedTracks, [_tracks.last]);
+      expect(playlists.download, isFalse);
+      expect(player.playCalls, 0);
+      expect(
+        find.byKey(const ValueKey('collection-selection-toolbar')),
+        findsNothing,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'mix selection downloads only selected audio using the shared queue',
+    (tester) async {
+      final downloads = _SelectedDownloads();
+      final player = _RecordingPlayerController();
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [downloadControllerProvider.overrideWith(() => downloads)],
+          child: _detailApp(
+            player: player,
+            subtitle: 'Mix recomendado',
+            tracksProvider: FutureProvider((ref) async => _tracks),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.longPress(find.text('Segunda cancion'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('collection-selection-download')),
+      );
+      await tester.pumpAndSettle();
+      expect(downloads.tracks, [_tracks.last]);
+      expect(player.playCalls, 0);
+      expect(
+        find.byKey(const ValueKey('collection-selection-toolbar')),
+        findsNothing,
+      );
+    },
+  );
+
+  testWidgets('Back clears collection selection without leaving the detail', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _detailApp(
+        player: _RecordingPlayerController(),
+        tracksProvider: FutureProvider((ref) async => _tracks),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.longPress(find.text('Primera cancion'));
+    await tester.pumpAndSettle();
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('collection-selection-toolbar')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const ValueKey('remote-collection-detail')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+    'albums expose the existing-playlist picker and plus without a callback',
+    (tester) async {
+      final controller = _PickerPlaylistsController();
+      final tracksProvider = FutureProvider<List<TrackInfo>>(
+        (ref) async => _tracks,
+      );
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playlistsControllerProvider.overrideWith(() => controller),
+            libraryTracksProvider.overrideWith((ref) async => []),
+            catalogPlaylistsProvider.overrideWith((ref) async => []),
+          ],
+          child: _detailApp(
+            player: _RecordingPlayerController(),
+            tracksProvider: tracksProvider,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('remote-collection-add-to-playlist')),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('playlist-picker-create')),
+        findsOneWidget,
+      );
+      await tester.tap(
+        find.byKey(const ValueKey('playlist-picker-option-existing')),
+      );
+      await tester.pumpAndSettle();
+      expect(controller.destination, 'existing');
+      expect(controller.receivedTracks, _tracks);
+      expect(controller.download, isFalse);
+    },
+  );
+
   testWidgets('create playlist dialog prefills, edits and cancels safely', (
     tester,
   ) async {
@@ -87,7 +264,7 @@ void main() {
         find.byKey(const ValueKey('remote-collection-detail')),
         findsOneWidget,
       );
-      expect(find.text('Album de contrato'), findsNWidgets(2));
+      expect(find.text('Album de contrato'), findsOneWidget);
       expect(find.text('Artista principal'), findsOneWidget);
       expect(find.textContaining('Album'), findsWidgets);
       expect(find.textContaining('2026'), findsOneWidget);
@@ -121,7 +298,13 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byIcon(Icons.download_rounded), findsOneWidget);
-      expect(find.byIcon(Icons.playlist_add_rounded), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byWidgetPredicate((widget) => widget is PopupMenuItem),
+          matching: find.byIcon(Icons.playlist_add_rounded),
+        ),
+        findsOneWidget,
+      );
       await tester.binding.handlePopRoute();
       await tester.pumpAndSettle();
 
@@ -164,6 +347,100 @@ void main() {
     expect(player.lastQueueSourceId, 'album:MPRE-contract');
     expect(playerOpens, 0);
   });
+
+  for (final playFromRow in [false, true]) {
+    testWidgets(
+      'album cover reaches playback and every queued song (row=$playFromRow)',
+      (tester) async {
+        tester.view.physicalSize = const Size(360, 900);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        const albumCover = 'https://lh3.googleusercontent.com/album-cover=w512';
+        final tracks = <TrackInfo>[
+          _tracks.first.copyWith(
+            thumbnailUrl: 'https://i.ytimg.com/vi/firstsong01/hqdefault.jpg',
+            catalogThumbnailUrl:
+                'https://lh3.googleusercontent.com/other-release=w120',
+          ),
+          _tracks.last,
+        ];
+        final player = _RecordingPlayerController();
+        await tester.pumpWidget(
+          _detailApp(
+            player: player,
+            tracksProvider: FutureProvider((ref) async => tracks),
+            artworkSource: albumCover,
+            preferCollectionArtworkForTracks: true,
+          ),
+        );
+        await tester.pumpAndSettle();
+        final action = find.byKey(
+          ValueKey(
+            playFromRow ? 'track-result-play-song-2' : 'remote-collection-play',
+          ),
+        );
+        await tester.ensureVisible(action);
+        await tester.tap(action);
+        await tester.pump();
+
+        expect(
+          player.lastTrack!.id,
+          playFromRow ? tracks.last.id : tracks.first.id,
+        );
+        expect(player.lastTrack!.thumbnailUrl, albumCover);
+        expect(player.lastTrack!.catalogThumbnailUrl, albumCover);
+        expect(player.lastQueue!.map((track) => track.thumbnailUrl), [
+          albumCover,
+          albumCover,
+        ]);
+        expect(player.lastQueue!.map((track) => track.catalogThumbnailUrl), [
+          albumCover,
+          albumCover,
+        ]);
+        expect(
+          player.lastQueue!.every(
+            (track) => track.metadataSource == TrackMetadataSource.youtubeMusic,
+          ),
+          isTrue,
+        );
+        expect(tracks.first.thumbnailUrl, contains('i.ytimg.com'));
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets(
+    'mix playback retains per-song artwork despite a collection cover',
+    (tester) async {
+      final tracks = _tracks
+          .map(
+            (track) => track.copyWith(
+              thumbnailUrl: 'https://i.ytimg.com/vi/${track.id}/hqdefault.jpg',
+              catalogThumbnailUrl:
+                  'https://lh3.googleusercontent.com/${track.id}=w512',
+            ),
+          )
+          .toList();
+      final player = _RecordingPlayerController();
+      await tester.pumpWidget(
+        _detailApp(
+          player: player,
+          tracksProvider: FutureProvider((ref) async => tracks),
+          artworkSource: 'https://lh3.googleusercontent.com/mix-cover=w512',
+        ),
+      );
+      await tester.pumpAndSettle();
+      final action = find.byKey(const ValueKey('remote-collection-play'));
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      await tester.pump();
+      expect(player.lastTrack, same(tracks.first));
+      expect(player.lastQueue!.first, same(tracks.first));
+      expect(player.lastQueue!.last, same(tracks.last));
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('mini player stays above gesture and three-button navigation', (
     tester,
@@ -367,7 +644,7 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('No se pudo cargar la coleccion.'), findsOneWidget);
-    expect(find.text('Album de contrato'), findsNWidgets(2));
+    expect(find.text('Album de contrato'), findsOneWidget);
     expect(player.playCalls, 0);
 
     await tester.tap(find.byKey(const ValueKey('remote-collection-retry')));
@@ -407,7 +684,7 @@ void main() {
     expect(player.playCalls, 0);
   });
 
-  testWidgets('keeps the accented detail surface pinned while scrolling', (
+  testWidgets('keeps the circular back button pinned above scrolling artwork', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(360, 640);
@@ -429,7 +706,6 @@ void main() {
       ),
       retry: (_, _) => null,
     );
-
     await tester.pumpWidget(
       _detailApp(
         player: _RecordingPlayerController(),
@@ -438,245 +714,160 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    final appBarFinder = find.byKey(
-      const ValueKey('remote-collection-app-bar'),
-    );
-    final titleFinder = find.descendant(
-      of: appBarFinder,
-      matching: find.text('Album de contrato'),
-    );
-
-    final initialTitleRect = tester.getRect(titleFinder);
-    final initialHeaderRect = tester.getRect(
-      find.byKey(const ValueKey('remote-collection-header')),
-    );
-    final appBarRect = tester.getRect(appBarFinder);
-    final statusBarSurface = find.byKey(
-      const ValueKey('remote-collection-status-bar-surface'),
-    );
-    final toolbarSurface = find.byKey(
-      const ValueKey('remote-collection-app-bar-surface'),
-    );
-    final statusBarRect = tester.getRect(statusBarSurface);
-    final toolbarRect = tester.getRect(toolbarSurface);
-    expect(statusBarRect.height, 24);
-    expect(statusBarRect.top, appBarRect.top);
-    expect(statusBarRect.bottom, toolbarRect.top);
-    expect(toolbarRect.height, kToolbarHeight);
-    expect(toolbarRect.bottom, appBarRect.bottom);
+    final back = find.byKey(const ValueKey('remote-collection-back'));
+    final initialBackRect = tester.getRect(back);
+    final header = find.byKey(const ValueKey('remote-collection-header'));
+    final initialHeaderRect = tester.getRect(header);
+    expect(find.byType(AppBar), findsNothing);
+    expect(find.text('Album de contrato'), findsOneWidget);
+    expect(initialHeaderRect.top, 0);
+    expect(initialBackRect.size, const Size(48, 48));
+    expect(initialBackRect.top, greaterThanOrEqualTo(24));
     expect(
       tester
-          .getSize(
-            find.byKey(const ValueKey('remote-collection-app-bar-spacer')),
-          )
-          .height,
-      appBarRect.height,
+          .getRect(find.byKey(const ValueKey('remote-collection-artwork')))
+          .top,
+      36,
+      reason:
+          'The cover starts below the system inset without reserving a title bar.',
     );
-    expect(initialHeaderRect.top, greaterThanOrEqualTo(appBarRect.bottom));
-    final surface = tester.widget<DecoratedBox>(
-      find.byKey(const ValueKey('remote-collection-app-bar-surface')),
-    );
-    final decoration = surface.decoration as BoxDecoration;
-    expect(decoration.color!.a, 1);
-    expect(decoration.gradient, isA<LinearGradient>());
-    expect(decoration.border, isNull);
+    final button = tester.widget<IconButton>(back);
     expect(
-      find.byKey(const ValueKey('remote-collection-app-bar-blur')),
-      findsNothing,
+      button.style!.shape!.resolve(const <WidgetState>{}),
+      isA<CircleBorder>(),
     );
-    final appBar = tester.widget<AppBar>(appBarFinder);
-    expect(appBar.forceMaterialTransparency, isFalse);
-    expect(appBar.backgroundColor?.a, 1);
-    expect(
-      appBar.systemOverlayStyle?.statusBarColor,
-      Theme.of(tester.element(appBarFinder)).colorScheme.surface,
-    );
-    expect(
-      tester
-          .widget<Scaffold>(
-            find.byKey(const ValueKey('remote-collection-detail')),
-          )
-          .extendBodyBehindAppBar,
-      isTrue,
-    );
+    expect(back.hitTestable(), findsOneWidget);
 
     await tester.drag(find.byType(CustomScrollView), const Offset(0, -300));
     await tester.pumpAndSettle();
-
     expect(
       tester.state<ScrollableState>(find.byType(Scrollable)).position.pixels,
       greaterThan(0),
     );
-    expect(tester.getRect(titleFinder), initialTitleRect);
-    expect(
-      tester
-          .getRect(find.byKey(const ValueKey('remote-collection-header')))
-          .top,
-      lessThan(appBarRect.bottom),
+    expect(tester.getRect(back), initialBackRect);
+    expect(tester.getRect(header).top, lessThan(initialHeaderRect.top));
+    expect(back.hitTestable(), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final brightness in Brightness.values) {
+    for (final mode in SurfaceBackgroundMode.values) {
+      testWidgets(
+        'collection artwork extends under transparent system bars for $brightness/$mode',
+        (tester) async {
+          tester.view.physicalSize = const Size(360, 640);
+          tester.view.devicePixelRatio = 1;
+          tester.view.padding = const FakeViewPadding(top: 24);
+          addTearDown(() {
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
+            tester.view.resetPadding();
+          });
+          await tester.pumpWidget(
+            _detailApp(
+              player: _RecordingPlayerController(),
+              tracksProvider: FutureProvider((ref) async => _tracks),
+              surfaceBackgroundMode: mode,
+              brightness: brightness,
+              artworkSource: 'https://img.test/collection.jpg',
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.byType(AppBar), findsNothing);
+          expect(
+            find.byKey(const ValueKey('remote-collection-app-bar-spacer')),
+            findsNothing,
+          );
+          final region = tester.widget<AnnotatedRegion<SystemUiOverlayStyle>>(
+            find.descendant(
+              of: find.byType(ArtworkDetailScaffold),
+              matching: find.byType(AnnotatedRegion<SystemUiOverlayStyle>),
+            ),
+          );
+          expect(region.value.statusBarColor, Colors.transparent);
+          expect(region.value.systemStatusBarContrastEnforced, isFalse);
+          expect(
+            region.value.statusBarIconBrightness,
+            brightness == Brightness.dark ? Brightness.light : Brightness.dark,
+          );
+          final background = find.byKey(
+            const ValueKey('remote-collection-background-photo'),
+          );
+          expect(tester.getRect(background).top, 0);
+          expect(
+            tester
+                .getRect(
+                  find.byKey(
+                    const ValueKey('remote-collection-artwork-underlay'),
+                  ),
+                )
+                .top,
+            0,
+          );
+          final back = find.byKey(const ValueKey('remote-collection-back'));
+          expect(tester.getRect(back).top, greaterThanOrEqualTo(24));
+          expect(back.hitTestable(), findsOneWidget);
+          expect(tester.takeException(), isNull);
+        },
+      );
+    }
+  }
+
+  testWidgets('circular close clears selection while keeping the detail open', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _detailApp(
+        player: _RecordingPlayerController(),
+        tracksProvider: FutureProvider((ref) async => _tracks),
+      ),
     );
-    expect(find.text('Album de contrato'), findsWidgets);
+    await tester.pumpAndSettle();
+    await tester.longPress(find.text('Primera cancion'));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('collection-selection-toolbar')),
+      findsOneWidget,
+    );
+    final close = find.byKey(const ValueKey('collection-selection-close'));
+    expect(tester.getSize(close), const Size(48, 48));
+    await tester.tap(close);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('collection-selection-toolbar')),
+      findsNothing,
+    );
     expect(
       find.byKey(const ValueKey('remote-collection-back')),
       findsOneWidget,
     );
-
-    tester.state<ScrollableState>(find.byType(Scrollable)).position.jumpTo(0);
-    await tester.pumpAndSettle();
-
-    expect(tester.getRect(titleFinder), initialTitleRect);
+    expect(find.text('Album de contrato'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
-  testWidgets('transparent detail surface blurs only its app bar bounds', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(360, 640);
-    tester.view.devicePixelRatio = 1;
-    tester.view.padding = const FakeViewPadding(top: 24);
-    addTearDown(() {
-      tester.view.resetPhysicalSize();
-      tester.view.resetDevicePixelRatio();
-      tester.view.resetPadding();
-    });
-    final tracksProvider = FutureProvider<List<TrackInfo>>(
-      (ref) async => _tracks,
-      retry: (_, _) => null,
-    );
-
+  testWidgets('circular back returns to the previous route', (tester) async {
     await tester.pumpWidget(
       _detailApp(
         player: _RecordingPlayerController(),
-        tracksProvider: tracksProvider,
-        surfaceBackgroundMode: SurfaceBackgroundMode.transparent,
+        tracksProvider: FutureProvider((ref) async => _tracks),
+        openFromLauncher: true,
       ),
     );
     await tester.pumpAndSettle();
-
-    final blurFinder = find.byKey(
-      const ValueKey('remote-collection-app-bar-blur'),
-    );
-    final surfaceFinder = find.byKey(
-      const ValueKey('remote-collection-app-bar-surface'),
-    );
-    final statusBarSurfaceFinder = find.byKey(
-      const ValueKey('remote-collection-status-bar-surface'),
-    );
-    expect(blurFinder, findsOneWidget);
-    expect(
-      find.ancestor(of: blurFinder, matching: find.byType(ClipRect)),
-      findsOneWidget,
-    );
-    final decoration =
-        tester.widget<DecoratedBox>(surfaceFinder).decoration as BoxDecoration;
-    expect(decoration.color!.a, lessThan(1));
-    expect(decoration.gradient, isA<LinearGradient>());
-    expect(decoration.border, isNull);
-    expect(tester.getRect(blurFinder), tester.getRect(surfaceFinder));
-    expect(tester.getRect(blurFinder).height, closeTo(kToolbarHeight, 0.01));
-    expect(tester.getRect(statusBarSurfaceFinder).height, 24);
-    expect(
-      tester.getRect(statusBarSurfaceFinder).bottom,
-      tester.getRect(surfaceFinder).top,
-    );
-    final appBar = tester.widget<AppBar>(
-      find.byKey(const ValueKey('remote-collection-app-bar')),
-    );
-    expect(appBar.forceMaterialTransparency, isTrue);
-    expect(appBar.backgroundColor, Colors.transparent);
-    expect(
-      appBar.systemOverlayStyle?.statusBarColor,
-      Theme.of(tester.element(surfaceFinder)).colorScheme.surface,
-    );
-  });
-
-  testWidgets('liquid glass detail surface uses layered glass in its app bar', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(360, 640);
-    tester.view.devicePixelRatio = 1;
-    tester.view.padding = const FakeViewPadding(top: 24);
-    addTearDown(() {
-      tester.view.resetPhysicalSize();
-      tester.view.resetDevicePixelRatio();
-      tester.view.resetPadding();
-    });
-    final tracksProvider = FutureProvider<List<TrackInfo>>(
-      (ref) async => _tracks,
-      retry: (_, _) => null,
-    );
-
-    await tester.pumpWidget(
-      _detailApp(
-        player: _RecordingPlayerController(),
-        tracksProvider: tracksProvider,
-        surfaceBackgroundMode: SurfaceBackgroundMode.liquidGlass,
-      ),
-    );
+    await tester.tap(find.text('Abrir coleccion'));
     await tester.pumpAndSettle();
-
-    final blurFinder = find.byKey(
-      const ValueKey('remote-collection-app-bar-blur'),
-    );
-    final surfaceFinder = find.byKey(
-      const ValueKey('remote-collection-app-bar-surface'),
-    );
-    final statusBarFinder = find.byKey(
-      const ValueKey('remote-collection-status-bar-surface'),
-    );
-    final appBarFinder = find.byKey(
-      const ValueKey('remote-collection-app-bar'),
-    );
-    final tonalSurface = Theme.of(
-      tester.element(appBarFinder),
-    ).colorScheme.surface;
-
-    expect(blurFinder, findsNothing);
-    final liquidGlassFinder = find.descendant(
-      of: appBarFinder,
-      matching: find.byType(LiquidGlassSurface),
-    );
-    expect(liquidGlassFinder, findsOneWidget);
     expect(
-      find.descendant(
-        of: liquidGlassFinder,
-        matching: find.byKey(LiquidGlassSurface.backdropKey),
-      ),
+      find.byKey(const ValueKey('remote-collection-detail')),
       findsOneWidget,
     );
-    final statusBarRect = tester.getRect(statusBarFinder);
-    final toolbarRect = tester.getRect(surfaceFinder);
-    expect(statusBarRect.height, 24);
-    expect(statusBarRect.bottom, toolbarRect.top);
-    expect(toolbarRect.height, kToolbarHeight);
+    await tester.tap(find.byKey(const ValueKey('remote-collection-back')));
+    await tester.pumpAndSettle();
+    expect(find.text('Abrir coleccion'), findsOneWidget);
     expect(
-      tester
-          .getSize(
-            find.byKey(const ValueKey('remote-collection-app-bar-spacer')),
-          )
-          .height,
-      tester
-          .getSize(find.byKey(const ValueKey('remote-collection-app-bar')))
-          .height,
+      find.byKey(const ValueKey('remote-collection-detail')),
+      findsNothing,
     );
-
-    final decoration =
-        tester.widget<DecoratedBox>(surfaceFinder).decoration as BoxDecoration;
-    expect(
-      decoration.color,
-      AppColors.tabHeaderSurfaceFor(
-        tester.element(appBarFinder),
-        scrolledUnder: true,
-      ),
-    );
-    expect(decoration.gradient, isNull);
-    expect(decoration.border, isNull);
-    final statusBarFill = tester.widget<ColoredBox>(
-      find.descendant(of: statusBarFinder, matching: find.byType(ColoredBox)),
-    );
-    expect(statusBarFill.color, tonalSurface);
-    final appBar = tester.widget<AppBar>(appBarFinder);
-    expect(appBar.forceMaterialTransparency, isTrue);
-    expect(appBar.backgroundColor, Colors.transparent);
-    expect(appBar.systemOverlayStyle?.statusBarColor, tonalSurface);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets(
@@ -719,6 +910,20 @@ void main() {
       expect(overlayGradient.colors.last.a, greaterThan(0.9));
       final background = tester.widget<SourceImage>(
         find.byKey(const ValueKey('remote-collection-background-image')),
+      );
+      final header = find.byKey(const ValueKey('remote-collection-header'));
+      final photo = find.byKey(
+        const ValueKey('remote-collection-background-photo'),
+      );
+      expect(find.descendant(of: header, matching: photo), findsOneWidget);
+      expect(tester.getRect(photo), tester.getRect(header));
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('remote-collection-artwork-underlay')),
+          matching: find.byType(SourceImage),
+        ),
+        findsNothing,
+        reason: 'The album or mix list inherits color without a cover image.',
       );
       final foreground = tester.widget<ProportionalArtwork>(
         find.descendant(
@@ -860,13 +1065,15 @@ void main() {
       greaterThanOrEqualTo(48),
     );
 
-    final scrollable = find.byType(CustomScrollView);
-    await tester.drag(scrollable, const Offset(0, -700));
-    await tester.pumpAndSettle();
-
     final trackTile = find.byKey(
       const ValueKey('remote-collection-track-song-1'),
     );
+    await tester.scrollUntilVisible(
+      trackTile,
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
     expect(trackTile, findsOneWidget);
     expect(tester.getRect(trackTile).height, greaterThanOrEqualTo(48));
     final playButton = find.byKey(const ValueKey('track-result-play-song-1'));
@@ -891,9 +1098,25 @@ Widget _detailApp({
   String subtitle = 'Artista principal',
   List<String> metadata = const ['Album', '2026'],
   String? artworkSource,
+  bool preferCollectionArtworkForTracks = false,
   bool disableAnimations = false,
+  bool openFromLauncher = false,
+  Brightness brightness = Brightness.light,
   SurfaceBackgroundMode surfaceBackgroundMode = SurfaceBackgroundMode.accent,
 }) {
+  final detailPage = RemoteCollectionDetailPage(
+    title: title,
+    subtitle: subtitle,
+    artworkSource: artworkSource,
+    preferCollectionArtworkForTracks: preferCollectionArtworkForTracks,
+    queueSourceId: 'album:MPRE-contract',
+    tracksProvider: tracksProvider,
+    emptyMessage: 'La coleccion esta vacia.',
+    errorMessage: 'No se pudo cargar la coleccion.',
+    onOpenPlayer: onOpenPlayer ?? _noop,
+    onAddToPlaylist: onAddToPlaylist,
+    metadata: metadata,
+  );
   return ProviderScope(
     overrides: [
       playerControllerProvider.overrideWith(() => player),
@@ -903,6 +1126,7 @@ Widget _detailApp({
     ],
     child: MaterialApp(
       theme: ThemeData(
+        brightness: brightness,
         extensions: [AppSurfaceTheme(backgroundMode: surfaceBackgroundMode)],
       ),
       builder: (context, child) {
@@ -912,23 +1136,67 @@ Widget _detailApp({
           child: child!,
         );
       },
-      home: RemoteCollectionDetailPage(
-        title: title,
-        subtitle: subtitle,
-        artworkSource: artworkSource,
-        queueSourceId: 'album:MPRE-contract',
-        tracksProvider: tracksProvider,
-        emptyMessage: 'La coleccion esta vacia.',
-        errorMessage: 'No se pudo cargar la coleccion.',
-        onOpenPlayer: onOpenPlayer ?? _noop,
-        onAddToPlaylist: onAddToPlaylist,
-        metadata: metadata,
-      ),
+      home: openFromLauncher
+          ? Builder(
+              builder: (context) => Scaffold(
+                body: Center(
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).push<void>(
+                      MaterialPageRoute<void>(builder: (_) => detailPage),
+                    ),
+                    child: const Text('Abrir coleccion'),
+                  ),
+                ),
+              ),
+            )
+          : detailPage,
     ),
   );
 }
 
 void _noop() {}
+
+class _SelectedDownloads extends DownloadController {
+  List<TrackInfo>? tracks;
+
+  @override
+  Map<String, DownloadTaskState> build() => const {};
+
+  @override
+  Future<int> downloadTracks(Iterable<TrackInfo> tracks) async {
+    this.tracks = tracks.toList();
+    return tracks.length;
+  }
+}
+
+class _PickerPlaylistsController extends PlaylistsController {
+  String? destination;
+  List<TrackInfo>? receivedTracks;
+  bool? download;
+
+  @override
+  Future<List<Playlist>> build() async => [
+    Playlist(
+      id: 'existing',
+      name: 'Mi playlist',
+      trackIds: const [],
+      createdAt: DateTime.utc(2026),
+      updatedAt: DateTime.utc(2026),
+    ),
+  ];
+
+  @override
+  Future<int> addRemoteTracksToPlaylist(
+    String playlistId,
+    Iterable<TrackInfo> tracks, {
+    bool download = false,
+  }) async {
+    destination = playlistId;
+    receivedTracks = tracks.toList();
+    this.download = download;
+    return tracks.length;
+  }
+}
 
 class _RecordingPlayerController extends PlayerController {
   int playCalls = 0;

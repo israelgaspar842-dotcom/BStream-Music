@@ -1,6 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
@@ -16,12 +19,44 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:networkSecurityConfig="@xml/network_security_config">
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.bstream.bstream_music.BStreamCastOptionsProvider" />
         <!-- Keep the runtime-configured media notification icon in release APKs. -->
         <meta-data
             android:name="bstream_music.notification_icon"
             android:resource="@drawable/ic_stat_bstream_music" />
+        <receiver
+            android:name=".BStreamMusicWidget"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/bstream_music_widget" />
+        </receiver>
+        <receiver
+            android:name=".BStreamMusicGlassWidget"
+            android:exported="true"
+            android:label="@string/widget_glass_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/bstream_music_glass_widget" />
+        </receiver>
+        <service
+            android:name=".BStreamMusicQueueWidgetService"
+            android:exported="true"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
+        <receiver
+            android:name=".BStreamWidgetPlaybackReceiver"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
+            android:label="IVG"
             android:exported="true"
             android:launchMode="singleTask"
             android:taskAffinity=""
@@ -148,6 +183,7 @@
         </activity>
         <service
             android:name="com.ryanheise.audioservice.AudioService"
+            android:label="IVG"
             android:foregroundServiceType="mediaPlayback"
             android:exported="true"
             tools:ignore="Instantiatable">
@@ -170,26 +206,14 @@
         -->
         <receiver
             android:name=".MusicWidgetProvider"
-            android:exported="true">
+            android:exported="true"
+            android:label="IVG · Vinilo">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/music_widget_info" />
-        </receiver>
-        <!--
-             Required by home_widget: ticks sent through
-             HomeWidgetBackgroundIntent are enqueued here and handed to the
-             background Dart callback. Without it the widget can render but the
-             Dart side would never hear a click.
-        -->
-        <receiver
-            android:name="es.antonborri.home_widget.HomeWidgetBackgroundReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="es.antonborri.home_widget.action.BACKGROUND" />
-            </intent-filter>
         </receiver>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

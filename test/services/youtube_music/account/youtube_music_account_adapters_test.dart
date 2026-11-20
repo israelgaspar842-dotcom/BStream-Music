@@ -3,9 +3,68 @@ import 'dart:io';
 import 'package:bstream_music/services/youtube_music/account/youtube_music_account.dart';
 import 'package:bstream_music/services/youtube_music/auth/youtube_music_auth_models.dart'
     as auth;
+import 'package:bstream_music/services/youtube_music/auth/youtube_music_auth_coordinator.dart';
+import 'package:bstream_music/services/youtube_music/auth/youtube_music_session_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  for (final viaCoordinator in [false, true]) {
+    test(
+      'profile refresh bypasses discovery cache${viaCoordinator ? ' through coordinator' : ''}',
+      () async {
+        final transport = _QueuedAccountTransport([
+          _accountProfile('Old name', 'https://yt3.googleusercontent.com/old'),
+          const <String, Object?>{},
+          _accountProfile('New name', 'https://yt3.googleusercontent.com/new'),
+        ]);
+        final client = GatewayYouTubeMusicAccountClient(
+          createGateway: (_) => YouTubeMusicAccountGateway(
+            transport: transport,
+            sessionHeaders: StaticYouTubeMusicSessionHeadersProvider(
+              YouTubeMusicSessionHeaders(const {}),
+            ),
+            clientContext: const {
+              'client': {'clientName': 'WEB_REMIX'},
+            },
+          ),
+        );
+        final authData = auth.YouTubeMusicWebAuthData(
+          cookieHeader: _credential.cookieHeader,
+          identity: _credential.identity,
+          apiKey: _credential.apiKey,
+          clientVersion: _credential.clientVersion,
+          clientName: _credential.clientName,
+        );
+        // Channel discovery leaves its current profile ready for the login's
+        // normal validation handoff. An independent refresh must bypass it.
+        await client.listChannels(authData);
+        expect(transport.requests, hasLength(2));
+
+        final auth.YouTubeMusicAccountProfile fresh;
+        if (viaCoordinator) {
+          final coordinator = YouTubeMusicAuthCoordinator(
+            sessionStore: _UnusedSessionStore(),
+            accountClient: client,
+          );
+          fresh = (await coordinator.refreshProfile(_credential)).profile;
+        } else {
+          fresh = await client.refreshAccount(authData);
+        }
+
+        expect(fresh.displayName, 'New name');
+        expect(
+          fresh.avatarUrl,
+          Uri.parse('https://yt3.googleusercontent.com/new'),
+        );
+        expect(transport.requests.map((request) => request.endpoint), [
+          'account/account_menu',
+          'account/accounts_list',
+          'account/account_menu',
+        ]);
+      },
+    );
+  }
+
   group('production session header adapters', () {
     test('derives headers from a secure credential snapshot', () async {
       var reads = 0;
@@ -195,6 +254,51 @@ void main() {
       );
     });
   });
+}
+
+Map<String, Object?> _accountProfile(String name, String avatarUrl) => {
+  'activeAccountHeaderRenderer': {
+    'accountName': {'simpleText': name},
+    'accountPhoto': {
+      'thumbnails': [
+        {'url': avatarUrl, 'width': 128, 'height': 128},
+      ],
+    },
+    'navigationEndpoint': {
+      'browseEndpoint': {'browseId': 'UC-main'},
+    },
+  },
+};
+
+class _QueuedAccountTransport implements YouTubeMusicAccountTransport {
+  _QueuedAccountTransport(this.responses);
+
+  final List<Object?> responses;
+  final requests = <YouTubeMusicAccountRequest>[];
+
+  @override
+  Future<YouTubeMusicAccountResponse> send(
+    YouTubeMusicAccountRequest request,
+  ) async {
+    requests.add(request);
+    return YouTubeMusicAccountResponse(
+      statusCode: 200,
+      body: responses.removeAt(0),
+    );
+  }
+}
+
+class _UnusedSessionStore implements YouTubeMusicSessionStore {
+  @override
+  Future<auth.YouTubeMusicSessionCredential?> read() =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> write(auth.YouTubeMusicSessionCredential credential) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> delete() => throw UnimplementedError();
 }
 
 final auth.YouTubeMusicSessionCredential _credential =

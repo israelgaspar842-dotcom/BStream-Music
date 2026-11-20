@@ -2,9 +2,9 @@ class AppConstants {
   const AppConstants._();
 
   static const appName = 'IVG Music';
-  static const appVersion = '1.2.8';
+  static const appVersion = '1.3.1';
   static const databaseName = 'bstream_music.db';
-  static const databaseVersion = 8;
+  static const databaseVersion = 11;
   static const fileExportChannel = 'bstream_music/file_export';
   static const androidFileExportChannel = fileExportChannel;
   static const androidScreenChannel = 'bstream_music/screen';
@@ -16,6 +16,10 @@ class AppConstants {
   static const supportDevelopmentUrl = 'https://ko-fi.com/soybryam06c/donate';
   static const githubRepositoryUrl =
       'https://github.com/BryamContreras/BStream-Music';
-  static const appDownloadUrl = 'https://bstreammusic.pages.dev/';
+  // IVG: updates are checked against this fork's own GitHub releases, so the
+  // app no longer asks to install the upstream BStream Music build.
+  static const updateRepository = 'israelgaspar842-dotcom/BStream-Music';
+  static const appDownloadUrl =
+      'https://github.com/israelgaspar842-dotcom/BStream-Music/releases/latest';
   static const creatorProfileUrl = 'https://israelvelizgaspar.vercel.app/';
 }

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:bstream_music/core/constants/app_constants.dart';
 import 'package:bstream_music/services/storage/backup_service.dart';
+import 'package:bstream_music/services/storage/backup_audio_layout.dart';
 import 'package:bstream_music/services/storage/library_operation_coordinator.dart';
 import 'package:bstream_music/services/storage/local_database_service.dart';
 import 'package:flutter/services.dart';
@@ -204,6 +205,7 @@ void main() {
     expect(databaseService.initializeCalls, 1);
     expect(databaseService.rewriteMediaRootCalls, 1);
     expect(databaseService.rewriteMediaRoot, mediaRoot.path);
+    expect(databaseService.rebaseSyncCalls, 1);
     expect(databaseService.recommendationGeneration, 1);
   });
 
@@ -360,6 +362,7 @@ class _FakeDatabaseService extends LocalDatabaseService {
   int initializeCalls = 0;
   int validationCalls = 0;
   int rewriteMediaRootCalls = 0;
+  int rebaseSyncCalls = 0;
   String? rewriteMediaRoot;
   Object? validationError;
   bool failNextInitialize = false;
@@ -367,6 +370,13 @@ class _FakeDatabaseService extends LocalDatabaseService {
 
   @override
   Future<String> databasePath() async => path;
+
+  @override
+  Future<BackupAudioMetadata> getBackupAudioMetadata() async => (
+    tracks: <Map<String, Object?>>[],
+    playlists: <Map<String, Object?>>[],
+    entries: <Map<String, Object?>>[],
+  );
 
   @override
   Future<T> withDatabase<T>(Future<T> Function(Database) operation) async {
@@ -400,6 +410,11 @@ class _FakeDatabaseService extends LocalDatabaseService {
     if (error != null) {
       throw error;
     }
+  }
+
+  @override
+  Future<void> rebasePlaylistSyncAfterRestore() async {
+    rebaseSyncCalls++;
   }
 
   @override

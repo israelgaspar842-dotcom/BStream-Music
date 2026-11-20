@@ -1,12 +1,14 @@
 enum PlayerStyle {
   bstreamMusic,
   appleMusic,
-  classicVinyl;
+  classicVinyl,
+  spotifyMusic;
 
   String get code => switch (this) {
     PlayerStyle.bstreamMusic => 'bstreamMusic',
     PlayerStyle.appleMusic => 'appleMusic',
     PlayerStyle.classicVinyl => 'classicVinyl',
+    PlayerStyle.spotifyMusic => 'spotifyMusic',
   };
 
   static PlayerStyle fromCode(String? code) {
@@ -14,6 +16,7 @@ enum PlayerStyle {
       'bstreamMusic' => PlayerStyle.bstreamMusic,
       'appleMusic' => PlayerStyle.appleMusic,
       'classicVinyl' => PlayerStyle.classicVinyl,
+      'spotifyMusic' => PlayerStyle.spotifyMusic,
       _ => defaultPlayerStyle,
     };
   }

@@ -6,14 +6,18 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart';
 
 import '../../../../core/theme/app_colors.dart';
-import '../../../../core/utils/image_source.dart';
+import '../../../../core/theme/app_ui.dart';
+import '../../../../core/widgets/painted_glass_button_style.dart';
 import '../../domain/entities/track_info.dart';
 import '../providers/music_providers.dart';
+import '../providers/track_selection_controller.dart';
+import '../widgets/artwork_detail_scaffold.dart';
 import '../widgets/artwork_gradient_header_background.dart';
 import '../widgets/mini_player.dart';
+import '../widgets/playlist_actions.dart';
 import '../widgets/source_image.dart';
-import '../widgets/surface_detail_app_bar.dart';
 import '../widgets/track_result_tile.dart';
+import '../widgets/track_selection_toolbar.dart';
 
 typedef AddRemoteTracksToPlaylist =
     Future<void> Function(
@@ -22,7 +26,7 @@ typedef AddRemoteTracksToPlaylist =
       String? initialPlaylistName,
     });
 
-class RemoteCollectionDetailPage extends ConsumerWidget {
+class RemoteCollectionDetailPage extends ConsumerStatefulWidget {
   const RemoteCollectionDetailPage({
     required this.title,
     required this.subtitle,
@@ -36,7 +40,9 @@ class RemoteCollectionDetailPage extends ConsumerWidget {
     this.detailsProvider,
     this.metadata = const [],
     this.fallbackIcon = Icons.queue_music_rounded,
-    this.useCollectionArtworkForTrackFallback = false,
+    this.preferCollectionArtworkForTracks = false,
+    this.songCountLabel,
+    this.onRetry,
     super.key,
   });
 
@@ -52,33 +58,50 @@ class RemoteCollectionDetailPage extends ConsumerWidget {
   final FutureProvider<RemoteCollectionData>? detailsProvider;
   final List<String> metadata;
   final IconData fallbackIcon;
-  final bool useCollectionArtworkForTrackFallback;
+
+  /// Album entries share the selected release's cover in rows and playback.
+  /// Mixes and playlists retain each song's own artwork.
+  final bool preferCollectionArtworkForTracks;
+  final String? songCountLabel;
+  final VoidCallback? onRetry;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<RemoteCollectionDetailPage> createState() =>
+      _RemoteCollectionDetailPageState();
+}
+
+class _RemoteCollectionDetailPageState
+    extends ConsumerState<RemoteCollectionDetailPage> {
+  bool _addingToPlaylist = false;
+  final _selectionScope = Object();
+
+  @override
+  Widget build(BuildContext context) {
     final strings = ref.watch(appStringsProvider);
-    final detailsState = detailsProvider == null
+    final selection = ref.watch(trackSelectionProvider(_selectionScope));
+    final detailsState = widget.detailsProvider == null
         ? null
-        : ref.watch(detailsProvider!);
+        : ref.watch(widget.detailsProvider!);
     final detail = switch (detailsState) {
       AsyncData(:final value) => value,
       _ => null,
     };
     final AsyncValue<List<TrackInfo>> tracksState = detailsState == null
-        ? ref.watch(tracksProvider)
+        ? ref.watch(widget.tracksProvider)
         : detailsState.whenData((value) => value.tracks);
     final tracks = switch (tracksState) {
       AsyncData(:final value) => value,
       _ => const <TrackInfo>[],
     };
-    final resolvedTitle = detail?.title ?? title;
-    final resolvedSubtitle = detail?.subtitle ?? subtitle;
-    final collectionArtworkSource = detail?.artworkSource ?? artworkSource;
+    final resolvedTitle = detail?.title ?? widget.title;
+    final resolvedSubtitle = detail?.subtitle ?? widget.subtitle;
+    final collectionArtworkSource =
+        detail?.artworkSource ?? widget.artworkSource;
     final resolvedArtworkSource =
         collectionArtworkSource ??
         (tracks.isEmpty ? null : tracks.first.thumbnailUrl);
-    final visibleTracks = useCollectionArtworkForTrackFallback
-        ? _withCollectionArtworkFallback(tracks, collectionArtworkSource)
+    final visibleTracks = widget.preferCollectionArtworkForTracks
+        ? _withCollectionArtwork(tracks, collectionArtworkSource)
         : tracks;
     final defaultMode = defaultMiniPlayerModeForPlatform(
       Theme.of(context).platform,
@@ -101,141 +124,142 @@ class RemoteCollectionDetailPage extends ConsumerWidget {
     final bottomContentPadding = underlayMiniPlayer
         ? miniPlayerHeight + MediaQuery.viewPaddingOf(context).bottom
         : 0.0;
-
-    return Scaffold(
+    final scaffold = ArtworkDetailScaffold(
       key: const ValueKey('remote-collection-detail'),
       extendBody: underlayMiniPlayer,
-      extendBodyBehindAppBar: true,
-      backgroundColor: Theme.of(context).colorScheme.surface,
-      appBar: SurfaceDetailAppBar(
-        appBarKey: const ValueKey('remote-collection-app-bar'),
-        surfaceKey: const ValueKey('remote-collection-app-bar-surface'),
-        blurKey: const ValueKey('remote-collection-app-bar-blur'),
-        statusBarSurfaceKey: const ValueKey(
-          'remote-collection-status-bar-surface',
-        ),
-        leading: IconButton(
-          key: const ValueKey('remote-collection-back'),
-          tooltip: MaterialLocalizations.of(context).backButtonTooltip,
-          onPressed: () => Navigator.of(context).maybePop(),
-          icon: const Icon(Icons.arrow_back_rounded),
-        ),
-        title: Text(
-          resolvedTitle,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
+      backButtonKey: ValueKey(
+        selection.active
+            ? 'collection-selection-close'
+            : 'remote-collection-back',
       ),
-      body: CustomScrollView(
-        scrollCacheExtent: const ScrollCacheExtent.pixels(800),
-        slivers: [
-          SliverToBoxAdapter(
-            child: SizedBox(
-              key: const ValueKey('remote-collection-app-bar-spacer'),
-              height: surfaceDetailAppBarBodyInset(context),
-              child: AppColors.surfaceBackgroundModeFor(context).usesBackdrop
-                  ? ArtworkGradientHeaderBackground(
-                      artworkSource: resolvedArtworkSource,
-                      cacheWidth: 640,
-                      keyPrefix: 'remote-collection-app-bar-underlay',
-                    )
-                  : null,
-            ),
-          ),
-          SliverToBoxAdapter(
-            child: _CollectionHeader(
-              title: resolvedTitle,
-              subtitle: resolvedSubtitle,
+      backTooltip: selection.active ? strings.cancel : null,
+      onBack: selection.active ? selection.clear : null,
+      closeButton: selection.active,
+      selectionToolbar: selection.active
+          ? TrackSelectionToolbar(
+              scope: _selectionScope,
+              tracks: visibleTracks,
+              keyPrefix: 'collection-selection',
+              initialPlaylistName: resolvedTitle,
+              showCloseButton: false,
+            )
+          : null,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          RepaintBoundary(
+            key: const ValueKey('remote-collection-artwork-underlay'),
+            child: ArtworkColorPageBackground(
               artworkSource: resolvedArtworkSource,
-              metadata: metadata,
-              fallbackIcon: fallbackIcon,
-              trackCount: tracksState is AsyncData<List<TrackInfo>>
-                  ? visibleTracks.length
-                  : null,
-              playLabel: strings.play,
-              addToPlaylistLabel: strings.addToPlaylist,
-              songsLabel: strings.collectionSongCount,
-              canPlay: visibleTracks.isNotEmpty,
-              onPlay: () =>
-                  _play(context, ref, visibleTracks.first, visibleTracks),
-              onAddToPlaylist: onAddToPlaylist == null || visibleTracks.isEmpty
-                  ? null
-                  : () => onAddToPlaylist!(
-                      context,
-                      visibleTracks,
-                      initialPlaylistName: resolvedTitle,
-                    ),
+              keyPrefix: 'remote-collection',
             ),
           ),
-          switch (tracksState) {
-            AsyncData() when visibleTracks.isEmpty => SliverToBoxAdapter(
-              child: _CollectionStatus(
-                key: const ValueKey('remote-collection-empty'),
-                icon: Icons.music_off_rounded,
-                message: emptyMessage,
-              ),
-            ),
-            AsyncData() => SliverPadding(
-              padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
-              sliver: SliverList.separated(
-                itemCount: visibleTracks.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 6),
-                itemBuilder: (context, index) {
-                  final track = visibleTracks[index];
-                  final identity = track.id.trim().isEmpty
-                      ? track.url
-                      : track.id;
-                  return KeyedSubtree(
-                    key: ValueKey('remote-collection-track-$identity'),
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 1080),
-                        child: TrackResultTile(
-                          track: track,
-                          queue: visibleTracks,
-                          queueSourceId: queueSourceId,
-                          onOpenPlayer: () => _openPlayer(context),
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
-            AsyncError() => SliverToBoxAdapter(
-              child: _CollectionStatus(
-                key: const ValueKey('remote-collection-error'),
-                icon: Icons.cloud_off_rounded,
-                message: errorMessage,
-                action: FilledButton.tonalIcon(
-                  key: const ValueKey('remote-collection-retry'),
-                  onPressed: () {
-                    final provider = detailsProvider;
-                    if (provider != null) {
-                      ref.invalidate(provider);
-                    } else if (tracksProvider
-                        case final ProviderOrFamily provider) {
-                      ref.invalidate(provider);
-                    }
-                  },
-                  style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
-                  icon: const Icon(Icons.refresh_rounded),
-                  label: Text(strings.retry),
+          CustomScrollView(
+            scrollCacheExtent: const ScrollCacheExtent.pixels(800),
+            slivers: [
+              SliverToBoxAdapter(
+                child: _CollectionHeader(
+                  title: resolvedTitle,
+                  subtitle: resolvedSubtitle,
+                  artworkSource: resolvedArtworkSource,
+                  metadata: widget.metadata,
+                  fallbackIcon: widget.fallbackIcon,
+                  trackCount: tracksState is AsyncData<List<TrackInfo>>
+                      ? visibleTracks.length
+                      : null,
+                  playLabel: strings.play,
+                  addToPlaylistLabel: strings.addToPlaylist,
+                  songsLabel: strings.collectionSongCount,
+                  songCountLabel: widget.songCountLabel,
+                  canPlay: visibleTracks.isNotEmpty,
+                  onPlay: () =>
+                      _play(context, visibleTracks.first, visibleTracks),
+                  addingToPlaylist: _addingToPlaylist,
+                  onAddToPlaylist: visibleTracks.isEmpty
+                      ? null
+                      : () => _addToPlaylist(visibleTracks, resolvedTitle),
                 ),
               ),
-            ),
-            _ => const SliverToBoxAdapter(
-              child: _CollectionStatus(
-                key: ValueKey('remote-collection-loading'),
-                child: CircularProgressIndicator(),
+              switch (tracksState) {
+                AsyncData() when visibleTracks.isEmpty => SliverToBoxAdapter(
+                  child: _CollectionStatus(
+                    key: const ValueKey('remote-collection-empty'),
+                    icon: Icons.music_off_rounded,
+                    message: widget.emptyMessage,
+                  ),
+                ),
+                AsyncData() => SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
+                  sliver: SliverList.separated(
+                    itemCount: visibleTracks.length,
+                    separatorBuilder: (_, _) =>
+                        const SizedBox(height: appTrackRowGap),
+                    itemBuilder: (context, index) {
+                      final track = visibleTracks[index];
+                      final identity = track.id.trim().isEmpty
+                          ? track.url
+                          : track.id;
+                      return KeyedSubtree(
+                        key: ValueKey('remote-collection-track-$identity'),
+                        child: Center(
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 1080),
+                            child: TrackResultTile(
+                              track: track,
+                              selectionScope: _selectionScope,
+                              queue: visibleTracks,
+                              queueSourceId: widget.queueSourceId,
+                              onOpenPlayer: () => _openPlayer(context),
+                              surfaceOpacity: 0.52,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                AsyncError() => SliverToBoxAdapter(
+                  child: _CollectionStatus(
+                    key: const ValueKey('remote-collection-error'),
+                    icon: Icons.cloud_off_rounded,
+                    message: widget.errorMessage,
+                    action: FilledButton.tonalIcon(
+                      key: const ValueKey('remote-collection-retry'),
+                      onPressed: () {
+                        if (widget.onRetry case final retry?) {
+                          retry();
+                          return;
+                        }
+                        final provider = widget.detailsProvider;
+                        if (provider != null) {
+                          ref.invalidate(provider);
+                        } else if (widget.tracksProvider
+                            case final ProviderOrFamily provider) {
+                          ref.invalidate(provider);
+                        }
+                      },
+                      style: FilledButton.styleFrom(
+                        minimumSize: const Size(0, 48),
+                      ),
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: Text(strings.retry),
+                    ),
+                  ),
+                ),
+                _ => const SliverToBoxAdapter(
+                  child: _CollectionStatus(
+                    key: ValueKey('remote-collection-loading'),
+                    child: CircularProgressIndicator(),
+                  ),
+                ),
+              },
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  key: const ValueKey('remote-collection-bottom-spacer'),
+                  height: bottomContentPadding + 24,
+                ),
               ),
-            ),
-          },
-          SliverToBoxAdapter(
-            child: SizedBox(
-              key: const ValueKey('remote-collection-bottom-spacer'),
-              height: bottomContentPadding + 24,
-            ),
+            ],
           ),
         ],
       ),
@@ -260,53 +284,85 @@ class RemoteCollectionDetailPage extends ConsumerWidget {
         ),
       ),
     );
+    return PopScope(
+      canPop: !selection.active,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) selection.clear();
+      },
+      child: scaffold,
+    );
   }
 
-  List<TrackInfo> _withCollectionArtworkFallback(
+  Future<void> _addToPlaylist(List<TrackInfo> tracks, String title) async {
+    if (_addingToPlaylist) return;
+    setState(() => _addingToPlaylist = true);
+    try {
+      final action = widget.onAddToPlaylist;
+      if (action == null) {
+        await addCollectionToPlaylist(
+          context,
+          ref,
+          tracks,
+          initialPlaylistName: title,
+        );
+      } else {
+        await action(context, tracks, initialPlaylistName: title);
+      }
+    } catch (error) {
+      debugPrint('Could not open collection playlist action: $error');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(ref.read(appStringsProvider).playlistAddFailed)),
+      );
+    } finally {
+      if (mounted) setState(() => _addingToPlaylist = false);
+    }
+  }
+
+  List<TrackInfo> _withCollectionArtwork(
     List<TrackInfo> tracks,
     String? collectionArtwork,
   ) {
     final normalizedArtwork = collectionArtwork?.trim();
     if (normalizedArtwork == null || normalizedArtwork.isEmpty) return tracks;
     var changed = false;
-    final result = <TrackInfo>[
-      for (final track in tracks)
-        _hasCanonicalCatalogArtwork(track)
-            ? track
-            : track.copyWith(catalogThumbnailUrl: normalizedArtwork),
-    ];
-    for (var index = 0; index < tracks.length; index++) {
-      if (!identical(tracks[index], result[index])) {
-        changed = true;
-        break;
+    final result = <TrackInfo>[];
+    for (final track in tracks) {
+      if (track.thumbnailUrl == normalizedArtwork &&
+          track.catalogThumbnailUrl == normalizedArtwork &&
+          track.metadataSource == TrackMetadataSource.youtubeMusic) {
+        result.add(track);
+        continue;
       }
+      changed = true;
+      // Both row artwork and the playback source must use the album cover.
+      // Mark it as catalog metadata so stream extraction keeps this choice.
+      result.add(
+        track.copyWith(
+          thumbnailUrl: normalizedArtwork,
+          catalogThumbnailUrl: normalizedArtwork,
+          metadataSource: TrackMetadataSource.youtubeMusic,
+        ),
+      );
     }
     return changed ? List<TrackInfo>.unmodifiable(result) : tracks;
   }
 
-  bool _hasCanonicalCatalogArtwork(TrackInfo track) {
-    final source = track.catalogThumbnailUrl?.trim();
-    return source != null &&
-        source.isNotEmpty &&
-        youtubeVideoIdFromThumbnailSource(source) == null;
-  }
-
-  void _play(
-    BuildContext context,
-    WidgetRef ref,
-    TrackInfo selected,
-    List<TrackInfo> tracks,
-  ) {
+  void _play(BuildContext context, TrackInfo selected, List<TrackInfo> tracks) {
     if (tracks.isEmpty) return;
     final messenger = ScaffoldMessenger.maybeOf(context);
     final playbackError = ref.read(appStringsProvider).playbackError;
     final playback = ref
         .read(playerControllerProvider.notifier)
-        .playRemote(selected, queue: tracks, queueSourceId: queueSourceId);
+        .playRemote(
+          selected,
+          queue: tracks,
+          queueSourceId: widget.queueSourceId,
+        );
     if (Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
     }
-    onOpenPlayer();
+    widget.onOpenPlayer();
     unawaited(
       playback.catchError((Object error, StackTrace stackTrace) {
         messenger
@@ -320,7 +376,7 @@ class RemoteCollectionDetailPage extends ConsumerWidget {
     if (Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
     }
-    onOpenPlayer();
+    widget.onOpenPlayer();
   }
 }
 
@@ -338,6 +394,8 @@ class _CollectionHeader extends StatelessWidget {
     required this.canPlay,
     required this.onPlay,
     required this.onAddToPlaylist,
+    this.addingToPlaylist = false,
+    this.songCountLabel,
   });
 
   final String title;
@@ -352,16 +410,22 @@ class _CollectionHeader extends StatelessWidget {
   final bool canPlay;
   final VoidCallback onPlay;
   final VoidCallback? onAddToPlaylist;
+  final bool addingToPlaylist;
+  final String? songCountLabel;
 
   @override
   Widget build(BuildContext context) {
+    final actionStyle = paintedGlassButtonStyle(context);
     final validMetadata = metadata
         .map((value) => value.trim())
         .where((value) => value.isNotEmpty)
         .toList(growable: false);
     final details = [
       ...validMetadata,
-      if (trackCount != null) songsLabel(trackCount!),
+      if (songCountLabel != null)
+        songCountLabel!
+      else if (trackCount != null)
+        songsLabel(trackCount!),
     ];
 
     return LayoutBuilder(
@@ -435,17 +499,15 @@ class _CollectionHeader extends StatelessWidget {
                 FilledButton.icon(
                   key: const ValueKey('remote-collection-play'),
                   onPressed: canPlay ? onPlay : null,
-                  style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
+                  style: actionStyle,
                   icon: const Icon(Icons.play_arrow_rounded),
                   label: Text(playLabel),
                 ),
                 if (onAddToPlaylist != null)
                   FilledButton.tonalIcon(
                     key: const ValueKey('remote-collection-add-to-playlist'),
-                    onPressed: onAddToPlaylist,
-                    style: FilledButton.styleFrom(
-                      minimumSize: const Size(0, 48),
-                    ),
+                    onPressed: addingToPlaylist ? null : onAddToPlaylist,
+                    style: actionStyle,
                     icon: const Icon(Icons.playlist_add_rounded),
                     label: Text(addToPlaylistLabel),
                   ),
@@ -471,7 +533,7 @@ class _CollectionHeader extends StatelessWidget {
                   child: Padding(
                     padding: EdgeInsets.fromLTRB(
                       wide ? 28 : 20,
-                      wide ? 24 : 12,
+                      MediaQuery.paddingOf(context).top + (wide ? 24 : 12),
                       wide ? 28 : 20,
                       20,
                     ),

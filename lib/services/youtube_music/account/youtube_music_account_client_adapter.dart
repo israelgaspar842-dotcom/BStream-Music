@@ -14,7 +14,9 @@ typedef YouTubeMusicAuthenticatedGatewayFactory =
 /// [YouTubeMusicSessionHeadersProvider]. This keeps credential handling in the
 /// auth composition root and out of playlist/domain code.
 class GatewayYouTubeMusicAccountClient
-    implements auth_client.YouTubeMusicAccountClient {
+    implements
+        auth_client.YouTubeMusicAccountClient,
+        auth_client.YouTubeMusicAccountProfileRefresher {
   GatewayYouTubeMusicAccountClient({required this.createGateway});
 
   final YouTubeMusicAuthenticatedGatewayFactory createGateway;
@@ -25,6 +27,17 @@ class GatewayYouTubeMusicAccountClient
   // same endpoint twice.
   String? _cachedProfileKey;
   auth.YouTubeMusicAccountProfile? _cachedProfile;
+
+  @override
+  Future<auth.YouTubeMusicAccountProfile> refreshAccount(
+    auth.YouTubeMusicWebAuthData authData,
+  ) {
+    // Discovery may leave a one-shot result if login is cancelled or an
+    // optional channel lookup fails. It must never satisfy a later refresh.
+    _cachedProfile = null;
+    _cachedProfileKey = null;
+    return validateAccount(authData);
+  }
 
   @override
   Future<auth.YouTubeMusicAccountProfile> validateAccount(

@@ -144,6 +144,31 @@ void main() {
       },
     );
 
+    for (final termination in account.RemotePaginationTermination.values) {
+      if (termination == account.RemotePaginationTermination.exhausted) {
+        continue;
+      }
+      test('rejects a partial playlist after ${termination.name}', () async {
+        final accountGateway = _FakeAccountGateway()
+          ..playlistReads.add(
+            _remoteSnapshot(
+              termination: termination,
+              entries: [
+                for (var index = 0; index < 100; index++)
+                  _remoteEntry(position: index, setVideoId: 'set-$index'),
+              ],
+            ),
+          );
+
+        await expectLater(
+          _adapter(
+            accountGateway,
+          ).fetchPlaylist(accountKey: _accountKey, remotePlaylistId: 'PL-list'),
+          throwsA(isA<PlaylistGatewayUnavailableException>()),
+        );
+      });
+    }
+
     test('maps an explicit missing playlist response to null', () async {
       final accountGateway = _FakeAccountGateway()..playlistStatusCode = 404;
 
